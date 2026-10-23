@@ -8,6 +8,8 @@
 //    same way the game's vertex shader does (see RTAO_NOTES.md) and writes it to the capture ring shared with D3D12.
 // skin_vertices_cs: dispatched next to a captured skinned (or DYNAMIC vertex buffer) draw. Skins its vertices like the game's VS and
 //    writes them in world space into the skinned vertex ring shared with D3D12.
+// alpha_strip_cs: renders one channel of a cutout material's alpha texture into a 256x256 R8 tile (texture exact cutouts,
+//    see "Source/Games/Dishonored 2/rtao_alpha.h"), copied from there into the strip shared with D3D12.
 
 // Depth (copy passes) or the shared AO (composite)
 Texture2D<float> tex : register(t0);
@@ -68,11 +70,12 @@ cbuffer CaptureParams : register(b0)
     uint RowZCB;
     uint DepthHackCB; // byte offset of cb_modeldepthhack, or RTAO_NO_OFFSET
     uint RecordRow0; // byte offset of the x row inside an instance record (48 direct, 0 indexed)
-    uint CapturePad0;
-    uint CapturePad1;
+    uint AlphaRefCB; // Cutouts: byte offset of the alpha test reference in the game's material cbuffer, or RTAO_NO_OFFSET (AlphaRefConst)
+    uint UvScaleBiasCB; // Cutouts: byte offset of cb_layer0_scalebias in the game's material cbuffer, or RTAO_NO_OFFSET (none)
     uint4 MvpCB; // byte offsets of cb_mvpmatrixx/y/z/w (clip.c = dot(float4(pos, 1), cb_mvpmatrix[c]))
     uint ViewProjCB; // byte offset of cb_viewprojectionmatrix in the game's PerViewCB (4 rows: clip = world_h x VP)
-    uint3 CapturePad2;
+    float AlphaRefConst; // Cutouts: the hardcoded reference when AlphaRefCB is RTAO_NO_OFFSET
+    uint2 CapturePad2;
     // skin_vertices_cs only
     uint SkinVertexCount;
     uint SkinDstVertex; // first vertex written in SkinOut
@@ -98,6 +101,12 @@ cbuffer GameInstanceCB : register(b1)
 cbuffer GameViewCB : register(b2)
 {
     uint4 GameViewCB[64];
+};
+
+// Cutouts: the pixel shader's cbuffer holding the alpha test reference and the uv scale/bias (its PerInstanceCB)
+cbuffer GameMaterialCB : register(b3)
+{
+    uint4 GameMaterialCB[256];
 };
 
 float4x4 Inverse4x4(float4x4 m)
@@ -227,11 +236,21 @@ void capture_instances_cs(uint3 id : SV_DispatchThreadID)
     float4 rows[3];
     uint flags = ResolveInstance(i, rows);
 
+    // Cutouts (texture exact): the draw's uv scale/bias (halves) and alpha test reference, the same for all its instances
+    float4 scalebias = UvScaleBiasCB != RTAO_NO_OFFSET ? asfloat(GameMaterialCB[UvScaleBiasCB >> 4]) : float4(1, 1, 0, 0);
+    float alpha_ref = AlphaRefConst;
+    if (AlphaRefCB != RTAO_NO_OFFSET)
+    {
+        uint4 v = GameMaterialCB[AlphaRefCB >> 4];
+        uint c = (AlphaRefCB >> 2) & 3;
+        alpha_ref = asfloat(c == 0 ? v.x : (c == 1 ? v.y : (c == 2 ? v.z : v.w)));
+    }
+
     uint address = ((DstSlot + i) & SlotMask) * 64;
     CaptureRing.Store4(address, asuint(rows[0]));
     CaptureRing.Store4(address + 16, asuint(rows[1]));
     CaptureRing.Store4(address + 32, asuint(rows[2]));
-    CaptureRing.Store4(address + 48, uint4(flags, 0, 0, 0));
+    CaptureRing.Store4(address + 48, uint4(flags, f32tof16(scalebias.x) | (f32tof16(scalebias.y) << 16), f32tof16(scalebias.z) | (f32tof16(scalebias.w) << 16), asuint(alpha_ref)));
 }
 
 // ---- Per frame vertex capture (skinned meshes, DYNAMIC vertex buffers). Must match RTAO::GeometryCapture::CaptureFrameDraw
@@ -390,4 +409,40 @@ void skin_vertices_cs(uint3 id : SV_DispatchThreadID)
         world = float3(dot(model, rows[0]), dot(model, rows[1]), dot(model, rows[2]));
     }
     SkinOut.Store3((SkinDstVertex + i) * 12, asuint(world));
+}
+
+// ---- Texture exact cutouts: one channel of a material's alpha texture into a 256x256 R8 tile. Must match
+// RTAO::CutoutMaterials::RecordStrip (rtao_alpha.cpp). Mip aware: sampled (trilinear) at the source mip whose size is
+// closest to the tile; past the last mip the view has, a grid of taps averages the texels a tile texel covers.
+
+cbuffer AlphaStripParams : register(b0)
+{
+    uint AlphaChannel; // 0..3
+    uint AlphaSourceMips; // Mips in the view
+    float2 AlphaSourceSize; // Size of the view's most detailed mip
+};
+Texture2D<float4> AlphaSource : register(t0);
+SamplerState AlphaSampler : register(s0); // Linear, wrap
+RWTexture2D<unorm float> AlphaTile : register(u0);
+
+[numthreads(8, 8, 1)]
+void alpha_strip_cs(uint3 id : SV_DispatchThreadID)
+{
+    const float tile = 256.0;
+    float lod = max(log2(max(AlphaSourceSize.x, AlphaSourceSize.y) / tile), 0.0);
+    float last = float(max(AlphaSourceMips, 1u) - 1u);
+    float sample_lod = min(lod, last);
+    // Taps per axis to cover what the missing mips would have averaged (1 when the view has the mip)
+    uint taps = (uint)clamp(exp2(ceil(lod - sample_lod)), 1.0, 4.0);
+    float value = 0.0;
+    [loop] for (uint y = 0; y < taps; y++)
+    {
+        [loop] for (uint x = 0; x < taps; x++)
+        {
+            float2 uv = (float2(id.xy) + (float2(x, y) + 0.5) / float(taps)) / tile;
+            float4 texel = AlphaSource.SampleLevel(AlphaSampler, uv, sample_lod);
+            value += AlphaChannel == 0 ? texel.x : (AlphaChannel == 1 ? texel.y : (AlphaChannel == 2 ? texel.z : texel.w));
+        }
+    }
+    AlphaTile[id.xy] = value / float(taps * taps);
 }

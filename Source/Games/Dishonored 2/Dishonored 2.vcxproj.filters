@@ -7,12 +7,14 @@
     <ClCompile Include="rtao_accel.cpp" />
     <ClCompile Include="rtao_pass.cpp" />
     <ClCompile Include="rtao_capture.cpp" />
+    <ClCompile Include="rtao_alpha.cpp" />
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="rtao_interop.h" />
     <ClInclude Include="rtao_accel.h" />
     <ClInclude Include="rtao_pass.h" />
     <ClInclude Include="rtao_capture.h" />
+    <ClInclude Include="rtao_alpha.h" />
     <ClInclude Include="Shaders\rtao_trace_cs.h" />
     <ClInclude Include="Shaders\rtao_filter_cs.h" />
   </ItemGroup>

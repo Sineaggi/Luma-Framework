@@ -451,7 +451,7 @@ namespace RTAO
       }
    }
 
-   void TlasBuilder::AddInstance(uint64_t instance_key, uint64_t blas_key, const float object_to_world[3][4], uint8_t mask)
+   void TlasBuilder::AddInstance(uint64_t instance_key, uint64_t blas_key, const float object_to_world[3][4], uint8_t mask, uint32_t cutout_record)
    {
       const std::lock_guard lock(mutex);
       auto [it, inserted] = instances.try_emplace(instance_key);
@@ -463,6 +463,7 @@ namespace RTAO
       std::memcpy(instance.transform, object_to_world, sizeof(instance.transform));
       instance.blas_key = blas_key;
       instance.mask = mask;
+      instance.cutout_record = cutout_record;
       instance.last_frame = frame; // Re-adding refreshes the transform and the age
    }
 
@@ -515,7 +516,7 @@ namespace RTAO
                // Same BLAS as an opaque draw of the mesh (built OPAQUE), overridden per instance: the trace's candidate
                // loop decides each hit. Opaque instances stay forced opaque, so they cost nothing extra.
                desc.Flags = D3D12_RAYTRACING_INSTANCE_FLAG_TRIANGLE_CULL_DISABLE | D3D12_RAYTRACING_INSTANCE_FLAG_FORCE_NON_OPAQUE;
-               desc.InstanceID |= kInstanceIdCutoutBit;
+               desc.InstanceID = kInstanceIdCutoutBit | (pair.second.cutout_record & kNoCutoutRecord); // The trace reads the record from it
                last_cutout_count++;
             }
             desc.AccelerationStructure = blas;

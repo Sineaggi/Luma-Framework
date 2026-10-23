@@ -96,6 +96,9 @@ namespace RTAO
       // D3D12 can read): a D3D11 buffer with D3D11_RESOURCE_MISC_SHARED (also SRV/UAV raw views), opened in D3D12.
       // The D3D12 side starts in COMMON state. Size is rounded up to 16 bytes.
       bool CreateSharedBuffer(ID3D11Device* device11, uint64_t size, ID3D12Resource*& out12, ID3D11Buffer*& out11, std::string& error);
+      // Creates a 2D texture D3D11 can render into and D3D12 can copy from (D3D12 created, ALLOW_RENDER_TARGET only, so one
+      // of the formats listed above). The D3D12 side starts in COMMON state and must be in COMMON whenever D3D11 uses it.
+      bool CreateSharedTexture2D(ID3D11Device* device11, DXGI_FORMAT format, uint32_t width, uint32_t height, ID3D12Resource*& out12, ID3D11Texture2D*& out11, std::string& error);
 
       // Valid after Init. Not reference counted: don't keep past Shutdown.
       ID3D12Device5* GetDevice() const { return device12; }

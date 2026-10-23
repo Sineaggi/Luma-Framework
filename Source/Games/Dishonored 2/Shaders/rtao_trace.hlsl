@@ -2,6 +2,7 @@
 // position reconstructed from depth. Writes raw visibility (1 = unoccluded) for rtao_filter.hlsl.
 // The normal comes from depth derivatives (the game's G-buffer normal decode is not wired up yet).
 #include "rtao_common.hlsli"
+#include "rtao_cutout.hlsli"
 
 RaytracingAccelerationStructure Scene : register(t0);
 RWTexture2D<float> AoRaw : register(u0);
@@ -96,8 +97,10 @@ void main(uint3 id : SV_DispatchThreadID)
     // opacity 1 the ray forces everything opaque (no candidates, the plain opaque trace), at 0 its mask leaves them out.
     // In between, each (ray, cutout triangle) crossing stops the ray with that probability: a stochastic stand-in for
     // the texture's coverage, which the temporal denoiser averages like the rest of the ray noise.
-    const uint ray_flags = CutoutOpacity >= 1.0 ? RAY_FLAG_FORCE_OPAQUE : RAY_FLAG_NONE;
-    const uint ray_mask = CutoutOpacity <= 0.0 ? (0xFF & ~kInstanceMaskCutout) : 0xFF;
+    // Texture exact cutouts (CutoutExact, rtao_cutout.hlsli): a cutout with a mask stops the ray where its alpha passes the
+    // game's test; the opacity only applies to the others, so neither shortcut is taken.
+    const uint ray_flags = (CutoutOpacity >= 1.0 && CutoutExact == 0) ? RAY_FLAG_FORCE_OPAQUE : RAY_FLAG_NONE;
+    const uint ray_mask = (CutoutOpacity <= 0.0 && CutoutExact == 0) ? (0xFF & ~kInstanceMaskCutout) : 0xFF;
     float occlusion = 0.0;
     uint rays = max(RayCount, 1u);
     for (uint i = 0; i < rays; i++)
@@ -115,8 +118,13 @@ void main(uint3 id : SV_DispatchThreadID)
             // Only cutout instances produce candidates
             if (q.CandidateType() == CANDIDATE_NON_OPAQUE_TRIANGLE && (q.CandidateInstanceID() & kInstanceIdCutoutBit) != 0)
             {
-                uint h = Hash(seed ^ Hash(q.CandidateInstanceIndex() * 0x8DA6B343u + q.CandidatePrimitiveIndex()));
-                if (float(h & 0xFFFFFF) / 16777216.0 < CutoutOpacity)
+                int solid = CutoutAlphaTest(q.CandidateInstanceID(), q.CandidatePrimitiveIndex(), q.CandidateTriangleBarycentrics());
+                if (solid < 0) // No mask: stochastic
+                {
+                    uint h = Hash(seed ^ Hash(q.CandidateInstanceIndex() * 0x8DA6B343u + q.CandidatePrimitiveIndex()));
+                    solid = float(h & 0xFFFFFF) / 16777216.0 < CutoutOpacity ? 1 : 0;
+                }
+                if (solid > 0)
                     q.CommitNonOpaqueTriangleHit(); // Ends the search (ACCEPT_FIRST_HIT_AND_END_SEARCH)
             }
         }
@@ -130,5 +138,6 @@ void main(uint3 id : SV_DispatchThreadID)
     float ao = 1.0 - occlusion / float(rays);
     if (DebugMode == 1)
         ao = n.y * 0.5 + 0.5; // Reconstructed normal (Y)
+    CutoutFlushCounters();
     AoRaw[px] = ao;
 }

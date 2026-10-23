@@ -770,6 +770,16 @@ void main(uint3 id : SV_DispatchThreadID)
       return true;
    }
 
+   bool Interop::CreateSharedTexture2D(ID3D11Device* device11, DXGI_FORMAT format, uint32_t width, uint32_t height, ID3D12Resource*& out12, ID3D11Texture2D*& out11, std::string& error)
+   {
+      if (!device12)
+      {
+         error = "interop not initialized";
+         return false;
+      }
+      return RTAO::CreateSharedTexture(device12, device11, format, width, height, out12, out11, error);
+   }
+
    uint64_t Interop::GetTimestampFrequency()
    {
       const std::lock_guard lock(mutex);

@@ -154,7 +154,7 @@ namespace
    int g_rtao_debug_mode = RTAO_OUTPUT_AO;
    // "View AO only" debug: 0 off, 1 the final AO (the game's blur output, any AO mode), 2 the RTAO output before the game's blur
    int g_ao_view_mode = 0;
-   float g_rtao_strength = 1.f;
+   float g_rtao_strength = 2.f; // RTAO power curve (config "RTAOStrength"); 2 matched XeGTAO's depth in the user's test
    float g_rtao_radius = 1.5f; // World units (config "RTAORadius")
    int g_rtao_rays = 4; // Per pixel per frame (config "RTAORays")
    int g_rtao_capture_pass = 1; // 0: depth only draws (no render target bound), 1: every depth writing draw (config "RTAOCapturePass")
@@ -2384,8 +2384,8 @@ public:
          if (ImGui::IsItemDeactivatedAfterEdit())
             reshade::set_config_value(runtime, NAME, "RTAOStrength", g_rtao_strength);
          if (ImGui::IsItemHovered())
-            ImGui::SetTooltip("Deepens (> 1) or lightens (< 1) the ray traced AO: a power curve on the result. 1 = as traced.");
-         DrawResetButton(g_rtao_strength, 1.f, "RTAOStrength");
+            ImGui::SetTooltip("Deepens (> 1) or lightens (< 1) the ray traced AO: a power curve on the result. 1 = as traced, 2 = default.");
+         DrawResetButton(g_rtao_strength, 2.f, "RTAOStrength");
          if (ImGui::Checkbox("RTAO: wind meshes", &g_rtao_wind_meshes))
             reshade::set_config_value(runtime, NAME, "RTAOWindMeshes", g_rtao_wind_meshes);
          if (ImGui::IsItemHovered())

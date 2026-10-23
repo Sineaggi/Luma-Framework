@@ -106,6 +106,14 @@ namespace RTAO
       }
       D3D11_SHADER_DESC desc = {};
       reflection->GetDesc(&desc);
+      // The game's scene shaders are all SM 5.0; its UI shaders are SM 4.0 (and use POSITION, not VERTEX_POSITION).
+      // UI draws can have the main depth target bound (Luma keeps it bound for UI stencil masks).
+      if (D3D11_SHVER_GET_MAJOR(desc.Version) < 5)
+      {
+         out.skip_reason = "UI (shader model 4)";
+         reflection->Release();
+         return false;
+      }
 
       bool has_position = false;
       for (UINT i = 0; i < desc.InputParameters; i++)

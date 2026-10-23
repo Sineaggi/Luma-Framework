@@ -345,7 +345,7 @@ namespace RTAO
       return true;
    }
 
-   bool AOPass::Record(ID3D12GraphicsCommandList4* list, const RecordInfo& info, D3D12_GPU_VIRTUAL_ADDRESS tlas, const PassSettings& settings, Retirer& retirer, std::string& error, const CutoutBindings* cutouts)
+   bool AOPass::Record(ID3D12GraphicsCommandList4* list, const RecordInfo& info, D3D12_GPU_VIRTUAL_ADDRESS tlas, const PassSettings& settings, Retirer& retirer, std::string& error, GpuTimer* timer, const CutoutBindings* cutouts)
    {
       if (!trace_pso || !tlas)
       {
@@ -412,6 +412,8 @@ namespace RTAO
       constants.debug_mode = settings.debug_mode;
       constants.strength = settings.strength;
       constants.cutout_opacity = settings.cutout_opacity;
+      constants.trace_half_res = settings.half_res ? 1 : 0;
+      constants.cutout_mode = settings.cutout_mode;
       constants.cutout_exact = exact ? 1 : 0;
       std::memcpy(constants_mapped + slot * kConstantsStride, &constants, sizeof(constants));
 
@@ -437,8 +439,9 @@ namespace RTAO
       TransitionBarrier(list, counters, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
 
       const uint32_t groups_x = (info.ao_width + 7) / 8, groups_y = (info.ao_height + 7) / 8;
+      const uint32_t trace_w = settings.half_res ? (info.ao_width + 1) / 2 : info.ao_width, trace_h = settings.half_res ? (info.ao_height + 1) / 2 : info.ao_height;
       list->SetPipelineState(trace_pso);
-      list->Dispatch(groups_x, groups_y, 1);
+      list->Dispatch((trace_w + 7) / 8, (trace_h + 7) / 8, 1);
       UavBarrier(list, &raw, 1);
       if (exact)
          TransitionBarrier(list, cutouts->arena, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COMMON);
@@ -446,6 +449,8 @@ namespace RTAO
       list->CopyBufferRegion(counters_readback, slot * 16, counters, 0, 16);
       TransitionBarrier(list, counters, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_COMMON);
       counters_pending[slot] = true;
+      if (timer)
+         timer->Mark(list, info.frame_slot);
       list->SetPipelineState(filter_pso);
       list->Dispatch(groups_x, groups_y, 1);
       ID3D12Resource* written[2] = { info.ao, history[1 - parity] };
@@ -496,7 +501,7 @@ namespace RTAO
       frequency = timestamp_frequency;
       D3D12_QUERY_HEAP_DESC desc = {};
       desc.Type = D3D12_QUERY_HEAP_TYPE_TIMESTAMP;
-      desc.Count = kSlots * 2;
+      desc.Count = kSlots * kStamps;
       HRESULT hr = device->CreateQueryHeap(&desc, IID_PPV_ARGS(&heap));
       if (FAILED(hr))
       {
@@ -505,7 +510,7 @@ namespace RTAO
       }
       D3D12_RESOURCE_DESC buffer = {};
       buffer.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
-      buffer.Width = kSlots * 2 * sizeof(uint64_t);
+      buffer.Width = kSlots * kStamps * sizeof(uint64_t);
       buffer.Height = 1;
       buffer.DepthOrArraySize = 1;
       buffer.MipLevels = 1;
@@ -529,14 +534,21 @@ namespace RTAO
       if (!heap || !pending[frame_slot] || frequency == 0)
          return;
       pending[frame_slot] = false;
-      D3D12_RANGE range = { frame_slot * 16, frame_slot * 16 + 16 };
+      const uint32_t count = stamps[frame_slot];
+      if (count < 2)
+         return;
+      const SIZE_T base = SIZE_T(frame_slot) * kStamps * sizeof(uint64_t);
+      D3D12_RANGE range = { base, base + count * sizeof(uint64_t) };
       uint8_t* data = nullptr;
       if (SUCCEEDED(readback->Map(0, &range, reinterpret_cast<void**>(&data))) && data)
       {
-         uint64_t t[2];
-         std::memcpy(t, data + frame_slot * 16, sizeof(t));
-         if (t[1] >= t[0])
-            last_ms = double(t[1] - t[0]) * 1000.0 / double(frequency);
+         uint64_t t[kStamps];
+         std::memcpy(t, data + base, count * sizeof(uint64_t));
+         if (t[count - 1] >= t[0])
+            last_ms = double(t[count - 1] - t[0]) * 1000.0 / double(frequency);
+         last_spans = count - 1;
+         for (uint32_t i = 0; i + 1 < count; i++)
+            last_span_ms[i] = t[i + 1] >= t[i] ? double(t[i + 1] - t[i]) * 1000.0 / double(frequency) : 0.0;
          D3D12_RANGE written = { 0, 0 };
          readback->Unmap(0, &written);
       }
@@ -544,8 +556,21 @@ namespace RTAO
 
    void GpuTimer::Begin(ID3D12GraphicsCommandList* list, uint32_t frame_slot)
    {
-      if (heap)
-         list->EndQuery(heap, D3D12_QUERY_TYPE_TIMESTAMP, (frame_slot % kSlots) * 2);
+      if (!heap)
+         return;
+      frame_slot %= kSlots;
+      list->EndQuery(heap, D3D12_QUERY_TYPE_TIMESTAMP, frame_slot * kStamps);
+      stamps[frame_slot] = 1;
+   }
+
+   void GpuTimer::Mark(ID3D12GraphicsCommandList* list, uint32_t frame_slot)
+   {
+      if (!heap)
+         return;
+      frame_slot %= kSlots;
+      if (stamps[frame_slot] == 0 || stamps[frame_slot] >= kStamps - 1)
+         return; // No Begin, or out of marks (End keeps the last one)
+      list->EndQuery(heap, D3D12_QUERY_TYPE_TIMESTAMP, frame_slot * kStamps + stamps[frame_slot]++);
    }
 
    void GpuTimer::End(ID3D12GraphicsCommandList* list, uint32_t frame_slot)
@@ -553,8 +578,10 @@ namespace RTAO
       if (!heap)
          return;
       frame_slot %= kSlots;
-      list->EndQuery(heap, D3D12_QUERY_TYPE_TIMESTAMP, frame_slot * 2 + 1);
-      list->ResolveQueryData(heap, D3D12_QUERY_TYPE_TIMESTAMP, frame_slot * 2, 2, readback, frame_slot * 16);
+      if (stamps[frame_slot] == 0)
+         return;
+      list->EndQuery(heap, D3D12_QUERY_TYPE_TIMESTAMP, frame_slot * kStamps + stamps[frame_slot]++);
+      list->ResolveQueryData(heap, D3D12_QUERY_TYPE_TIMESTAMP, frame_slot * kStamps, stamps[frame_slot], readback, UINT64(frame_slot) * kStamps * sizeof(uint64_t));
       pending[frame_slot] = true;
    }
 

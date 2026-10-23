@@ -15,8 +15,23 @@ cbuffer PassConstants : register(b0)
     uint2 Size;         uint2 DepthSize;
     uint DepthPacked;   uint ReversedZ;  uint FilterMode; float AlphaMin;
     float ClampK;       float Bias;      uint DebugMode;  float Strength;
-    float CutoutOpacity; uint CutoutExact; uint2 CutoutPad;
+    float CutoutOpacity; uint TraceHalfRes; uint CutoutMode; uint CutoutExact;
 };
+
+// Half resolution trace (RTAO Quality Low): one traced pixel per 2x2 block, at a position that cycles every 4 frames;
+// AoRaw then holds one value per block, and the filter upsamples it (depth aware) back to full resolution.
+static const uint2 kTraceJitter[4] = { uint2(0, 0), uint2(1, 1), uint2(1, 0), uint2(0, 1) };
+
+uint2 TraceSize()
+{
+    return TraceHalfRes != 0 ? (Size + 1) / 2 : Size;
+}
+
+// Full resolution pixel traced for a raw texel this frame
+uint2 TracedPixel(uint2 cell)
+{
+    return TraceHalfRes != 0 ? min(cell * 2 + kTraceJitter[Frame & 3], Size - 1) : cell;
+}
 
 // Must match rtao_accel.h
 static const uint kInstanceMaskCutout = 0x02;

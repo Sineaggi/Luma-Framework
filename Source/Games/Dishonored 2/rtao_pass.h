@@ -37,8 +37,9 @@ namespace RTAO
       uint32_t debug_mode;
       float strength;
       float cutout_opacity;
+      uint32_t trace_half_res;
+      uint32_t cutout_mode;
       uint32_t cutout_exact; // Texture exact cutouts (rtao_alpha.h): records/atlas bound
-      uint32_t cutout_pad[2];
    };
    static_assert(sizeof(PassConstants) == 256);
 
@@ -71,32 +72,46 @@ namespace RTAO
       // Chance that a ray crossing an alpha tested (cutout) triangle is stopped by it: approximates partial coverage
       // (leaves, grates). 0 = cutouts are left out, 1 = as solid as the rest.
       float cutout_opacity = 0.5f;
+      // Traces one pixel per 2x2 block (cycling over 4 frames), upsampled by the filter: a quarter of the rays
+      bool half_res = false;
+      uint32_t cutout_mode = 0;
       // Texture exact cutouts: a cutout whose material has a mask occludes where its alpha passes the game's test; the
       // opacity above stays for the others (no mask yet, atlas full, alpha test form not replayable)
       bool cutout_exact = true;
       bool reset_history = false;
    };
 
-   // GPU time of a span of a command list, read back when the frame slot comes around again (no stall)
+   // GPU time of a span of a command list, read back when the frame slot comes around again (no stall). Mark() splits
+   // the span into consecutive sub-spans (e.g. capture, TLAS build, trace, filter), read with LastSpanMs().
    class GpuTimer
    {
    public:
+      static constexpr uint32_t kMaxMarks = 6; // Marks between Begin and End
+
       ~GpuTimer() { Shutdown(); }
       bool Init(ID3D12Device* device, uint64_t timestamp_frequency, std::string& error);
-      // Call Collect, then Begin ... End, once per frame slot use
+      // Call Collect, then Begin ... [Mark ...] End, once per frame slot use
       void Collect(uint32_t frame_slot);
       void Begin(ID3D12GraphicsCommandList* list, uint32_t frame_slot);
+      void Mark(ID3D12GraphicsCommandList* list, uint32_t frame_slot);
       void End(ID3D12GraphicsCommandList* list, uint32_t frame_slot);
       double LastMs() const { return last_ms; }
+      // Sub-span i (Begin or mark i-1 to mark i or End) of the last collected frame, 0 if it had fewer
+      double LastSpanMs(uint32_t i) const { return i < last_spans ? last_span_ms[i] : 0.0; }
+      uint32_t LastSpanCount() const { return last_spans; }
       void Shutdown();
 
    private:
       static constexpr uint32_t kSlots = 3;
+      static constexpr uint32_t kStamps = kMaxMarks + 2;
       ID3D12QueryHeap* heap = nullptr;
       ID3D12Resource* readback = nullptr;
       uint64_t frequency = 0;
       bool pending[kSlots] = {};
+      uint32_t stamps[kSlots] = {}; // Timestamps written in the slot's current use
       double last_ms = 0.0;
+      double last_span_ms[kMaxMarks + 1] = {};
+      uint32_t last_spans = 0;
    };
 
    class AOPass
@@ -106,9 +121,9 @@ namespace RTAO
 
       bool Init(ID3D12Device5* device, std::string& error);
       bool IsInitialized() const { return trace_pso != nullptr; }
-      // Records trace + filter into info.ao (left in UNORDERED_ACCESS state). "cutouts": texture exact cutout resources
-      // (GeometryCapture::GetCutoutBindings), null: stochastic cutouts only.
-      bool Record(ID3D12GraphicsCommandList4* list, const RecordInfo& info, D3D12_GPU_VIRTUAL_ADDRESS tlas, const PassSettings& settings, Retirer& retirer, std::string& error, const CutoutBindings* cutouts = nullptr);
+      // Records trace + filter into info.ao (left in UNORDERED_ACCESS state). With a timer, marks the end of the trace.
+      // "cutouts": texture exact cutout resources (GeometryCapture::GetCutoutBindings), null: stochastic cutouts only.
+      bool Record(ID3D12GraphicsCommandList4* list, const RecordInfo& info, D3D12_GPU_VIRTUAL_ADDRESS tlas, const PassSettings& settings, Retirer& retirer, std::string& error, GpuTimer* timer = nullptr, const CutoutBindings* cutouts = nullptr);
       // Cutout candidates the trace resolved in the last frame read back (a few frames late): with a mask (and how many
       // of those were opaque), and with the stochastic fallback
       struct CutoutCounters

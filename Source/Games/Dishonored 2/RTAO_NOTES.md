@@ -1,4 +1,44 @@
-# RTAO notes: geometry capture in Dishonored 2 (Void Engine)
+# RTAO: ray traced ambient occlusion for Dishonored 2
+
+## Summary
+
+Luma's "Ambient Occlusion" setting picks one of: Off, HBAO+ (the game's own, through its r_hbao cvar), XeGTAO, or
+RTAO. RTAO replaces the game's SSAO pass with AO ray traced on a side D3D12 device (DXR 1.1 RayQuery, same GPU,
+shared textures + a shared fence), against geometry captured from the game's own draws:
+
+- **Scene:** static meshes (all matrix families, including MVP-only props), skinned characters and bone-animated
+  props, and meshes with CPU-written (DYNAMIC) vertex buffers, both rebuilt and refit every frame. Wind vegetation
+  is in its rest pose. Alpha-tested cutouts are partly transparent. Off-screen static geometry is retained for 180
+  frames once seen in 4. Geometry drawn after the AO pass, the UI, particles, water and the first-person view model
+  are left out.
+- **Pass:** cosine-distributed rays from the depth-reconstructed position, then a cross-bilateral + temporal
+  denoiser (ported from the user's Fallout 4 RtShadows), then a power curve (Strength).
+- **Cost (RTX 4090, 3440x1440):** about 0.8 ms indoors and 2.3 ms on the Karnaca docks before the performance work.
+  The quality modes / dedup aim at about 1 ms there (not yet measured in game).
+
+Panel (Luma settings, "Ambient Occlusion" section) and config keys (ReShade.ini, `[Luma]`):
+
+| UI | Key | Default | Notes |
+| --- | --- | --- | --- |
+| Ambient Occlusion | AOMode | 1 (XeGTAO) | 0 Off, 1 XeGTAO, 2 RTAO, 3 HBAO+; the old XeGTAOEnable is migrated |
+| View AO only (debug) | (not saved) | Off | Final AO (after the game's blur, any mode), or RTAO output |
+| RTAO Output | RTAOTestOutput | 0 | Ray traced AO, test pattern, depth test, BLAS coverage, no denoiser |
+| RTAO Strength | RTAOStrength | 2 | Power curve (>1 darker) |
+| RTAO Radius / Rays | RTAORadius / RTAORays | 1.5 / 4 | World units / rays per traced pixel |
+| RTAO Quality | RTAOQuality | 0 Low | Low: 1 of 4 pixels traced per frame + upsample; Medium: 2 rays; High |
+| RTAO Capture | RTAOCapturePass | 1 | Depth-only draws, or all depth-writing draws |
+| RTAO: skinned characters / dynamic meshes | RTAOSkinned / RTAODynamic | on | Per-frame BLAS |
+| RTAO: wind meshes / alpha tested cutouts | RTAOWindMeshes / RTAOCutouts | on | |
+| RTAO Cutout Opacity / fast cutouts | RTAOCutoutOpacity / RTAOFastCutouts | 0.5 / off | |
+| RTAO: skip repeated draws | RTAODedup | on | One capture per object per frame |
+
+Known limits: instanced skinned draws (crowds) and GPU-culled indirect draws are not captured (0 seen so far).
+Wind sway isn't replayed. Cutouts are statistically, not texture, exact (work in progress). A moving object only
+occludes from the frames it is drawn in (no off-screen retention). Needs a DXR 1.1 GPU; it falls back to XeGTAO
+otherwise. Tested on an RTX 4090 only. The standalone GPU test (`Tests/rtao_interop_test.cpp`) covers the interop,
+capture, BLAS/TLAS, trace and denoiser offline.
+
+# Geometry capture in Dishonored 2 (Void Engine)
 
 Offline analysis, 2026-10-23. Source: the 6185 vertex shaders and 48 compute shaders Luma dumped while the game
 ran (`<game>\Luma\Dishonored 2\Dump\0x*.vs_5_0.cso`). That is the set the game really created, so the game's

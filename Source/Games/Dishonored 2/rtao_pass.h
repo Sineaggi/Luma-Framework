@@ -45,6 +45,9 @@ namespace RTAO
       Temporal = 2,
    };
 
+   // 4x4 inverse (double precision Gauss-Jordan). False if singular.
+   bool InvertMatrix(const float in[16], float out[16]);
+
    // Matrices use row vectors (clip = float4(world, 1) * view_proj), i.e. the game's PerViewCB memory layout.
    struct PassSettings
    {

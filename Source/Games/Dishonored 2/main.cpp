@@ -16,6 +16,11 @@
 #include "..\..\Core\core.hpp"
 
 #include "rtao_interop.h"
+#include "rtao_accel.h"
+#include "rtao_capture.h"
+#include "rtao_pass.h"
+
+#include <shared_mutex>
 
 struct CBPerViewGlobals
 {
@@ -74,7 +79,7 @@ namespace
    {
       AO_MODE_OFF = 0, // Game behaviour (vanilla SSAO, or HBAO+ if enabled in the game)
       AO_MODE_XEGTAO = 1,
-      AO_MODE_RTAO = 2, // Ray traced AO on a side D3D12 device (milestone M0: interop smoke test only)
+      AO_MODE_RTAO = 2, // Ray traced AO on a side D3D12 device, from geometry captured off the game's draws
       AO_MODE_COUNT
    };
    std::atomic<int> g_ao_mode = AO_MODE_XEGTAO;
@@ -82,9 +87,36 @@ namespace
    std::atomic<bool> g_rtao_unavailable = false;
    std::mutex g_rtao_status_mutex;
    std::string g_rtao_status; // Last RTAO init result or error, shown in the UI
-   // What the M0 D3D12 kernel writes (0 depth based test AO, 1 test pattern). Config key "RTAOTestOutput".
-   int g_rtao_debug_mode = 0;
+   // What RTAO mode shows (config key "RTAOTestOutput", its name kept from M0)
+   enum RTAOOutput : int
+   {
+      RTAO_OUTPUT_AO = 0, // Ray traced AO, denoised
+      RTAO_OUTPUT_TEST_PATTERN = 1, // M0 interop test kernel
+      RTAO_OUTPUT_DEPTH_TEST = 2, // M0 depth crease test kernel
+      RTAO_OUTPUT_COVERAGE = 3, // BLAS coverage: white = captured geometry matches the depth, grey = missing, black = misplaced
+      RTAO_OUTPUT_RAW = 4, // Ray traced AO, no denoiser
+      RTAO_OUTPUT_COUNT
+   };
+   int g_rtao_debug_mode = RTAO_OUTPUT_AO;
    float g_rtao_strength = 1.f;
+   float g_rtao_radius = 1.5f; // World units (config "RTAORadius")
+   int g_rtao_rays = 4; // Per pixel per frame (config "RTAORays")
+   int g_rtao_capture_pass = 1; // 0: depth only draws (no render target bound), 1: every depth writing draw (config "RTAOCapturePass")
+
+   bool RTAOOutputIsRayTraced(int output)
+   {
+      return output == RTAO_OUTPUT_AO || output == RTAO_OUTPUT_COVERAGE || output == RTAO_OUTPUT_RAW;
+   }
+
+   // Geometry capture: what each game vertex shader / input layout means for capture, by native object pointer
+   std::shared_mutex g_rtao_shader_mutex;
+   std::unordered_map<uint64_t, RTAO::VertexShaderInfo> g_rtao_vertex_shaders;
+   std::unordered_map<uint64_t, RTAO::InputLayoutInfo> g_rtao_input_layouts;
+   std::atomic<bool> g_rtao_capture_active = false; // Set while RTAO traces, so the draw hook costs nothing otherwise
+   std::atomic<uint32_t> g_rtao_main_depth_width = 0, g_rtao_main_depth_height = 0; // The main view's depth size
+   std::atomic<uint64_t> g_rtao_vs_by_source[4] = {}; // Reflected vertex shaders, by RTAO::MatrixSource
+   std::atomic<uint64_t> g_rtao_draws_by_source[4] = {}; // Main view draws, by their vertex shader's matrix source
+   std::atomic<uint64_t> g_rtao_draws_unknown_shader = 0, g_rtao_draws_unusable_layout = 0, g_rtao_indirect_draws = 0;
 
    int GetEffectiveAOMode()
    {
@@ -177,6 +209,9 @@ struct GameDeviceDataDishonored2 final : public GameDeviceData
       ComPtr<ID3D11CommandList> prefix;
       void* remainder_command_list = nullptr; // Identity only, set when the game calls FinishCommandList()
       RTAO::Constants constants = {};
+      RTAO::PassSettings settings = {};
+      int output = 0;
+      std::shared_ptr<RTAO::GeometryCapture::PendingRecords> capture_records; // Captured before the split: in the prefix
       uint32_t frame = 0;
    };
    std::mutex rtao_pending_mutex;
@@ -187,6 +222,21 @@ struct GameDeviceDataDishonored2 final : public GameDeviceData
    std::atomic<bool> rtao_logged_run_error = false;
    // Diagnostics, logged a few times per session (OnPresent)
    std::atomic<uint32_t> rtao_stat_inline_ok = 0, rtao_stat_splits = 0, rtao_stat_mapped = 0, rtao_stat_deferred_ok = 0, rtao_stat_failed = 0, rtao_stat_dropped = 0;
+
+   // RTAO ray tracing (used on the immediate context's thread, inside the interop's recorder)
+   RTAO::GeometryCapture rtao_capture;
+   RTAO::BlasCache rtao_blases;
+   RTAO::TlasBuilder rtao_tlas;
+   RTAO::AOPass rtao_pass;
+   RTAO::GpuTimer rtao_timer;
+   RTAO::Retirer rtao_retirer;
+   bool rtao_rt_ready = false;
+   bool rtao_rt_failed = false;
+   int rtao_last_output = -1;
+   uint32_t rtao_last_draw_frame = 0;
+   // Snapshots for the UI (written by the recorder)
+   std::atomic<uint64_t> rtao_blas_count = 0, rtao_blas_bytes = 0;
+   std::atomic<uint32_t> rtao_tlas_instances = 0, rtao_gpu_us = 0;
 };
 
 //TODOFT: Building shaders menu (apply gamma?)
@@ -209,6 +259,11 @@ public:
          reshade::register_event<reshade::addon_event::map_buffer_region>(Dishonored2::OnMapBufferRegion);
          reshade::register_event<reshade::addon_event::unmap_buffer_region>(Dishonored2::OnUnmapBufferRegion);
          reshade::register_event<reshade::addon_event::execute_secondary_command_list>(Dishonored2::OnExecuteSecondaryCommandList);
+         reshade::register_event<reshade::addon_event::init_pipeline>(Dishonored2::OnRTAOInitPipeline);
+         reshade::register_event<reshade::addon_event::destroy_pipeline>(Dishonored2::OnRTAODestroyPipeline);
+         reshade::register_event<reshade::addon_event::draw_indexed>(Dishonored2::OnRTAODrawIndexed);
+         reshade::register_event<reshade::addon_event::draw_or_dispatch_indirect>(Dishonored2::OnRTAODrawIndirect);
+         reshade::register_event<reshade::addon_event::destroy_resource>(Dishonored2::OnRTAODestroyResource);
       }
    }
 
@@ -229,6 +284,7 @@ public:
       native_shaders_definitions.emplace(CompileTimeStringHash("DS2 XeGTAO Main Pass PS"), ShaderDefinition{ "Luma_XeGTAO", reshade::api::pipeline_subobject_type::pixel_shader, nullptr, "main_pass_ps" });
       native_shaders_definitions.emplace(CompileTimeStringHash("DS2 RTAO Depth Copy PS"), ShaderDefinition{ "Luma_RTAO", reshade::api::pipeline_subobject_type::pixel_shader, nullptr, "depth_copy_ps" });
       native_shaders_definitions.emplace(CompileTimeStringHash("DS2 RTAO Depth Pack PS"), ShaderDefinition{ "Luma_RTAO", reshade::api::pipeline_subobject_type::pixel_shader, nullptr, "depth_pack_ps" });
+      native_shaders_definitions.emplace(CompileTimeStringHash("DS2 RTAO Capture CS"), ShaderDefinition{ "Luma_RTAO", reshade::api::pipeline_subobject_type::compute_shader, nullptr, "capture_instances_cs" });
       native_shaders_definitions.emplace(CompileTimeStringHash("DS2 RTAO Composite PS"), ShaderDefinition{ "Luma_RTAO", reshade::api::pipeline_subobject_type::pixel_shader, nullptr, "composite_ps" });
       native_shaders_definitions.emplace(CompileTimeStringHash("DS2 Pre DLSS CS"), ShaderDefinition{ "Luma_PreDLSS_CS", reshade::api::pipeline_subobject_type::compute_shader });
       native_shaders_definitions.emplace(CompileTimeStringHash("DS2 Post DLSS CS"), ShaderDefinition{ "Luma_PostDLSS_CS", reshade::api::pipeline_subobject_type::compute_shader });
@@ -243,6 +299,9 @@ public:
    // "GameDeviceData" has no virtual destructor, so delete it as our type (releases its resources and the D3D12 device)
    void OnDestroyDeviceData(DeviceData& device_data) override
    {
+      g_rtao_capture_active = false;
+      if (device_data.game)
+         static_cast<GameDeviceDataDishonored2*>(device_data.game)->rtao.WaitForIdle(2000); // Nothing in flight when the RT objects go
       delete static_cast<GameDeviceDataDishonored2*>(device_data.game);
       device_data.game = nullptr;
    }
@@ -303,6 +362,19 @@ public:
          return false;
       }
 
+      // Ray traced outputs need the capture, the TLAS and the pass; if they can't start, show the depth test instead
+      int output = std::clamp(g_rtao_debug_mode, 0, int(RTAO_OUTPUT_COUNT) - 1);
+      if (RTAOOutputIsRayTraced(output) && !EnsureRTAORayTracing(native_device, device_data, game_device_data))
+         output = RTAO_OUTPUT_DEPTH_TEST;
+      const bool ray_traced = RTAOOutputIsRayTraced(output);
+      g_rtao_capture_active = ray_traced;
+      game_device_data.rtao_last_draw_frame = game_device_data.rtao_frame;
+      g_rtao_main_depth_width = depth_desc.Width;
+      g_rtao_main_depth_height = depth_desc.Height;
+      RTAO::PassSettings settings = MakeRTAOSettings(output);
+      settings.reset_history = output != game_device_data.rtao_last_output;
+      game_device_data.rtao_last_output = output;
+
       const bool immediate = native_device_context->GetType() == D3D11_DEVICE_CONTEXT_IMMEDIATE;
       if (!game_device_data.rtao_logged_context_type.exchange(true))
       {
@@ -334,14 +406,15 @@ public:
       RTAO::Constants constants = {};
       static_assert(sizeof(constants.inv_projection) == sizeof(cb_per_view_global.cb_inverseprojectionmatrix));
       std::memcpy(constants.inv_projection, &cb_per_view_global.cb_inverseprojectionmatrix, sizeof(constants.inv_projection));
-      constants.debug_mode = uint32_t(g_rtao_debug_mode);
+      constants.debug_mode = output == RTAO_OUTPUT_TEST_PATTERN ? 1 : 0;
       constants.strength = g_rtao_strength;
       constants.frame = cb_luma_global_settings.FrameIndex;
 
       // 2) D3D11 -> D3D12 -> D3D11
       if (immediate)
       {
-         if (!rtao.Run(native_device_context, constants, error))
+         const bool ok = ray_traced ? rtao.Run(native_device_context, MakeRTAORecorder(game_device_data, settings), error) : rtao.Run(native_device_context, constants, error);
+         if (!ok)
          {
             game_device_data.rtao_stat_failed++;
             if (!game_device_data.rtao_logged_run_error.exchange(true))
@@ -357,7 +430,12 @@ public:
          GameDeviceDataDishonored2::RTAOPendingSplit pending;
          pending.deferred_context = native_device_context;
          pending.constants = constants;
+         pending.settings = settings;
+         pending.output = output;
          pending.frame = game_device_data.rtao_frame;
+         // Geometry recorded so far on this context lands in the prefix (executed before the D3D12 pass)
+         if (ray_traced)
+            pending.capture_records = game_device_data.rtao_capture.TakeContextRecords(native_device_context);
          if (FAILED(native_device_context->FinishCommandList(TRUE, pending.prefix.put())) || !pending.prefix)
          {
             return false;
@@ -385,19 +463,90 @@ public:
       return true;
    }
 
+   // Lazily starts the ray tracing part of RTAO (capture, acceleration structures, pass). Render thread.
+   static bool EnsureRTAORayTracing(ID3D11Device* native_device, DeviceData& device_data, GameDeviceDataDishonored2& game_device_data)
+   {
+      if (game_device_data.rtao_rt_ready)
+         return true;
+      if (game_device_data.rtao_rt_failed)
+         return false;
+      const auto capture_cs = device_data.native_compute_shaders.find(CompileTimeStringHash("DS2 RTAO Capture CS"));
+      if (capture_cs == device_data.native_compute_shaders.end() || !capture_cs->second)
+         return false; // Not compiled (yet)
+      std::string error;
+      auto& rtao = game_device_data.rtao;
+      if (!game_device_data.rtao_capture.Init(native_device, rtao, capture_cs->second.get(), error) || !game_device_data.rtao_pass.Init(rtao.GetDevice(), error) ||
+         !game_device_data.rtao_timer.Init(rtao.GetDevice(), rtao.GetTimestampFrequency(), error))
+      {
+         game_device_data.rtao_rt_failed = true;
+         SetRTAOStatus("ray tracing failed to start, showing the depth test instead: " + error, true);
+         return false;
+      }
+      game_device_data.rtao_rt_ready = true;
+      SetRTAOStatus("ray tracing ready (geometry capture, BLAS/TLAS, RayQuery AO + denoiser)", false);
+      return true;
+   }
+
+   // Camera from the game's per view constants (the copy Luma keeps, see UpdateGlobalCB). The game's vertex shaders
+   // compute clip = world.x * VP[0] + world.y * VP[1] + world.z * VP[2] + VP[3] on the matrix registers as stored,
+   // which is the row vector convention RTAO::PassSettings uses, so the bytes are taken as they are.
+   static RTAO::PassSettings MakeRTAOSettings(int output)
+   {
+      RTAO::PassSettings settings;
+      static_assert(sizeof(settings.view_proj) == sizeof(cb_per_view_global.cb_viewprojectionmatrix));
+      std::memcpy(settings.view_proj, &cb_per_view_global.cb_viewprojectionmatrix, sizeof(settings.view_proj));
+      RTAO::InvertMatrix(settings.view_proj, settings.inv_view_proj);
+      std::memcpy(settings.cam_pos, &cb_per_view_global.cb_wscampos, sizeof(settings.cam_pos));
+      std::memcpy(settings.cam_fwd, &cb_per_view_global.cb_wscamforwarddir, sizeof(settings.cam_fwd));
+      settings.reversed_z = true; // Dishonored 2 renders with inverted depth (see the DLSS settings)
+      settings.radius = (std::max)(g_rtao_radius, 0.01f);
+      settings.ray_count = uint32_t(std::clamp(g_rtao_rays, 1, 64));
+      settings.filter_mode = (output == RTAO_OUTPUT_AO) ? RTAO::FilterMode::Temporal : RTAO::FilterMode::Off;
+      settings.debug_mode = output == RTAO_OUTPUT_COVERAGE ? 3 : 0;
+      return settings;
+   }
+
+   static RTAO::Recorder MakeRTAORecorder(GameDeviceDataDishonored2& game_device_data, const RTAO::PassSettings& settings)
+   {
+      return [&game_device_data, settings](ID3D12GraphicsCommandList4* list, const RTAO::RecordInfo& info, std::string& error) {
+         auto& g = game_device_data;
+         g.rtao_retirer.Collect(info.completed_fence_value);
+         g.rtao_timer.Collect(info.frame_slot);
+         g.rtao_timer.Begin(list, info.frame_slot);
+         if (!g.rtao_capture.Record(list, info, g.rtao_blases, g.rtao_tlas, g.rtao_retirer, 64, error))
+            return false;
+         const RTAO::BuildContext ctx = { info.device, list, &g.rtao_retirer, info.submit_fence_value };
+         D3D12_GPU_VIRTUAL_ADDRESS top = 0;
+         uint32_t instances = 0;
+         if (!g.rtao_tlas.Build(ctx, g.rtao_blases, info.frame_slot, top, instances, error))
+            return false;
+         if (!g.rtao_pass.Record(list, info, top, settings, g.rtao_retirer, error))
+            return false;
+         g.rtao_timer.End(list, info.frame_slot);
+         g.rtao_blas_count = g.rtao_blases.Count();
+         g.rtao_blas_bytes = g.rtao_blases.ResultBytes();
+         g.rtao_tlas_instances = instances;
+         g.rtao_gpu_us = uint32_t(g.rtao_timer.LastMs() * 1000.0);
+         return true;
+      };
+   }
+
    // Deferred SSAO only: map the game's FinishCommandList() to our pending split, and run the D3D12 pass right before
-   // the game executes that command list on the immediate context.
+   // the game executes that command list on the immediate context. Also does the geometry capture's command list
+   // bookkeeping (records count as executed only when their command list runs).
    static void HandleRTAOCommandList(reshade::api::command_list* cmd_list, reshade::api::command_list* secondary_cmd_list)
    {
       auto& device_data = *cmd_list->get_device()->get_private_data<DeviceData>();
       if (!device_data.game)
          return;
       auto& game_device_data = GetGameDeviceData(device_data);
+      bool any_pending;
       {
          const std::lock_guard lock(game_device_data.rtao_pending_mutex);
-         if (game_device_data.rtao_pending.empty())
-            return;
+         any_pending = !game_device_data.rtao_pending.empty();
       }
+      if (!any_pending && !game_device_data.rtao_rt_ready)
+         return;
 
       ID3D11DeviceChild* first = (ID3D11DeviceChild*)(cmd_list->get_native());
       ID3D11DeviceChild* second = (ID3D11DeviceChild*)(secondary_cmd_list->get_native());
@@ -410,22 +559,32 @@ public:
          if (context->GetType() != D3D11_DEVICE_CONTEXT_IMMEDIATE)
             return;
          GameDeviceDataDishonored2::RTAOPendingSplit pending;
+         bool found = false;
+         if (any_pending)
          {
             const std::lock_guard lock(game_device_data.rtao_pending_mutex);
             auto it = std::find_if(game_device_data.rtao_pending.begin(), game_device_data.rtao_pending.end(), [&](const auto& p) { return p.remainder_command_list == command_list.get(); });
-            if (it == game_device_data.rtao_pending.end())
-               return;
-            pending = std::move(*it);
-            game_device_data.rtao_pending.erase(it);
+            if (it != game_device_data.rtao_pending.end())
+            {
+               pending = std::move(*it);
+               game_device_data.rtao_pending.erase(it);
+               found = true;
+            }
          }
-         context->ExecuteCommandList(pending.prefix.get(), TRUE);
-         std::string error;
-         const bool ok = game_device_data.rtao.Run(context.get(), pending.constants, error);
-         (ok ? game_device_data.rtao_stat_deferred_ok : game_device_data.rtao_stat_failed)++;
-         if (!ok && !game_device_data.rtao_logged_run_error.exchange(true))
+         if (found)
          {
-            SetRTAOStatus("D3D12 pass failed (deferred): " + error, true); // The composite then reads the previous AO
+            context->ExecuteCommandList(pending.prefix.get(), TRUE);
+            game_device_data.rtao_capture.Commit(pending.capture_records); // The prefix's draws have now executed
+            std::string error;
+            const bool ok = RTAOOutputIsRayTraced(pending.output) ? game_device_data.rtao.Run(context.get(), MakeRTAORecorder(game_device_data, pending.settings), error) : game_device_data.rtao.Run(context.get(), pending.constants, error);
+            (ok ? game_device_data.rtao_stat_deferred_ok : game_device_data.rtao_stat_failed)++;
+            if (!ok && !game_device_data.rtao_logged_run_error.exchange(true))
+            {
+               SetRTAOStatus("D3D12 pass failed (deferred): " + error, true); // The composite then reads the previous AO
+            }
          }
+         // After the D3D12 pass: this list's own draws run after it (for the split list, the post SSAO remainder)
+         game_device_data.rtao_capture.OnExecuteCommandList(command_list.get());
          return;
       }
 
@@ -434,6 +593,7 @@ public:
       command_list.reset();
       if (SUCCEEDED(first->QueryInterface(&command_list)) && SUCCEEDED(second->QueryInterface(&context)))
       {
+         game_device_data.rtao_capture.OnFinishCommandList(context.get(), command_list.get());
          const std::lock_guard lock(game_device_data.rtao_pending_mutex);
          for (auto& pending : game_device_data.rtao_pending)
          {
@@ -691,6 +851,10 @@ public:
 
       // Drop deferred RTAO splits the game never executed (e.g. discarded command lists)
       game_device_data.rtao_frame++;
+      if (game_device_data.rtao_capture.IsInitialized())
+         game_device_data.rtao_capture.OnPresent();
+      if (game_device_data.rtao_frame - game_device_data.rtao_last_draw_frame > 2)
+         g_rtao_capture_active = false; // RTAO not drawing (other AO mode, menus): no capture cost
       {
          const std::lock_guard lock(game_device_data.rtao_pending_mutex);
          game_device_data.rtao_stat_dropped += uint32_t(std::erase_if(game_device_data.rtao_pending, [&](const auto& p) { return game_device_data.rtao_frame - p.frame > 3; }));
@@ -703,6 +867,15 @@ public:
             rtao_frames, game_device_data.rtao_stat_inline_ok.load(), game_device_data.rtao_stat_splits.load(), game_device_data.rtao_stat_mapped.load(),
             game_device_data.rtao_stat_deferred_ok.load(), game_device_data.rtao_stat_failed.load(), game_device_data.rtao_stat_dropped.load());
          reshade::log::message(reshade::log::level::info, buffer);
+         if (game_device_data.rtao_capture.IsInitialized())
+         {
+            const RTAO::CaptureStats stats = game_device_data.rtao_capture.GetStats();
+            snprintf(buffer, sizeof(buffer), "RTAO: capture: draws %llu/%llu captured, meshes %llu (%llu with BLAS, %llu MB), arena %llu MB, TLAS %u, indirect draws %llu, unknown VS %llu, GPU %.2f ms",
+               (unsigned long long)stats.draws_captured, (unsigned long long)stats.draws_seen, (unsigned long long)stats.meshes, (unsigned long long)stats.meshes_ready,
+               (unsigned long long)(game_device_data.rtao_blas_bytes.load() >> 20), (unsigned long long)(stats.arena_vertex_bytes >> 20), game_device_data.rtao_tlas_instances.load(),
+               (unsigned long long)g_rtao_indirect_draws.load(), (unsigned long long)g_rtao_draws_unknown_shader.load(), game_device_data.rtao_gpu_us.load() / 1000.0);
+            reshade::log::message(reshade::log::level::info, buffer);
+         }
       }
    }
    
@@ -1166,6 +1339,205 @@ public:
       return DrawOrDispatchOverrideType::None; // Return true to cancel this draw call
    }
 
+   // ---- RTAO geometry capture hooks
+
+   static void OnRTAOInitPipeline(reshade::api::device* device, reshade::api::pipeline_layout, uint32_t subobject_count, const reshade::api::pipeline_subobject* subobjects, reshade::api::pipeline pipeline)
+   {
+      if (device->get_api() != reshade::api::device_api::d3d11)
+         return;
+      for (uint32_t i = 0; i < subobject_count; i++)
+      {
+         const auto& subobject = subobjects[i];
+         if (subobject.type == reshade::api::pipeline_subobject_type::vertex_shader && subobject.data)
+         {
+            const auto* desc = static_cast<const reshade::api::shader_desc*>(subobject.data);
+            if (!desc->code || desc->code_size == 0)
+               continue;
+            RTAO::VertexShaderInfo info;
+            RTAO::ReflectVertexShader(desc->code, desc->code_size, info);
+            g_rtao_vs_by_source[(std::min)(uint32_t(info.source), 3u)]++;
+            const std::unique_lock lock(g_rtao_shader_mutex);
+            g_rtao_vertex_shaders[pipeline.handle] = info;
+         }
+         else if (subobject.type == reshade::api::pipeline_subobject_type::input_layout && subobject.data)
+         {
+            const auto* elements = static_cast<const reshade::api::input_element*>(subobject.data);
+            std::vector<D3D11_INPUT_ELEMENT_DESC> descs(subobject.count);
+            for (uint32_t j = 0; j < subobject.count; j++)
+            {
+               descs[j].SemanticName = elements[j].semantic;
+               descs[j].SemanticIndex = elements[j].semantic_index;
+               descs[j].Format = DXGI_FORMAT(elements[j].format);
+               descs[j].InputSlot = elements[j].buffer_binding;
+               descs[j].AlignedByteOffset = elements[j].offset;
+               descs[j].InputSlotClass = elements[j].instance_step_rate > 0 ? D3D11_INPUT_PER_INSTANCE_DATA : D3D11_INPUT_PER_VERTEX_DATA;
+               descs[j].InstanceDataStepRate = elements[j].instance_step_rate;
+            }
+            const RTAO::InputLayoutInfo info = RTAO::ParseInputLayout(descs.data(), uint32_t(descs.size()));
+            const std::unique_lock lock(g_rtao_shader_mutex);
+            g_rtao_input_layouts[pipeline.handle] = info;
+         }
+      }
+   }
+
+   static void OnRTAODestroyPipeline(reshade::api::device* device, reshade::api::pipeline pipeline)
+   {
+      if (device->get_api() != reshade::api::device_api::d3d11)
+         return;
+      const std::unique_lock lock(g_rtao_shader_mutex);
+      g_rtao_vertex_shaders.erase(pipeline.handle);
+      g_rtao_input_layouts.erase(pipeline.handle);
+   }
+
+   // Is the bound depth target the main view's, with depth writes on? (Shadow maps and other views use other targets.)
+   static bool IsMainViewDepthWrite(ID3D11DeviceContext* context, bool depth_only)
+   {
+      com_ptr<ID3D11RenderTargetView> rtv;
+      com_ptr<ID3D11DepthStencilView> dsv;
+      context->OMGetRenderTargets(1, &rtv, &dsv);
+      if (!dsv || (depth_only && rtv))
+         return false;
+      com_ptr<ID3D11Resource> resource;
+      dsv->GetResource(&resource);
+      com_ptr<ID3D11Texture2D> texture;
+      if (!resource || FAILED(resource->QueryInterface(&texture)))
+         return false;
+      D3D11_TEXTURE2D_DESC desc;
+      texture->GetDesc(&desc);
+      if (desc.Width != g_rtao_main_depth_width.load(std::memory_order_relaxed) || desc.Height != g_rtao_main_depth_height.load(std::memory_order_relaxed))
+         return false;
+      com_ptr<ID3D11DepthStencilState> state;
+      UINT stencil_ref = 0;
+      context->OMGetDepthStencilState(&state, &stencil_ref);
+      if (state) // Null is the default state: depth test and writes on
+      {
+         D3D11_DEPTH_STENCIL_DESC state_desc;
+         state->GetDesc(&state_desc);
+         if (!state_desc.DepthEnable || state_desc.DepthWriteMask != D3D11_DEPTH_WRITE_MASK_ALL)
+            return false;
+      }
+      return true;
+   }
+
+   static bool OnRTAODrawIndexed(reshade::api::command_list* cmd_list, uint32_t index_count, uint32_t instance_count, uint32_t first_index, int32_t vertex_offset, uint32_t first_instance)
+   {
+      if (!g_rtao_capture_active.load(std::memory_order_relaxed))
+         return false;
+      auto* device = cmd_list->get_device();
+      if (device->get_api() != reshade::api::device_api::d3d11)
+         return false;
+      auto* context = reinterpret_cast<ID3D11DeviceContext*>(cmd_list->get_native());
+      if (!IsMainViewDepthWrite(context, g_rtao_capture_pass == 0))
+         return false;
+      D3D11_PRIMITIVE_TOPOLOGY topology;
+      context->IAGetPrimitiveTopology(&topology);
+      if (topology != D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST)
+         return false;
+
+      com_ptr<ID3D11VertexShader> vs;
+      context->VSGetShader(&vs, nullptr, nullptr);
+      com_ptr<ID3D11InputLayout> layout;
+      context->IAGetInputLayout(&layout);
+      RTAO::VertexShaderInfo vs_info;
+      RTAO::InputLayoutInfo layout_info;
+      {
+         const std::shared_lock lock(g_rtao_shader_mutex);
+         auto vs_it = g_rtao_vertex_shaders.find(uint64_t(uintptr_t(vs.get())));
+         if (vs_it == g_rtao_vertex_shaders.end())
+         {
+            g_rtao_draws_unknown_shader++;
+            return false;
+         }
+         vs_info = vs_it->second;
+         auto layout_it = g_rtao_input_layouts.find(uint64_t(uintptr_t(layout.get())));
+         if (layout_it != g_rtao_input_layouts.end())
+            layout_info = layout_it->second;
+      }
+      g_rtao_draws_by_source[(std::min)(uint32_t(vs_info.source), 3u)]++;
+      if (vs_info.source == RTAO::MatrixSource::None)
+         return false;
+      if (!layout_info.has_position || layout_info.position_per_instance)
+      {
+         g_rtao_draws_unusable_layout++;
+         return false;
+      }
+
+      RTAO::DrawInfo draw;
+      draw.vs = &vs_info;
+      draw.position_format = layout_info.position_format;
+      draw.position_offset = layout_info.position_offset;
+      draw.index_count = index_count;
+      draw.first_index = first_index;
+      draw.base_vertex = vertex_offset;
+      draw.instance_count = instance_count;
+      com_ptr<ID3D11Buffer> vertex_buffer, index_buffer, instance_cb;
+      com_ptr<ID3D11ShaderResourceView> instance_buffer, instance_index;
+      UINT stride = 0, offset = 0;
+      context->IAGetVertexBuffers(layout_info.position_slot, 1, &vertex_buffer, &stride, &offset);
+      DXGI_FORMAT index_format = DXGI_FORMAT_UNKNOWN;
+      UINT index_offset = 0;
+      context->IAGetIndexBuffer(&index_buffer, &index_format, &index_offset);
+      if (vs_info.instance_cb_slot != RTAO::kNoOffset)
+      {
+         com_ptr<ID3D11DeviceContext1> context1;
+         UINT first_constant = 0, num_constants = 0;
+         if (SUCCEEDED(context->QueryInterface(&context1)))
+            context1->VSGetConstantBuffers1(vs_info.instance_cb_slot, 1, &instance_cb, &first_constant, &num_constants);
+         else
+            context->VSGetConstantBuffers(vs_info.instance_cb_slot, 1, &instance_cb);
+         draw.instance_cb_first_constant = first_constant;
+         draw.instance_cb_num_constants = num_constants;
+      }
+      if (vs_info.instance_buffer_slot != RTAO::kNoOffset)
+         context->VSGetShaderResources(vs_info.instance_buffer_slot, 1, &instance_buffer);
+      if (vs_info.instance_index_slot != RTAO::kNoOffset)
+         context->VSGetShaderResources(vs_info.instance_index_slot, 1, &instance_index);
+      draw.vertex_buffer = vertex_buffer.get();
+      draw.vertex_buffer_offset = offset;
+      draw.vertex_stride = stride;
+      draw.index_buffer = index_buffer.get();
+      draw.index_format = index_format;
+      draw.index_buffer_offset = index_offset;
+      draw.instance_cb = instance_cb.get();
+      draw.instance_buffer = instance_buffer.get();
+      draw.instance_index = instance_index.get();
+
+      auto& device_data = *device->get_private_data<DeviceData>();
+      if (device_data.game)
+         GetGameDeviceData(device_data).rtao_capture.CaptureDraw(context, draw);
+      return false;
+   }
+
+   // GPU culled geometry (arkcullgeometry) is drawn indirectly: counted only for now (see RTAO_NOTES.md)
+   static bool OnRTAODrawIndirect(reshade::api::command_list* cmd_list, reshade::api::indirect_command type, reshade::api::resource buffer, uint64_t offset, uint32_t draw_count, uint32_t stride)
+   {
+      if (!g_rtao_capture_active.load(std::memory_order_relaxed) || type != reshade::api::indirect_command::draw_indexed)
+         return false;
+      if (cmd_list->get_device()->get_api() != reshade::api::device_api::d3d11)
+         return false;
+      if (IsMainViewDepthWrite(reinterpret_cast<ID3D11DeviceContext*>(cmd_list->get_native()), false))
+         g_rtao_indirect_draws += draw_count;
+      return false;
+   }
+
+   static void OnRTAODestroyResource(reshade::api::device* device, reshade::api::resource resource)
+   {
+      if (device->get_api() != reshade::api::device_api::d3d11 || resource.handle == 0)
+         return;
+      auto* native = reinterpret_cast<ID3D11Resource*>(resource.handle);
+      D3D11_RESOURCE_DIMENSION dimension = D3D11_RESOURCE_DIMENSION_UNKNOWN;
+      native->GetType(&dimension);
+      if (dimension != D3D11_RESOURCE_DIMENSION_BUFFER)
+         return;
+      auto* device_data = device->get_private_data<DeviceData>();
+      if (device_data && device_data->game)
+      {
+         auto& game_device_data = GetGameDeviceData(*device_data);
+         if (game_device_data.rtao_capture.IsInitialized())
+            game_device_data.rtao_capture.OnDestroyBuffer(static_cast<ID3D11Buffer*>(native));
+      }
+   }
+
    static void OnMapBufferRegion(reshade::api::device* device, reshade::api::resource resource, uint64_t offset, uint64_t size, reshade::api::map_access access, void** data)
    {
       if (device->get_api() != reshade::api::device_api::d3d11) // e.g. RTAO's D3D12 device
@@ -1441,7 +1813,13 @@ public:
       }
       g_ao_mode = (ao_mode >= AO_MODE_OFF && ao_mode < AO_MODE_COUNT) ? ao_mode : AO_MODE_XEGTAO;
       reshade::get_config_value(runtime, NAME, "RTAOTestOutput", g_rtao_debug_mode);
-      g_rtao_debug_mode = std::clamp(g_rtao_debug_mode, 0, 1);
+      g_rtao_debug_mode = std::clamp(g_rtao_debug_mode, 0, int(RTAO_OUTPUT_COUNT) - 1);
+      reshade::get_config_value(runtime, NAME, "RTAORadius", g_rtao_radius);
+      reshade::get_config_value(runtime, NAME, "RTAORays", g_rtao_rays);
+      reshade::get_config_value(runtime, NAME, "RTAOCapturePass", g_rtao_capture_pass);
+      g_rtao_radius = std::clamp(g_rtao_radius, 0.05f, 50.f);
+      g_rtao_rays = std::clamp(g_rtao_rays, 1, 64);
+      g_rtao_capture_pass = std::clamp(g_rtao_capture_pass, 0, 1);
 
       auto& game_settings = cb_luma_global_settings.GameSettings;
       reshade::get_config_value(runtime, NAME, "BloomStrength", game_settings.BloomStrength);
@@ -1516,10 +1894,47 @@ public:
             status = g_rtao_status;
          }
          ImGui::TextWrapped("RTAO status: %s", status.empty() ? "waiting for the SSAO pass" : status.c_str());
-         static const char* rtao_debug_mode_names[] = { "Depth test AO", "Test pattern" };
-         if (ImGui::Combo("RTAO Test Output", &g_rtao_debug_mode, rtao_debug_mode_names, IM_ARRAYSIZE(rtao_debug_mode_names)))
+         static const char* rtao_output_names[RTAO_OUTPUT_COUNT] = { "Ray traced AO", "Test pattern (interop check)", "Depth test AO (no ray tracing)", "BLAS coverage (debug)", "Ray traced AO, no denoiser" };
+         if (ImGui::Combo("RTAO Output", &g_rtao_debug_mode, rtao_output_names, RTAO_OUTPUT_COUNT))
             reshade::set_config_value(runtime, NAME, "RTAOTestOutput", g_rtao_debug_mode);
-         ImGui::SliderFloat("RTAO Test Strength", &g_rtao_strength, 0.f, 4.f);
+         if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("BLAS coverage: white = captured geometry matches the depth buffer, grey = geometry missing from the ray tracing scene, black = geometry in front of what the depth shows (misplaced or extra).");
+         if (ImGui::SliderFloat("RTAO Radius", &g_rtao_radius, 0.05f, 10.f, "%.2f", ImGuiSliderFlags_Logarithmic))
+            g_rtao_radius = std::clamp(g_rtao_radius, 0.05f, 50.f);
+         if (ImGui::IsItemDeactivatedAfterEdit())
+            reshade::set_config_value(runtime, NAME, "RTAORadius", g_rtao_radius);
+         if (ImGui::SliderInt("RTAO Rays", &g_rtao_rays, 1, 16))
+            g_rtao_rays = std::clamp(g_rtao_rays, 1, 64);
+         if (ImGui::IsItemDeactivatedAfterEdit())
+            reshade::set_config_value(runtime, NAME, "RTAORays", g_rtao_rays);
+         static const char* capture_pass_names[] = { "Depth only draws", "All depth writing draws" };
+         if (ImGui::Combo("RTAO Capture", &g_rtao_capture_pass, capture_pass_names, IM_ARRAYSIZE(capture_pass_names)))
+            reshade::set_config_value(runtime, NAME, "RTAOCapturePass", g_rtao_capture_pass);
+         if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("Which main view draws feed the ray tracing scene. Use \"All\" if the coverage view shows missing (grey) geometry.");
+         if (ImGui::SliderFloat("RTAO Test Strength", &g_rtao_strength, 0.f, 4.f))
+            g_rtao_strength = std::clamp(g_rtao_strength, 0.f, 4.f);
+
+         auto& game_device_data = GetGameDeviceData(device_data);
+         if (game_device_data.rtao_capture.IsInitialized() && ImGui::TreeNode("RTAO stats"))
+         {
+            const RTAO::CaptureStats stats = game_device_data.rtao_capture.GetStats();
+            ImGui::Text("GPU time (capture readback, BLAS/TLAS builds, trace, denoise): %.2f ms", game_device_data.rtao_gpu_us.load() / 1000.0);
+            ImGui::Text("Draws seen %llu, captured %llu (%llu instances)", (unsigned long long)stats.draws_seen, (unsigned long long)stats.draws_captured, (unsigned long long)stats.instances_captured);
+            ImGui::Text("Main view draws by matrix source: none %llu, direct %llu, indexed %llu, cbuffer %llu",
+               (unsigned long long)g_rtao_draws_by_source[0].load(), (unsigned long long)g_rtao_draws_by_source[1].load(), (unsigned long long)g_rtao_draws_by_source[2].load(), (unsigned long long)g_rtao_draws_by_source[3].load());
+            ImGui::Text("Unknown vertex shader %llu, unusable input layout %llu, GPU culled (indirect, not captured) %llu",
+               (unsigned long long)g_rtao_draws_unknown_shader.load(), (unsigned long long)g_rtao_draws_unusable_layout.load(), (unsigned long long)g_rtao_indirect_draws.load());
+            ImGui::Text("Skipped: shader %llu, format %llu, buffer %llu, arena full %llu, ring %llu, binding %llu, other %llu",
+               (unsigned long long)stats.skipped[RTAO::kSkipShader], (unsigned long long)stats.skipped[RTAO::kSkipFormat], (unsigned long long)stats.skipped[RTAO::kSkipBuffer], (unsigned long long)stats.skipped[RTAO::kSkipArenaFull],
+               (unsigned long long)stats.skipped[RTAO::kSkipRingFull], (unsigned long long)stats.skipped[RTAO::kSkipBinding], (unsigned long long)stats.skipped[RTAO::kSkipOther]);
+            ImGui::Text("Meshes %llu (%llu with a BLAS, %llu failed), BLAS %llu (%.1f MB), buffers copied %llu (arena %.1f MB)", (unsigned long long)stats.meshes, (unsigned long long)stats.meshes_ready,
+               (unsigned long long)stats.blas_failed, (unsigned long long)game_device_data.rtao_blas_count.load(), game_device_data.rtao_blas_bytes.load() / 1048576.0, (unsigned long long)stats.buffers_copied, stats.arena_vertex_bytes / 1048576.0);
+            ImGui::Text("TLAS instances %u, instances read back last frame %llu, view model instances %llu", game_device_data.rtao_tlas_instances.load(), (unsigned long long)stats.frame_instances, (unsigned long long)stats.view_model_instances);
+            ImGui::Text("Vertex shaders reflected: none %llu, direct %llu, indexed %llu, cbuffer %llu", (unsigned long long)g_rtao_vs_by_source[0].load(), (unsigned long long)g_rtao_vs_by_source[1].load(),
+               (unsigned long long)g_rtao_vs_by_source[2].load(), (unsigned long long)g_rtao_vs_by_source[3].load());
+            ImGui::TreePop();
+         }
       }
    }
 
@@ -1705,6 +2120,11 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD ul_reason_for_call, LPVOID lpReserv
       reshade::unregister_event<reshade::addon_event::map_buffer_region>(Dishonored2::OnMapBufferRegion);
       reshade::unregister_event<reshade::addon_event::unmap_buffer_region>(Dishonored2::OnUnmapBufferRegion);
       reshade::unregister_event<reshade::addon_event::execute_secondary_command_list>(Dishonored2::OnExecuteSecondaryCommandList);
+      reshade::unregister_event<reshade::addon_event::init_pipeline>(Dishonored2::OnRTAOInitPipeline);
+      reshade::unregister_event<reshade::addon_event::destroy_pipeline>(Dishonored2::OnRTAODestroyPipeline);
+      reshade::unregister_event<reshade::addon_event::draw_indexed>(Dishonored2::OnRTAODrawIndexed);
+      reshade::unregister_event<reshade::addon_event::draw_or_dispatch_indirect>(Dishonored2::OnRTAODrawIndirect);
+      reshade::unregister_event<reshade::addon_event::destroy_resource>(Dishonored2::OnRTAODestroyResource);
    }
 
    CoreMain(hModule, ul_reason_for_call, lpReserved);

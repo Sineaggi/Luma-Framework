@@ -6363,7 +6363,9 @@ namespace
          if (cmd_list_data.is_known_ui_shader_bound || (!ui_separation_use_ui_hashes_only && device_data.has_drawn_main_post_processing && cmd_list_data.is_primary))
          {
             com_ptr<ID3D11RenderTargetView> rtv;
-            native_device_context->OMGetRenderTargets(1, &rtv, nullptr);
+            // Keep the game's depth stencil bound: UI (e.g. Iggy/Scaleform) can use stencil masks to clip widgets, and dropping it draws masked content unclipped
+            com_ptr<ID3D11DepthStencilView> dsv;
+            native_device_context->OMGetRenderTargets(1, &rtv, &dsv);
             if (rtv && !original_shader_hashes.Contains(shader_hashes_UI_excluded))
             {
                bool do_ui = false;
@@ -6386,7 +6388,7 @@ namespace
                   // Render target was set to the UI one by the game, whether at the beginning of UI drawing, or again inside of it (sometimes UI draws stuff on the side to compose its textures).
                   // Note: for now we don't restore this back to the original value, as we haven't found any game that reads back the RT, or doesn't set it every frame or draw call.
                   // Most of the times rendering the original UI on a black (0 0 0 0 cleared) render target preserves the original blends look identically.
-                  native_device_context->OMSetRenderTargets(1, &ui_texture_rtv_const, nullptr);
+                  native_device_context->OMSetRenderTargets(1, &ui_texture_rtv_const, IsDepthStencilCompatible(dsv.get(), device_data.ui_texture.get()) ? dsv.get() : nullptr);
                   do_ui = true;
 
 #if DEVELOPMENT
@@ -6419,7 +6421,7 @@ namespace
 
                if (rtv && rtv == ui_texture_rtv_const)
                {
-                  native_device_context->OMSetRenderTargets(1, &device_data.ui_latest_original_rtv, nullptr);
+                  native_device_context->OMSetRenderTargets(1, &device_data.ui_latest_original_rtv, dsv.get());
                   device_data.ui_latest_original_rtv = nullptr;
                }
             }
@@ -6427,10 +6429,11 @@ namespace
          else if (ui_separation_use_ui_hashes_only)
          {
             com_ptr<ID3D11RenderTargetView> rtv;
-            native_device_context->OMGetRenderTargets(1, &rtv, nullptr);
+            com_ptr<ID3D11DepthStencilView> dsv;
+            native_device_context->OMGetRenderTargets(1, &rtv, &dsv);
             if (rtv && rtv == ui_texture_rtv_const)
             {
-               native_device_context->OMSetRenderTargets(1, &device_data.ui_latest_original_rtv, nullptr);
+               native_device_context->OMSetRenderTargets(1, &device_data.ui_latest_original_rtv, dsv.get());
                device_data.ui_latest_original_rtv = nullptr;
             }
          }

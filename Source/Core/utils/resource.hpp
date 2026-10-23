@@ -443,6 +443,22 @@ bool AreViewsOfSameResource(ID3D11View* view1, ID3D11View* view2)
    return resource1 == resource2;
 }
 
+// Whether a depth stencil view can stay bound together with a render target texture (single 2D texture, same sample count, at least as large)
+bool IsDepthStencilCompatible(ID3D11DepthStencilView* dsv, ID3D11Texture2D* render_target)
+{
+   if (!dsv || !render_target)
+      return false;
+   com_ptr<ID3D11Resource> dsv_resource;
+   dsv->GetResource(&dsv_resource);
+   com_ptr<ID3D11Texture2D> dsv_texture;
+   if (!dsv_resource || FAILED(dsv_resource->QueryInterface(&dsv_texture)))
+      return false;
+   D3D11_TEXTURE2D_DESC dsv_desc, rt_desc;
+   dsv_texture->GetDesc(&dsv_desc);
+   render_target->GetDesc(&rt_desc);
+   return dsv_desc.SampleDesc.Count == rt_desc.SampleDesc.Count && dsv_desc.Width >= rt_desc.Width && dsv_desc.Height >= rt_desc.Height;
+}
+
 template<typename T>
 using D3D11_RESOURCE_DESC = std::conditional_t<typeid(T) == typeid(ID3D11Texture2D), D3D11_TEXTURE2D_DESC, std::conditional_t<typeid(T) == typeid(ID3D11Texture3D), D3D11_TEXTURE3D_DESC, std::conditional_t<typeid(T) == typeid(ID3D11Texture1D), D3D11_TEXTURE1D_DESC, D3D11_BUFFER_DESC>>>;
 

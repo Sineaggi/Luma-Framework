@@ -89,7 +89,11 @@ exist in the main view (DEVELOPMENT build, Luma's draw call list).
 - Per draw: `IAGetVertexBuffers` / `IAGetIndexBuffer` / `IAGetInputLayout`, `VSGetConstantBuffers(2)` (the
   PerInstanceCB contents need a map hook or a copy), `VSGetShaderResources` for the instance buffers and
   `ro_matrices`.
-- The game's VBs and IBs are not shareable with D3D12. The plan is a D3D12 buffer created with
-  `D3D12_HEAP_FLAG_SHARED` and opened in D3D11, then D3D11 `CopySubresourceRegion` from the game buffer into
-  it (buffers have no format restrictions, unlike textures). That is unverified: test it in
-  `Tests/rtao_interop_test.cpp` first.
+- The game's VBs and IBs are not shareable with D3D12, so they are copied (D3D11 `CopySubresourceRegion`) into
+  a buffer both APIs can see. Measured on the RTX 4090 (probe + `Tests/rtao_interop_test.cpp`):
+  - a D3D12 buffer with `D3D12_HEAP_FLAG_SHARED` does not open in D3D11 (`OpenSharedResource1`: E_INVALIDARG,
+    with any resource flags);
+  - a D3D11 buffer refuses `D3D11_RESOURCE_MISC_SHARED_NTHANDLE` (E_INVALIDARG);
+  - a D3D11 buffer with the legacy `D3D11_RESOURCE_MISC_SHARED` + `IDXGIResource::GetSharedHandle`, opened with
+    `ID3D12Device::OpenSharedHandle`, works. The test copies data through it and builds a BLAS straight from it
+    (`Interop::CreateSharedBuffer`, `BlasCache::BuildFromGpu`).

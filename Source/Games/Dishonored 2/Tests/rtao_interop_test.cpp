@@ -1,16 +1,25 @@
 // Standalone smoke test for rtao_interop.{h,cpp} (no game, no ReShade). Exercises, on the local GPU:
 // the D3D12 device on the D3D11 adapter (LUID), DXR 1.1 check, shared textures, the shared fence, the D3D11
 // depth copy shaders from Shaders/Dishonored 2/Luma_RTAO.hlsl, the D3D12 test kernel and the readback on D3D11.
+// M1: TLAS retention, D3D11 -> D3D12 shared buffers, BLAS (CPU and shared-buffer input) + TLAS of a box scene,
+// ray traced AO (RayQuery) and the denoiser, checked against a CPU ray cast of the same scene.
 //
 // Build (x64 Native Tools prompt, from this folder):
-//   cl /nologo /std:c++20 /EHsc /O2 /I.. rtao_interop_test.cpp ..\rtao_interop.cpp d3d11.lib d3dcompiler.lib
+//   cl /nologo /std:c++20 /EHsc /O2 /I.. rtao_interop_test.cpp ..\rtao_interop.cpp ..\rtao_accel.cpp ..\rtao_pass.cpp d3d11.lib d3dcompiler.lib
 // Run from this folder (it reads the shaders by relative path): rtao_interop_test.exe
 
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
 #include "rtao_interop.h"
+#include "rtao_accel.h"
+#include "rtao_pass.h"
 
 #include <d3dcompiler.h>
+#include <algorithm>
 #include <cmath>
 #include <cstdio>
+#include <cstring>
 #include <vector>
 
 static int g_failures = 0;
@@ -74,8 +83,463 @@ static std::vector<float> ReadAO(ID3D11Device* device, ID3D11DeviceContext* cont
    return out;
 }
 
+// ---- M1: acceleration structures, ray traced AO, denoiser
+
+// Row-vector 4x4 helpers (clip = float4(world, 1) * M), the convention of rtao_pass.h
+struct Mat4
+{
+   float m[16] = {};
+   float& operator()(int r, int c) { return m[r * 4 + c]; }
+   float operator()(int r, int c) const { return m[r * 4 + c]; }
+};
+static Mat4 Mul(const Mat4& a, const Mat4& b)
+{
+   Mat4 o;
+   for (int r = 0; r < 4; r++)
+      for (int c = 0; c < 4; c++)
+         for (int k = 0; k < 4; k++)
+            o(r, c) += a(r, k) * b(k, c);
+   return o;
+}
+static Mat4 Inverse(const Mat4& in)
+{
+   double a[4][8];
+   for (int r = 0; r < 4; r++)
+      for (int c = 0; c < 8; c++)
+         a[r][c] = c < 4 ? in(r, c) : (c - 4 == r ? 1.0 : 0.0);
+   for (int c = 0; c < 4; c++)
+   {
+      int pivot = c;
+      for (int r = c + 1; r < 4; r++)
+         if (std::fabs(a[r][c]) > std::fabs(a[pivot][c]))
+            pivot = r;
+      for (int k = 0; k < 8; k++)
+         std::swap(a[c][k], a[pivot][k]);
+      const double d = a[c][c];
+      for (int k = 0; k < 8; k++)
+         a[c][k] /= d;
+      for (int r = 0; r < 4; r++)
+         if (r != c)
+         {
+            const double f = a[r][c];
+            for (int k = 0; k < 8; k++)
+               a[r][k] -= f * a[c][k];
+         }
+   }
+   Mat4 o;
+   for (int r = 0; r < 4; r++)
+      for (int c = 0; c < 4; c++)
+         o(r, c) = float(a[r][c + 4]);
+   return o;
+}
+struct V3
+{
+   float x, y, z;
+};
+static V3 Sub(V3 a, V3 b) { return { a.x - b.x, a.y - b.y, a.z - b.z }; }
+static float Dot(V3 a, V3 b) { return a.x * b.x + a.y * b.y + a.z * b.z; }
+static V3 Cross(V3 a, V3 b) { return { a.y * b.z - a.z * b.y, a.z * b.x - a.x * b.z, a.x * b.y - a.y * b.x }; }
+static V3 Normalize(V3 a)
+{
+   float l = std::sqrt(Dot(a, a));
+   return { a.x / l, a.y / l, a.z / l };
+}
+
+struct Box
+{
+   V3 min, max;
+};
+// 0 is the ground; the floating box (3) goes through the shared-buffer BLAS (the game capture route)
+static const Box kBoxes[] = {
+   { { -20, -1, -20 }, { 20, 0, 20 } },
+   { { -1, 0, -1 }, { 1, 2, 1 } },
+   { { 3, 0, 2 }, { 4, 3, 3 } },
+   { { -4.5f, 0.6f, -1 }, { -3.5f, 1.6f, 0 } }, // 0.6 above the ground, inside the 1.5 AO radius
+};
+static constexpr int kBoxCount = int(sizeof(kBoxes) / sizeof(kBoxes[0]));
+
+// Unit cube [0,1]^3
+static const float kCubeVertices[8 * 3] = { 0, 0, 0, 1, 0, 0, 1, 1, 0, 0, 1, 0, 0, 0, 1, 1, 0, 1, 1, 1, 1, 0, 1, 1 };
+static const uint32_t kCubeIndices[36] = { 0, 2, 1, 0, 3, 2, 4, 5, 6, 4, 6, 7, 0, 1, 5, 0, 5, 4, 3, 7, 6, 3, 6, 2, 0, 4, 7, 0, 7, 3, 1, 2, 6, 1, 6, 5 };
+
+static bool RayBox(V3 o, V3 d, const Box& b, float& t_hit)
+{
+   float t0 = 0.f, t1 = 1e30f;
+   const float* oo = &o.x;
+   const float* dd = &d.x;
+   const float* mn = &b.min.x;
+   const float* mx = &b.max.x;
+   for (int a = 0; a < 3; a++)
+   {
+      if (std::fabs(dd[a]) < 1e-12f)
+      {
+         if (oo[a] < mn[a] || oo[a] > mx[a])
+            return false;
+         continue;
+      }
+      float ta = (mn[a] - oo[a]) / dd[a], tb = (mx[a] - oo[a]) / dd[a];
+      if (ta > tb)
+         std::swap(ta, tb);
+      t0 = std::max(t0, ta);
+      t1 = std::min(t1, tb);
+      if (t0 > t1)
+         return false;
+   }
+   t_hit = t0;
+   return true;
+}
+
+static float BoxDistance(V3 p, const Box& b)
+{
+   float dx = std::max({ b.min.x - p.x, 0.f, p.x - b.max.x });
+   float dy = std::max({ b.min.y - p.y, 0.f, p.y - b.max.y });
+   float dz = std::max({ b.min.z - p.z, 0.f, p.z - b.max.z });
+   return std::sqrt(dx * dx + dy * dy + dz * dz);
+}
+
+static void TestTlasRetention()
+{
+   RTAO::TlasBuilder tlas;
+   const float identity[3][4] = { { 1, 0, 0, 0 }, { 0, 1, 0, 0 }, { 0, 0, 1, 0 } };
+   tlas.BeginFrame();
+   tlas.AddInstance(1, 1, identity);
+   tlas.AddInstance(2, 1, identity);
+   for (uint32_t i = 0; i < RTAO::TlasBuilder::kRetainFrames; i++)
+   {
+      tlas.BeginFrame();
+      tlas.AddInstance(2, 1, identity); // 2 stays in view, 1 left the view
+   }
+   CHECK(tlas.RetainedCount() == 2, "an instance must be kept for kRetainFrames after it left the view (got %zu)", tlas.RetainedCount());
+   tlas.BeginFrame();
+   CHECK(tlas.RetainedCount() == 1, "an instance must be pruned after kRetainFrames (got %zu)", tlas.RetainedCount());
+   printf("TLAS retention: ok\n");
+}
+
+// The game capture route: D3D11 CopySubresourceRegion from a (non shared) D3D11 buffer into a D3D12 shared buffer
+static void TestSharedBuffer(ID3D11Device* device, ID3D11DeviceContext* context, RTAO::Interop& interop)
+{
+   std::string error;
+   std::vector<uint32_t> pattern(256);
+   for (uint32_t i = 0; i < pattern.size(); i++)
+      pattern[i] = 0xA5000000u | i * 7919u;
+   D3D11_BUFFER_DESC desc = { UINT(pattern.size() * 4), D3D11_USAGE_IMMUTABLE, D3D11_BIND_VERTEX_BUFFER, 0, 0, 0 };
+   D3D11_SUBRESOURCE_DATA data = { pattern.data(), 0, 0 };
+   ID3D11Buffer* source = nullptr;
+   device->CreateBuffer(&desc, &data, &source);
+   ID3D12Resource* shared12 = nullptr;
+   ID3D11Buffer* shared11 = nullptr;
+   if (!interop.CreateSharedBuffer(device, pattern.size() * 4, shared12, shared11, error))
+   {
+      CHECK(false, "CreateSharedBuffer: %s", error.c_str());
+      source->Release();
+      return;
+   }
+   context->CopySubresourceRegion(shared11, 0, 0, 0, 0, source, 0, nullptr);
+
+   D3D12_RESOURCE_DESC readback_desc = shared12->GetDesc();
+   readback_desc.Flags = D3D12_RESOURCE_FLAG_NONE; // The shared one may allow UAVs, a readback buffer can't
+   D3D12_HEAP_PROPERTIES heap = { D3D12_HEAP_TYPE_READBACK };
+   ID3D12Resource* readback = nullptr;
+   interop.GetDevice()->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &readback_desc, D3D12_RESOURCE_STATE_COPY_DEST, nullptr, IID_PPV_ARGS(&readback));
+   CHECK(interop.Run(context, [&](ID3D12GraphicsCommandList4* list, const RTAO::RecordInfo&, std::string&) {
+      D3D12_RESOURCE_BARRIER barrier = {};
+      barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+      barrier.Transition.pResource = shared12;
+      barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_COMMON;
+      barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_SOURCE;
+      list->ResourceBarrier(1, &barrier);
+      list->CopyBufferRegion(readback, 0, shared12, 0, pattern.size() * 4);
+      std::swap(barrier.Transition.StateBefore, barrier.Transition.StateAfter);
+      list->ResourceBarrier(1, &barrier);
+      return true;
+   }, error), "Run (shared buffer): %s", error.c_str());
+   CHECK(interop.WaitForIdle(5000), "WaitForIdle");
+   const uint32_t* mapped = nullptr;
+   readback->Map(0, nullptr, (void**)&mapped);
+   bool same = mapped && std::memcmp(mapped, pattern.data(), pattern.size() * 4) == 0;
+   readback->Unmap(0, nullptr);
+   CHECK(same, "D3D11 copy into the shared buffer must be visible on D3D12");
+   printf("shared buffer (D3D11 CopySubresourceRegion -> D3D12): %s\n", same ? "ok" : "MISMATCH");
+   readback->Release();
+   shared11->Release();
+   shared12->Release();
+   source->Release();
+}
+
+static void TestRayTracedScene(ID3D11Device* device, ID3D11DeviceContext* context, RTAO::Interop& interop, ID3D11VertexShader* copy_vs, ID3D11PixelShader* depth_ps)
+{
+   std::string error;
+   const UINT W = 320, H = 180;
+   CHECK(interop.EnsureTargets(device, W, H, W, H, error), "EnsureTargets: %s", error.c_str());
+
+   // Camera: LH, row vectors, reversed Z
+   const V3 eye = { 0, 4, -9 }, target = { 0, 0.5f, 0 }, up = { 0, 1, 0 };
+   const V3 f = Normalize(Sub(target, eye)), r = Normalize(Cross(up, f)), u = Cross(f, r);
+   Mat4 view;
+   view(0, 0) = r.x; view(0, 1) = u.x; view(0, 2) = f.x;
+   view(1, 0) = r.y; view(1, 1) = u.y; view(1, 2) = f.y;
+   view(2, 0) = r.z; view(2, 1) = u.z; view(2, 2) = f.z;
+   view(3, 0) = -Dot(r, eye); view(3, 1) = -Dot(u, eye); view(3, 2) = -Dot(f, eye); view(3, 3) = 1;
+   const float n = 0.1f, fr = 1000.f, sy = 1.f / std::tan(3.14159265f / 6.f), sx = sy / (float(W) / float(H));
+   Mat4 proj;
+   proj(0, 0) = sx;
+   proj(1, 1) = sy;
+   proj(2, 2) = -n / (fr - n);
+   proj(2, 3) = 1;
+   proj(3, 2) = n * fr / (fr - n);
+   const Mat4 view_proj = Mul(view, proj), inv_view_proj = Inverse(view_proj);
+
+   // Reference "rasterization" on the CPU: depth, hit object and world position per pixel
+   std::vector<float> depth(W * H, 0.f);
+   std::vector<int> hit_id(W * H, -1);
+   std::vector<V3> hit_pos(W * H);
+   for (UINT y = 0; y < H; y++)
+      for (UINT x = 0; x < W; x++)
+      {
+         const float ndc_x = (x + 0.5f) / W * 2.f - 1.f, ndc_y = 1.f - (y + 0.5f) / H * 2.f;
+         float v[4] = { ndc_x, ndc_y, 0.5f, 1.f }, w[4] = {};
+         for (int c = 0; c < 4; c++)
+            for (int k = 0; k < 4; k++)
+               w[c] += v[k] * inv_view_proj(k, c);
+         const V3 dir = Normalize(Sub({ w[0] / w[3], w[1] / w[3], w[2] / w[3] }, eye));
+         float best = 1e30f;
+         for (int b = 0; b < kBoxCount; b++)
+         {
+            float t;
+            if (RayBox(eye, dir, kBoxes[b], t) && t < best)
+            {
+               best = t;
+               hit_id[y * W + x] = b;
+            }
+         }
+         if (hit_id[y * W + x] < 0)
+            continue;
+         const V3 p = { eye.x + dir.x * best, eye.y + dir.y * best, eye.z + dir.z * best };
+         hit_pos[y * W + x] = p;
+         float clip[4] = {};
+         const float pv[4] = { p.x, p.y, p.z, 1.f };
+         for (int c = 0; c < 4; c++)
+            for (int k = 0; k < 4; k++)
+               clip[c] += pv[k] * view_proj(k, c);
+         depth[y * W + x] = clip[2] / clip[3];
+      }
+   D3D11_TEXTURE2D_DESC depth_desc = { W, H, 1, 1, DXGI_FORMAT_R32_FLOAT, { 1, 0 }, D3D11_USAGE_DEFAULT, D3D11_BIND_SHADER_RESOURCE, 0, 0 };
+   D3D11_SUBRESOURCE_DATA depth_data = { depth.data(), W * 4, 0 };
+   ID3D11Texture2D* depth_texture = nullptr;
+   device->CreateTexture2D(&depth_desc, &depth_data, &depth_texture);
+   ID3D11ShaderResourceView* depth_srv = nullptr;
+   device->CreateShaderResourceView(depth_texture, nullptr, &depth_srv);
+
+   // The floating box's mesh crosses the way game geometry will: D3D11 buffers copied into D3D12 shared buffers
+   ID3D11Buffer* vb11 = nullptr;
+   ID3D11Buffer* ib11 = nullptr;
+   {
+      D3D11_BUFFER_DESC desc = { sizeof(kCubeVertices), D3D11_USAGE_IMMUTABLE, D3D11_BIND_VERTEX_BUFFER, 0, 0, 0 };
+      D3D11_SUBRESOURCE_DATA data = { kCubeVertices, 0, 0 };
+      device->CreateBuffer(&desc, &data, &vb11);
+      desc = { sizeof(kCubeIndices), D3D11_USAGE_IMMUTABLE, D3D11_BIND_INDEX_BUFFER, 0, 0, 0 };
+      data = { kCubeIndices, 0, 0 };
+      device->CreateBuffer(&desc, &data, &ib11);
+   }
+   ID3D12Resource* vb12 = nullptr;
+   ID3D12Resource* ib12 = nullptr;
+   ID3D11Buffer* vb_shared11 = nullptr;
+   ID3D11Buffer* ib_shared11 = nullptr;
+   CHECK(interop.CreateSharedBuffer(device, sizeof(kCubeVertices), vb12, vb_shared11, error), "shared VB: %s", error.c_str());
+   CHECK(interop.CreateSharedBuffer(device, sizeof(kCubeIndices), ib12, ib_shared11, error), "shared IB: %s", error.c_str());
+   if (!vb12 || !ib12)
+      return;
+   context->CopySubresourceRegion(vb_shared11, 0, 0, 0, 0, vb11, 0, nullptr);
+   context->CopySubresourceRegion(ib_shared11, 0, 0, 0, 0, ib11, 0, nullptr);
+
+   RTAO::Retirer retirer;
+   RTAO::BlasCache blases;
+   RTAO::TlasBuilder tlas;
+   RTAO::AOPass pass;
+   CHECK(pass.Init(interop.GetDevice(), error), "AOPass::Init: %s", error.c_str());
+
+   RTAO::PassSettings settings;
+   std::memcpy(settings.view_proj, view_proj.m, sizeof(settings.view_proj));
+   std::memcpy(settings.inv_view_proj, inv_view_proj.m, sizeof(settings.inv_view_proj));
+   settings.cam_pos[0] = eye.x; settings.cam_pos[1] = eye.y; settings.cam_pos[2] = eye.z;
+   settings.cam_fwd[0] = f.x; settings.cam_fwd[1] = f.y; settings.cam_fwd[2] = f.z;
+   settings.reversed_z = true;
+   settings.radius = 1.5f;
+   settings.ray_count = 4;
+
+   uint32_t last_instance_count = 0;
+   auto run_frame = [&](RTAO::FilterMode filter_mode) {
+      ID3D11RenderTargetView* rtv = interop.GetDepthRTV();
+      D3D11_VIEWPORT viewport = { 0, 0, (float)W, (float)H, 0, 1 };
+      context->RSSetViewports(1, &viewport);
+      context->OMSetRenderTargets(1, &rtv, nullptr);
+      context->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP);
+      context->VSSetShader(copy_vs, nullptr, 0);
+      context->PSSetShader(depth_ps, nullptr, 0);
+      context->PSSetShaderResources(0, 1, &depth_srv);
+      context->Draw(4, 0);
+      ID3D11RenderTargetView* null_rtv = nullptr;
+      context->OMSetRenderTargets(1, &null_rtv, nullptr);
+      rtv->Release();
+
+      settings.filter_mode = filter_mode;
+      CHECK(interop.Run(context, [&](ID3D12GraphicsCommandList4* list, const RTAO::RecordInfo& info, std::string& err) {
+         retirer.Collect(info.completed_fence_value);
+         const RTAO::BuildContext ctx = { info.device, list, &retirer, info.submit_fence_value };
+         RTAO::CpuMesh cube = { kCubeVertices, 8, 12, kCubeIndices, 36 };
+         if (!blases.BuildFromCpu(ctx, 1, cube, err))
+            return false;
+         if (!blases.Has(2))
+         {
+            D3D12_RESOURCE_BARRIER barriers[2] = {};
+            ID3D12Resource* buffers[2] = { vb12, ib12 };
+            for (int i = 0; i < 2; i++)
+            {
+               barriers[i].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+               barriers[i].Transition.pResource = buffers[i];
+               barriers[i].Transition.StateBefore = D3D12_RESOURCE_STATE_COMMON;
+               barriers[i].Transition.StateAfter = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+            }
+            list->ResourceBarrier(2, barriers);
+            RTAO::GpuMesh gpu_cube;
+            gpu_cube.vertices = vb12->GetGPUVirtualAddress();
+            gpu_cube.vertex_count = 8;
+            gpu_cube.indices = ib12->GetGPUVirtualAddress();
+            gpu_cube.index_count = 36;
+            if (!blases.BuildFromGpu(ctx, 2, gpu_cube, err))
+               return false;
+            for (auto& barrier : barriers)
+               std::swap(barrier.Transition.StateBefore, barrier.Transition.StateAfter);
+            list->ResourceBarrier(2, barriers);
+         }
+         blases.FlushBarrier(list);
+
+         tlas.BeginFrame();
+         for (int b = 0; b < kBoxCount; b++)
+         {
+            const Box& box = kBoxes[b];
+            const float xform[3][4] = { { box.max.x - box.min.x, 0, 0, box.min.x }, { 0, box.max.y - box.min.y, 0, box.min.y }, { 0, 0, box.max.z - box.min.z, box.min.z } };
+            tlas.AddInstance(uint64_t(b), b == 3 ? 2 : 1, xform);
+         }
+         D3D12_GPU_VIRTUAL_ADDRESS top = 0;
+         if (!tlas.Build(ctx, blases, info.frame_slot, top, last_instance_count, err))
+            return false;
+         return pass.Record(list, info, top, settings, retirer, err);
+      }, error), "Run (RTAO): %s", error.c_str());
+      ID3D11ShaderResourceView* ao_srv = interop.GetAOSRV();
+      UINT w = 0, h = 0;
+      std::vector<float> ao = ReadAO(device, context, ao_srv, w, h);
+      ao_srv->Release();
+      return ao;
+   };
+
+   // Pixel classes, from the CPU reference
+   auto average = [&](const std::vector<float>& ao, auto predicate, int& count) {
+      double sum = 0;
+      count = 0;
+      for (UINT i = 0; i < W * H; i++)
+         if (predicate(i))
+         {
+            sum += ao[i];
+            count++;
+         }
+      return count ? float(sum / count) : -1.f;
+   };
+   auto is_sky = [&](UINT i) { return hit_id[i] < 0; };
+   auto is_open_ground = [&](UINT i) {
+      if (hit_id[i] != 0)
+         return false;
+      for (int b = 1; b < kBoxCount; b++)
+         if (BoxDistance(hit_pos[i], kBoxes[b]) < 2.f)
+            return false;
+      return true;
+   };
+   auto is_corner = [&](UINT i) { // Ground right next to box 1's walls
+      return hit_id[i] == 0 && BoxDistance(hit_pos[i], kBoxes[1]) < 0.15f;
+   };
+   auto is_box_top = [&](UINT i) {
+      const V3 p = hit_pos[i];
+      return hit_id[i] == 1 && p.y > 1.99f && std::fabs(p.x) < 0.5f && std::fabs(p.z) < 0.5f;
+   };
+   auto is_under_floating = [&](UINT i) {
+      const V3 p = hit_pos[i];
+      return hit_id[i] == 0 && p.x > -4.4f && p.x < -3.6f && p.z > -0.9f && p.z < -0.1f;
+   };
+
+   int counts[5];
+   std::vector<float> raw = run_frame(RTAO::FilterMode::Off);
+   const float sky = average(raw, is_sky, counts[0]);
+   const float open = average(raw, is_open_ground, counts[1]);
+   const float corner = average(raw, is_corner, counts[2]);
+   const float top = average(raw, is_box_top, counts[3]);
+   const float under = average(raw, is_under_floating, counts[4]);
+   printf("RTAO raw (%u TLAS instances, %zu BLAS): sky %.3f (%d px), open ground %.3f (%d), wall corner %.3f (%d), box top %.3f (%d), under the floating box %.3f (%d)\n",
+      last_instance_count, blases.Count(), sky, counts[0], open, counts[1], corner, counts[2], top, counts[3], under, counts[4]);
+   CHECK(last_instance_count == kBoxCount, "all instances in the TLAS");
+   CHECK(counts[0] > 0 && sky > 0.999f, "sky must be unoccluded");
+   CHECK(counts[1] > 50 && open > 0.97f, "open ground must be (nearly) unoccluded");
+   CHECK(counts[2] > 10 && corner < 0.8f && corner > 0.2f, "ground at a wall must be partly occluded");
+   CHECK(counts[3] > 10 && top > 0.97f, "the top of a box must be unoccluded");
+   CHECK(counts[4] > 10 && under < 0.9f, "ground under the floating box (shared-buffer BLAS) must see it");
+
+   // Temporal: converges, stays sane
+   auto stddev = [&](const std::vector<float>& ao, auto predicate) {
+      int count = 0;
+      float mean = average(ao, predicate, count);
+      double s = 0;
+      for (UINT i = 0; i < W * H; i++)
+         if (predicate(i))
+            s += (ao[i] - mean) * (ao[i] - mean);
+      return count ? float(std::sqrt(s / count)) : 0.f;
+   };
+   const float raw_noise = stddev(raw, is_corner);
+   std::vector<float> filtered;
+   for (int i = 0; i < 24; i++)
+      filtered = run_frame(RTAO::FilterMode::Temporal);
+   int c;
+   const float filtered_corner = average(filtered, is_corner, c);
+   const float filtered_open = average(filtered, is_open_ground, c);
+   const float filtered_noise = stddev(filtered, is_corner);
+   bool finite = true;
+   for (float v : filtered)
+      finite = finite && std::isfinite(v) && v >= 0.f && v <= 1.f;
+   printf("RTAO temporal (24 frames): open ground %.3f, wall corner %.3f, corner noise %.4f (raw %.4f)\n", filtered_open, filtered_corner, filtered_noise, raw_noise);
+   CHECK(finite, "filtered AO must be finite and in [0, 1]");
+   CHECK(filtered_open > 0.97f, "open ground must stay unoccluded after filtering");
+   CHECK(std::fabs(filtered_corner - corner) < 0.15f, "filtering must not shift the corner AO much");
+   CHECK(filtered_noise < raw_noise, "the denoiser must reduce noise");
+
+   CHECK(interop.WaitForIdle(5000), "WaitForIdle");
+   retirer.ReleaseAll();
+   pass.Shutdown(nullptr, 0);
+   tlas.Clear(nullptr, 0);
+   blases.Clear(nullptr, 0);
+   vb12->Release();
+   ib12->Release();
+   vb_shared11->Release();
+   ib_shared11->Release();
+   vb11->Release();
+   ib11->Release();
+   depth_srv->Release();
+   depth_texture->Release();
+}
+
 int main()
 {
+   setvbuf(stdout, nullptr, _IONBF, 0);
+   // RTAO_D3D12_DEBUG=1: D3D12 debug layer + GPU based validation (messages go to the debugger output)
+   if (GetEnvironmentVariableA("RTAO_D3D12_DEBUG", nullptr, 0) != 0)
+   {
+      auto get_debug = reinterpret_cast<PFN_D3D12_GET_DEBUG_INTERFACE>(GetProcAddress(LoadLibraryW(L"d3d12.dll"), "D3D12GetDebugInterface"));
+      ID3D12Debug1* debug = nullptr;
+      if (get_debug && SUCCEEDED(get_debug(IID_PPV_ARGS(&debug))))
+      {
+         debug->EnableDebugLayer();
+         debug->SetEnableGPUBasedValidation(TRUE);
+         debug->Release();
+         printf("D3D12 debug layer on\n");
+      }
+   }
    ID3D11Device* device = nullptr;
    ID3D11DeviceContext* context = nullptr;
    D3D_FEATURE_LEVEL level = D3D_FEATURE_LEVEL_11_1;
@@ -164,6 +628,40 @@ int main()
          CHECK(std::fabs(at(40, 40) - 0.35f) < 0.01f, "cell (1,1) should be 0.35");
          CHECK(at(5, 5) < 0.01f, "bar should be 0");
       }
+   }
+
+   TestTlasRetention();
+   TestSharedBuffer(device, context, interop);
+   TestRayTracedScene(device, context, interop, vs, ps);
+
+   // With RTAO_D3D12_DEBUG set: any D3D12 validation error fails the test
+   ID3D12InfoQueue* info_queue = nullptr;
+   if (SUCCEEDED(interop.GetDevice()->QueryInterface(IID_PPV_ARGS(&info_queue))))
+   {
+      interop.WaitForIdle(5000);
+      UINT64 errors = 0;
+      const UINT64 count = info_queue->GetNumStoredMessages();
+      for (UINT64 i = 0; i < count; i++)
+      {
+         SIZE_T length = 0;
+         info_queue->GetMessage(i, nullptr, &length);
+         std::vector<char> storage(length);
+         auto* message = reinterpret_cast<D3D12_MESSAGE*>(storage.data());
+         if (FAILED(info_queue->GetMessage(i, message, &length)))
+            continue;
+         if (message->Severity <= D3D12_MESSAGE_SEVERITY_ERROR)
+         {
+            printf("D3D12 validation error: %s\n", message->pDescription);
+            errors++;
+         }
+         else if (message->Severity == D3D12_MESSAGE_SEVERITY_WARNING)
+         {
+            printf("D3D12 validation warning: %s\n", message->pDescription);
+         }
+      }
+      printf("D3D12 debug layer: %llu messages, %llu errors\n", (unsigned long long)count, (unsigned long long)errors);
+      CHECK(errors == 0, "D3D12 validation errors");
+      info_queue->Release();
    }
 
    // Resize path

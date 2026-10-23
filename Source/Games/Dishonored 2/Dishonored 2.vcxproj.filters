@@ -4,8 +4,14 @@
     <ClCompile Include="main.cpp" />
     <ClCompile Include="..\..\Core\unity_build.cpp" />
     <ClCompile Include="rtao_interop.cpp" />
+    <ClCompile Include="rtao_accel.cpp" />
+    <ClCompile Include="rtao_pass.cpp" />
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="rtao_interop.h" />
+    <ClInclude Include="rtao_accel.h" />
+    <ClInclude Include="rtao_pass.h" />
+    <ClInclude Include="Shaders\rtao_trace_cs.h" />
+    <ClInclude Include="Shaders\rtao_filter_cs.h" />
   </ItemGroup>
 </Project>

@@ -617,6 +617,10 @@ namespace RTAO
             if (it != buffers.end())
                it->second.executed = true;
          }
+         else if (after_ao_pass)
+         {
+            stats.after_ao_records++; // Drawn after the AO took its depth: not in that depth, so not an occluder
+         }
          else
          {
             executed.push_back(record);
@@ -665,10 +669,17 @@ namespace RTAO
       CommitLocked(records->records);
    }
 
+   void GeometryCapture::MarkAOPassDone()
+   {
+      const std::lock_guard lock(mutex);
+      after_ao_pass = true;
+   }
+
    void GeometryCapture::OnPresent()
    {
       const std::lock_guard lock(mutex);
       frame++;
+      after_ao_pass = false;
       // Command lists the game finished but never executed (or released)
       for (auto it = list_records.begin(); it != list_records.end();)
       {

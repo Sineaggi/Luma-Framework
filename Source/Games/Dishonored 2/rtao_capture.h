@@ -120,7 +120,7 @@ namespace RTAO
       uint64_t meshes = 0, meshes_ready = 0, buffers_copied = 0, arena_vertex_bytes = 0, arena_index_bytes = 0;
       uint64_t blas_built = 0, blas_failed = 0, blas_evicted = 0;
       uint64_t frame_instances = 0; // Read back last frame
-      uint64_t view_model_instances = 0, late_records = 0, readback_overflow = 0;
+      uint64_t view_model_instances = 0, late_records = 0, readback_overflow = 0, after_ao_records = 0;
       uint64_t tlas_instances = 0;
    };
    enum CaptureSkip
@@ -149,6 +149,9 @@ namespace RTAO
       struct PendingRecords;
       std::shared_ptr<PendingRecords> TakeContextRecords(ID3D11DeviceContext* deferred_context);
       void Commit(const std::shared_ptr<PendingRecords>& records);
+      // Call right after the frame's AO pass ran: geometry drawn later in the frame (translucent/reflective surfaces
+      // that write depth after the AO's depth was taken) is left out, until OnPresent.
+      void MarkAOPassDone();
       void OnPresent();
       void OnDestroyBuffer(ID3D11Buffer* buffer);
 
@@ -224,6 +227,7 @@ namespace RTAO
       std::vector<Rec> executed; // Waiting for the next D3D12 pass
       uint32_t frame = 0;
       uint32_t last_record_frame = 0;
+      bool after_ao_pass = false;
       // Per frame slot: what was copied into that readback buffer (mesh key, count), in order
       std::vector<std::pair<uint64_t, uint32_t>> readback_records[kFrameSlots];
       CaptureStats stats;

@@ -172,7 +172,10 @@ namespace
    std::atomic<uint32_t> g_rtao_main_depth_width = 0, g_rtao_main_depth_height = 0; // The main view's depth size
    std::atomic<uint64_t> g_rtao_vs_by_source[4] = {}; // Reflected vertex shaders, by RTAO::MatrixSource
    std::atomic<uint64_t> g_rtao_draws_by_source[4] = {}; // Main view draws, by their vertex shader's matrix source
-   std::atomic<uint64_t> g_rtao_draws_unknown_shader = 0, g_rtao_draws_unusable_layout = 0, g_rtao_indirect_draws = 0;
+   std::atomic<uint64_t> g_rtao_draws_unknown_shader = 0, g_rtao_draws_unusable_layout = 0, g_rtao_indirect_draws = 0, g_rtao_draws_not_triangle_list = 0;
+   // Main view draws whose vertex shader can't be captured, by reason (the reasons are static strings)
+   std::mutex g_rtao_skip_reason_mutex;
+   std::unordered_map<const char*, uint64_t> g_rtao_skip_reasons;
 
    int GetEffectiveAOMode()
    {
@@ -488,6 +491,7 @@ public:
             return false;
          }
          game_device_data.rtao_stat_inline_ok++;
+         game_device_data.rtao_capture.MarkAOPassDone();
       }
       else
       {
@@ -760,6 +764,7 @@ public:
             {
                SetRTAOStatus("D3D12 pass failed (deferred): " + error, true); // The composite then reads the previous AO
             }
+            game_device_data.rtao_capture.MarkAOPassDone();
          }
          // After the D3D12 pass: this list's own draws run after it (for the split list, the post SSAO remainder)
          game_device_data.rtao_capture.OnExecuteCommandList(command_list.get());
@@ -1099,6 +1104,16 @@ public:
                (unsigned long long)(game_device_data.rtao_blas_bytes.load() >> 20), (unsigned long long)(stats.arena_vertex_bytes >> 20), game_device_data.rtao_tlas_instances.load(),
                (unsigned long long)g_rtao_indirect_draws.load(), (unsigned long long)g_rtao_draws_unknown_shader.load(), game_device_data.rtao_gpu_us.load() / 1000.0);
             reshade::log::message(reshade::log::level::info, buffer);
+            std::string reasons = "RTAO: main view draws not captured:";
+            {
+               const std::lock_guard lock(g_rtao_skip_reason_mutex);
+               for (const auto& pair : g_rtao_skip_reasons)
+                  reasons += std::string(" ") + pair.first + " " + std::to_string(pair.second) + ",";
+            }
+            reasons += " not a triangle list " + std::to_string(g_rtao_draws_not_triangle_list.load()) + ", unusable input layout " + std::to_string(g_rtao_draws_unusable_layout.load()) +
+               ", capture skips: format " + std::to_string(stats.skipped[RTAO::kSkipFormat]) + ", dynamic buffer " + std::to_string(stats.skipped[RTAO::kSkipBuffer]) + ", binding " + std::to_string(stats.skipped[RTAO::kSkipBinding]) +
+               ", other " + std::to_string(stats.skipped[RTAO::kSkipOther]) + ", drawn after the AO pass " + std::to_string(stats.after_ao_records);
+            reshade::log::message(reshade::log::level::info, reasons.c_str());
          }
       }
    }
@@ -1669,7 +1684,10 @@ public:
       D3D11_PRIMITIVE_TOPOLOGY topology;
       context->IAGetPrimitiveTopology(&topology);
       if (topology != D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST)
+      {
+         g_rtao_draws_not_triangle_list++;
          return false;
+      }
 
       com_ptr<ID3D11VertexShader> vs;
       context->VSGetShader(&vs, nullptr, nullptr);
@@ -1692,7 +1710,11 @@ public:
       }
       g_rtao_draws_by_source[(std::min)(uint32_t(vs_info.source), 3u)]++;
       if (vs_info.source == RTAO::MatrixSource::None)
+      {
+         const std::lock_guard lock(g_rtao_skip_reason_mutex);
+         g_rtao_skip_reasons[vs_info.skip_reason ? vs_info.skip_reason : "unknown"]++;
          return false;
+      }
       if (!layout_info.has_position || layout_info.position_per_instance)
       {
          g_rtao_draws_unusable_layout++;
@@ -2182,7 +2204,7 @@ public:
                (unsigned long long)stats.skipped[RTAO::kSkipRingFull], (unsigned long long)stats.skipped[RTAO::kSkipBinding], (unsigned long long)stats.skipped[RTAO::kSkipOther]);
             ImGui::Text("Meshes %llu (%llu with a BLAS, %llu failed), BLAS %llu (%.1f MB), buffers copied %llu (arena %.1f MB)", (unsigned long long)stats.meshes, (unsigned long long)stats.meshes_ready,
                (unsigned long long)stats.blas_failed, (unsigned long long)game_device_data.rtao_blas_count.load(), game_device_data.rtao_blas_bytes.load() / 1048576.0, (unsigned long long)stats.buffers_copied, stats.arena_vertex_bytes / 1048576.0);
-            ImGui::Text("TLAS instances %u, instances read back last frame %llu, view model instances %llu", game_device_data.rtao_tlas_instances.load(), (unsigned long long)stats.frame_instances, (unsigned long long)stats.view_model_instances);
+            ImGui::Text("TLAS instances %u, instances read back last frame %llu, view model instances %llu, draws after the AO pass (left out) %llu", game_device_data.rtao_tlas_instances.load(), (unsigned long long)stats.frame_instances, (unsigned long long)stats.view_model_instances, (unsigned long long)stats.after_ao_records);
             ImGui::Text("Vertex shaders reflected: none %llu, direct %llu, indexed %llu, cbuffer %llu", (unsigned long long)g_rtao_vs_by_source[0].load(), (unsigned long long)g_rtao_vs_by_source[1].load(),
                (unsigned long long)g_rtao_vs_by_source[2].load(), (unsigned long long)g_rtao_vs_by_source[3].load());
             ImGui::TreePop();

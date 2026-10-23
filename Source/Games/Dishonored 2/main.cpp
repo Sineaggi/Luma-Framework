@@ -12,6 +12,10 @@
 // Luma's handlers treat it as D3D11, and release builds pop a "non DirectX 11 device" message box mid frame.
 #define CHECK_GRAPHICS_API_COMPATIBILITY 1
 
+// RT sun shadows replays the game's screen shadows draw itself (to bind the traced visibility around it), and the
+// RTAO composite replays the SSAO draw: both need the original draw call, which release builds only provide with this.
+#define ENABLE_POST_DRAW_DISPATCH_CALLBACK 1
+
 #include "../../../Shaders/Dishonored 2/Includes/GameCBuffers.hlsl"
 #include "..\..\Core\core.hpp"
 

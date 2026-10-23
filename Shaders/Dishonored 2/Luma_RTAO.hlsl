@@ -26,6 +26,23 @@ float4 composite_ps(float4 pos : SV_Position) : SV_Target
     return float4(tex.Load(int3(pos.xy, 0)), 1.0, 0.0, 0.0);
 }
 
+// "View AO only" debug: an AO texture (AO in x) drawn fullscreen as grey over the back buffer
+cbuffer AOViewParams : register(b0)
+{
+    float2 InvTargetSize;
+    float2 UVScale; // Used region of the AO texture (render resolution / texture size)
+    float Brightness; // 1 for SDR back buffers, paper white / 80 nits for scRGB
+    float3 AOViewPad;
+};
+SamplerState ao_view_sampler : register(s0);
+
+float4 ao_view_ps(float4 pos : SV_Position) : SV_Target
+{
+    float2 uv = pos.xy * InvTargetSize * UVScale;
+    float ao = saturate(tex.SampleLevel(ao_view_sampler, uv, 0));
+    return float4(ao.xxx * Brightness, 1.0);
+}
+
 // ---- Instance capture. Must match RTAO::CaptureParams in rtao_capture.h.
 
 #define RTAO_SOURCE_DIRECT_INSTANCE_BUFFER 1  // StructuredBuffer, stride 96, index = SV_InstanceID + cb_instancebufferoffset

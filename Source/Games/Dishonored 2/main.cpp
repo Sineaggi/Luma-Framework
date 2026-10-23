@@ -68,6 +68,7 @@ namespace
    ShaderHashesList shader_hashes_DownsampleDepth;
    ShaderHashesList shader_hashes_UnprojectDepth;
    ShaderHashesList shader_hashes_SSAO;
+   ShaderHashesList shader_hashes_AODenoise; // The game's AO blur, after the SSAO (or XeGTAO/RTAO) draw
 
    // XeGTAO
    constexpr size_t XE_GTAO_DEPTH_MIP_LEVELS = 5;
@@ -98,6 +99,8 @@ namespace
       RTAO_OUTPUT_COUNT
    };
    int g_rtao_debug_mode = RTAO_OUTPUT_AO;
+   // "View AO only" debug: 0 off, 1 the final AO (the game's blur output, any AO mode), 2 the RTAO output before the game's blur
+   int g_ao_view_mode = 0;
    float g_rtao_strength = 1.f;
    float g_rtao_radius = 1.5f; // World units (config "RTAORadius")
    int g_rtao_rays = 4; // Per pixel per frame (config "RTAORays")
@@ -233,6 +236,10 @@ struct GameDeviceDataDishonored2 final : public GameDeviceData
    bool rtao_rt_ready = false;
    bool rtao_rt_failed = false;
    int rtao_last_output = -1;
+   // "View AO only": the last AO blur render target of the frame
+   std::mutex ao_view_mutex;
+   com_ptr<ID3D11Resource> ao_view_resource;
+   ComPtr<ID3D11Buffer> ao_view_cb;
    uint32_t rtao_last_draw_frame = 0;
    // Snapshots for the UI (written by the recorder)
    std::atomic<uint64_t> rtao_blas_count = 0, rtao_blas_bytes = 0;
@@ -284,6 +291,7 @@ public:
       native_shaders_definitions.emplace(CompileTimeStringHash("DS2 XeGTAO Main Pass PS"), ShaderDefinition{ "Luma_XeGTAO", reshade::api::pipeline_subobject_type::pixel_shader, nullptr, "main_pass_ps" });
       native_shaders_definitions.emplace(CompileTimeStringHash("DS2 RTAO Depth Copy PS"), ShaderDefinition{ "Luma_RTAO", reshade::api::pipeline_subobject_type::pixel_shader, nullptr, "depth_copy_ps" });
       native_shaders_definitions.emplace(CompileTimeStringHash("DS2 RTAO Depth Pack PS"), ShaderDefinition{ "Luma_RTAO", reshade::api::pipeline_subobject_type::pixel_shader, nullptr, "depth_pack_ps" });
+      native_shaders_definitions.emplace(CompileTimeStringHash("DS2 AO View PS"), ShaderDefinition{ "Luma_RTAO", reshade::api::pipeline_subobject_type::pixel_shader, nullptr, "ao_view_ps" });
       native_shaders_definitions.emplace(CompileTimeStringHash("DS2 RTAO Capture CS"), ShaderDefinition{ "Luma_RTAO", reshade::api::pipeline_subobject_type::compute_shader, nullptr, "capture_instances_cs" });
       native_shaders_definitions.emplace(CompileTimeStringHash("DS2 RTAO Composite PS"), ShaderDefinition{ "Luma_RTAO", reshade::api::pipeline_subobject_type::pixel_shader, nullptr, "composite_ps" });
       native_shaders_definitions.emplace(CompileTimeStringHash("DS2 Pre DLSS CS"), ShaderDefinition{ "Luma_PreDLSS_CS", reshade::api::pipeline_subobject_type::compute_shader });
@@ -461,6 +469,120 @@ public:
       if (ao_srv)
          ao_srv->Release();
       return true;
+   }
+
+   static DXGI_FORMAT TypedViewFormat(DXGI_FORMAT format)
+   {
+      switch (format)
+      {
+      case DXGI_FORMAT_R8G8B8A8_TYPELESS: return DXGI_FORMAT_R8G8B8A8_UNORM;
+      case DXGI_FORMAT_B8G8R8A8_TYPELESS: return DXGI_FORMAT_B8G8R8A8_UNORM;
+      case DXGI_FORMAT_R16G16B16A16_TYPELESS: return DXGI_FORMAT_R16G16B16A16_FLOAT;
+      case DXGI_FORMAT_R10G10B10A2_TYPELESS: return DXGI_FORMAT_R10G10B10A2_UNORM;
+      case DXGI_FORMAT_R16G16_TYPELESS: return DXGI_FORMAT_R16G16_FLOAT;
+      case DXGI_FORMAT_R8G8_TYPELESS: return DXGI_FORMAT_R8G8_UNORM;
+      case DXGI_FORMAT_R32_TYPELESS: return DXGI_FORMAT_R32_FLOAT;
+      case DXGI_FORMAT_R16_TYPELESS: return DXGI_FORMAT_R16_FLOAT;
+      case DXGI_FORMAT_R8_TYPELESS: return DXGI_FORMAT_R8_UNORM;
+      default: return format;
+      }
+   }
+
+   // "View AO only" debug: draws the selected AO texture fullscreen as grey over the back buffer, at present (after
+   // Luma's display composition, so it covers the scene and the UI)
+   static void DrawAOView(ID3D11Device* native_device, DeviceData& device_data, GameDeviceDataDishonored2& game_device_data)
+   {
+      const auto copy_vs = device_data.native_vertex_shaders.find(CompileTimeStringHash("Copy VS"));
+      const auto view_ps = device_data.native_pixel_shaders.find(CompileTimeStringHash("DS2 AO View PS"));
+      if (copy_vs == device_data.native_vertex_shaders.end() || !copy_vs->second || view_ps == device_data.native_pixel_shaders.end() || !view_ps->second)
+         return;
+
+      // The AO texture
+      com_ptr<ID3D11ShaderResourceView> srv;
+      float2 uv_scale = { 1.f, 1.f };
+      if (g_ao_view_mode == 2)
+      {
+         if (!game_device_data.rtao.IsInitialized())
+            return;
+         ID3D11ShaderResourceView* rtao_srv = game_device_data.rtao.GetAOSRV();
+         if (!rtao_srv)
+            return;
+         srv = rtao_srv;
+         rtao_srv->Release();
+      }
+      else
+      {
+         com_ptr<ID3D11Resource> resource;
+         {
+            const std::lock_guard lock(game_device_data.ao_view_mutex);
+            resource = game_device_data.ao_view_resource;
+         }
+         com_ptr<ID3D11Texture2D> texture;
+         if (!resource || FAILED(resource->QueryInterface(&texture)))
+            return;
+         D3D11_TEXTURE2D_DESC desc;
+         texture->GetDesc(&desc);
+         D3D11_SHADER_RESOURCE_VIEW_DESC srv_desc = {};
+         srv_desc.Format = TypedViewFormat(desc.Format);
+         srv_desc.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D;
+         srv_desc.Texture2D.MipLevels = 1;
+         if (FAILED(native_device->CreateShaderResourceView(texture.get(), &srv_desc, &srv)))
+            return;
+      }
+      {
+         // The game renders into the top left render resolution part of its textures
+         com_ptr<ID3D11Resource> resource;
+         srv->GetResource(&resource);
+         com_ptr<ID3D11Texture2D> texture;
+         if (!resource || FAILED(resource->QueryInterface(&texture)))
+            return;
+         D3D11_TEXTURE2D_DESC desc;
+         texture->GetDesc(&desc);
+         uv_scale.x = std::clamp(device_data.render_resolution.x / float(desc.Width), 0.f, 1.f);
+         uv_scale.y = std::clamp(device_data.render_resolution.y / float(desc.Height), 0.f, 1.f);
+      }
+
+      // The back buffer
+      com_ptr<ID3D11Texture2D> back_buffer;
+      {
+         const std::shared_lock lock(device_data.mutex);
+         if (device_data.swapchains.empty())
+            return;
+         IDXGISwapChain* swapchain = (IDXGISwapChain*)((*device_data.swapchains.begin())->get_native());
+         if (!swapchain || FAILED(swapchain->GetBuffer(0, IID_PPV_ARGS(&back_buffer))))
+            return;
+      }
+      D3D11_TEXTURE2D_DESC back_buffer_desc;
+      back_buffer->GetDesc(&back_buffer_desc);
+      D3D11_RENDER_TARGET_VIEW_DESC rtv_desc = {};
+      rtv_desc.Format = TypedViewFormat(back_buffer_desc.Format);
+      rtv_desc.ViewDimension = D3D11_RTV_DIMENSION_TEXTURE2D;
+      com_ptr<ID3D11RenderTargetView> rtv;
+      if (FAILED(native_device->CreateRenderTargetView(back_buffer.get(), &rtv_desc, &rtv)))
+         return;
+      const bool scrgb = rtv_desc.Format == DXGI_FORMAT_R16G16B16A16_FLOAT;
+
+      if (!game_device_data.ao_view_cb)
+      {
+         D3D11_BUFFER_DESC cb_desc = { 32, D3D11_USAGE_DYNAMIC, D3D11_BIND_CONSTANT_BUFFER, D3D11_CPU_ACCESS_WRITE, 0, 0 };
+         if (FAILED(native_device->CreateBuffer(&cb_desc, nullptr, game_device_data.ao_view_cb.put())))
+            return;
+      }
+      com_ptr<ID3D11DeviceContext> context;
+      native_device->GetImmediateContext(&context);
+      D3D11_MAPPED_SUBRESOURCE mapped;
+      if (FAILED(context->Map(game_device_data.ao_view_cb.get(), 0, D3D11_MAP_WRITE_DISCARD, 0, &mapped)))
+         return;
+      const float params[8] = { 1.f / float(back_buffer_desc.Width), 1.f / float(back_buffer_desc.Height), uv_scale.x, uv_scale.y, scrgb ? 203.f / 80.f : 1.f, 0.f, 0.f, 0.f };
+      std::memcpy(mapped.pData, params, sizeof(params));
+      context->Unmap(game_device_data.ao_view_cb.get(), 0);
+
+      DrawStateStack<DrawStateStackType::FullGraphics> draw_state_stack;
+      draw_state_stack.Cache(context.get(), device_data.uav_max_count);
+      ID3D11Buffer* const cb = game_device_data.ao_view_cb.get();
+      context->PSSetConstantBuffers(0, 1, &cb);
+      DrawCustomPixelShader(context.get(), device_data.default_depth_stencil_state.get(), device_data.default_blend_state.get(), device_data.sampler_state_linear.get(), copy_vs->second.get(), view_ps->second.get(), srv.get(), rtv.get(), back_buffer_desc.Width, back_buffer_desc.Height);
+      draw_state_stack.Restore(context.get());
    }
 
    // Lazily starts the ray tracing part of RTAO (capture, acceleration structures, pass). Render thread.
@@ -853,6 +975,9 @@ public:
       game_device_data.rtao_frame++;
       if (game_device_data.rtao_capture.IsInitialized())
          game_device_data.rtao_capture.OnPresent();
+      if (g_ao_view_mode != 0)
+         DrawAOView(native_device, device_data, game_device_data);
+
       if (game_device_data.rtao_frame - game_device_data.rtao_last_draw_frame > 2)
          g_rtao_capture_active = false; // RTAO not drawing (other AO mode, menus): no capture cost
       {
@@ -932,6 +1057,19 @@ public:
          }
       }
 #endif
+
+      if (g_ao_view_mode == 1 && original_shader_hashes.Contains(shader_hashes_AODenoise))
+      {
+         com_ptr<ID3D11RenderTargetView> rtv;
+         native_device_context->OMGetRenderTargets(1, &rtv, nullptr);
+         if (rtv)
+         {
+            com_ptr<ID3D11Resource> resource;
+            rtv->GetResource(&resource);
+            const std::lock_guard lock(game_device_data.ao_view_mutex);
+            game_device_data.ao_view_resource = resource; // The last one of the frame is the final AO
+         }
+      }
 
       if (original_shader_hashes.Contains(shader_hashes_SSAO))
       {
@@ -1886,6 +2024,10 @@ public:
       {
          ImGui::SetTooltip("Replaces the game's SSAO, HBAO+ has to be disabled in game.\nOff: the game's own SSAO.\nXeGTAO: Intel's ground truth AO.\nRTAO: ray traced AO on a side D3D12 device (work in progress: currently an interop test, needs DXR 1.1). Falls back to XeGTAO if unavailable.");
       }
+      static const char* ao_view_names[] = { "Off", "Final AO (after the game's blur)", "RTAO output (before the game's blur)" };
+      ImGui::Combo("View AO only (debug)", &g_ao_view_mode, ao_view_names, IM_ARRAYSIZE(ao_view_names));
+      if (ImGui::IsItemHovered())
+         ImGui::SetTooltip("Shows the AO buffer fullscreen in grey (white = no occlusion) instead of the game.\n\"Final AO\" works with every AO mode (the game's SSAO, XeGTAO, RTAO), so you can compare them directly.\nWith RTAO, the RTAO Output choice (e.g. BLAS coverage, no denoiser) is what shows here.");
       if (ao_mode == AO_MODE_RTAO)
       {
          std::string status;
@@ -2066,6 +2208,7 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD ul_reason_for_call, LPVOID lpReserv
       shader_hashes_UnprojectDepth.compute_shaders.emplace(std::stoul("223FB9DA", nullptr, 16)); // DH2
       shader_hashes_UnprojectDepth.compute_shaders.emplace(std::stoul("74E15FB8", nullptr, 16)); // DH DOTO
       shader_hashes_SSAO.pixel_shaders.emplace(0x94445D2D); // DH2 + DH DOTO
+      shader_hashes_AODenoise.pixel_shaders.emplace(0x4CD2BE39); // DH2
       // All UI pixel shaders (these are all Shader Model 4.0, as opposed to the rest of the rendering using SM5.0)
       shader_hashes_UI.pixel_shaders = {
          std::stoul("6FE8114D", nullptr, 16),

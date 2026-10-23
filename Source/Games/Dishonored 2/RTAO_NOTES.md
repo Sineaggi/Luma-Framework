@@ -173,17 +173,46 @@ the ray noise. Opacity 1 traces with `RAY_FLAG_FORCE_OPAQUE` (no candidates: the
 cutouts out. Standalone test (320x180, RTX 4090): ground AO next to a cutout box 0.987 / 0.801 / 0.667 at opacity
 0 / 0.5 / 1, RT pass 0.144 / 0.152 / 0.144 ms; opaque geometry never produces candidates, so its cost is unchanged.
 
-Texture exact path (not implemented): the coverage the game really uses is `diffuse.a` (times
-`lerp(1, VERTEX_COLOR.a, cb)` in some shaders) at `uv * cb_layer0_scalebias.xy + .zw`, against the reference.
-- Masks: per alpha tested material (key: the bound diffuse texture), a D3D11 pass renders its alpha (with the
-  shader's uv scale/bias and reference baked in as 0/1, or the raw alpha + reference per instance) into a shared
-  R8_UNORM strip (shared textures from D3D12 open in D3D11 only as render targets, R8/R16/RGBA8/RGB10A2 UNORM),
-  and D3D12 copies the strip into a slice of a private Texture2DArray (f4-mods rtcore/alpha_atlas.h: N strips per
-  frame, slices keyed by texture pointer, a counted cap). BC textures can't cross directly, hence the render pass.
-- UVs: VERTEX_TEXCOORD0 offset/format from the input layout, read from the vertex arena (already shared); per
-  geometry a small record (arena offsets, strides, index format, slice, uv scale/bias, reference) in a structured
-  buffer indexed by InstanceID (the low 23 bits are free).
-- Trace: on a cutout candidate, fetch the 3 indices and UVs, interpolate with `CandidateTriangleBarycentrics()`,
-  sample the slice (point/bilinear, LOD 0 or a ray cone LOD), `CommitNonOpaqueTriangleHit()` if alpha >= reference.
-  Cost: a few dependent loads per candidate; the stochastic version stays as the fallback for materials without a
-  slice.
+## Texture exact cutouts
+
+Implemented (rtao-alpha, `rtao_alpha.{h,cpp}`, `Shaders/rtao_cutout.hlsli`, UI "RTAO cutouts: texture exact", default
+on): a cutout candidate is committed only where the material's alpha passes the game's test, so leaves cast leaf shaped
+AO. The stochastic opacity stays as the fallback for cutouts without a mask.
+
+What the game tests, from the dump (`ReflectPixelShader`, all 1414 non FX alpha tested pixel shaders checked with a scan
+of their disassembly): `discard if tex.a < reference` with
+- the coordinate either an interpolator as is (414 shaders) or `interpolator * cb_layer0_scalebias.xy + .zw` (992); the
+  bytecode pass finds the alpha read and the instruction producing its coordinate (`mov r, v#` / `mad r, v#, cb2[k],
+  cb2[k]`) instead of trusting "scalebias is used": 128 shaders use it for other maps but read the alpha at the raw
+  uv (e.g. hair 0x00C4313E). 8 shaders form the coordinate otherwise (parallax, panning): they stay stochastic;
+- the channel: alpha in 1410, red in 4 (single channel opacity maps), found by the same data flow per channel;
+- the reference: `cb_defaultalphatest` / `cb_hairalphatest` in PerInstanceCB (cb2) in 1099, an immediate in 151 (the
+  `add r, a, l(-0.5)` of the vegetation shaders), 164 compare against something else (a dither pattern, a dissolve noise,
+  `alpha * vertex color`): 0.5 there, which approximates the coverage. The vertex color factor some shaders apply
+  (`lerp(1, color.a, cb_layer0_colorconstant.w)`, e.g. 0x048591C8) is ignored.
+- the uv is VERTEX_TEXCOORD0 (the vertex shaders pass it through, e.g. 0x65471A10 `mov o0, v3.xyxy`): assumed for all.
+
+Pipeline (details in rtao_alpha.h):
+- material = (alpha texture resource, channel). At its first cutout draw, `alpha_strip_cs` (Luma_RTAO.hlsl) samples the
+  bound SRV, mip aware (trilinear at the mip nearest 256, supersampled past the view's last mip), into a private 256x256
+  R8 UAV texture, copied into a tile of a shared R8 strip (D3D12 created render target: the only kind D3D11 opens). Ring
+  of 64 tiles, 16 new masks per D3D12 pass at most (the rest come at later draws). The recorder copies executed tiles into
+  a private Texture2DArray (1024 slices of 256x256 R8, 64 MB, first come first served; freed when the texture is
+  destroyed; overflow counted). Rendered once more 240 frames later (streamed mips).
+- per instance: `capture_instances_cs` reads the draw's uv scale/bias and reference from the pixel shader's material
+  cbuffer (bound at b3) and writes them (halves + float) in the spare 12 bytes of the instance's ring entry. The readback
+  turns (material, mesh arena offsets, TEXCOORD0 stream, scale/bias, reference) into a 48 byte record (65536 max, ids
+  recycled once unused longer than the TLAS keeps an instance), whose id goes in the low 23 bits of the cutout's
+  InstanceID. The TEXCOORD0 buffer is copied into the arena like the positions (often the same buffer).
+- trace: per candidate, 3 indices + 3 uvs from the arena (root SRV over the whole arena), barycentric interpolation,
+  scale/bias, one bilinear (wrap) sample of the slice at mip 0, `alpha >= reference`. Counters per frame (masked tests,
+  solid, stochastic tests) are read back for the UI/log.
+
+Measured (standalone test, RTX 4090, while the game ran on the same GPU): a wall with a BC3 2x2 alpha checker, ground AO
+in front of the solid / hole quadrant 0.687 / 0.992 (stochastic 0.5: 0.837 / 0.845); a uv bias of 0.5 in the material
+cbuffer swaps them (0.991 / 0.683). Cost, 1920x1080, 4 rays, 16 stacked cutout layers (1.2M cutout candidates per frame,
+`RTAO_PERF=1`): AO pass 0.208 ms texture exact, 0.205 ms stochastic, 0.174 ms all opaque. The candidates dominate, the
+mask test itself is close to free; candidate count (the BVH traversal) is what the perf track should look at.
+
+Not covered: skinned/dynamic (per frame) cutouts (hair on characters) are still added as opaque instances; GPU culled
+(indirect) foliage isn't captured at all; alpha tested geometry in the shadow/other views doesn't matter here.

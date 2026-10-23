@@ -1475,7 +1475,7 @@ namespace
          }
          else
          {
-            static_assert(false);
+            static_assert(sizeof(T) == 0);
          }
       }
    }

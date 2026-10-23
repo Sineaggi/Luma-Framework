@@ -545,7 +545,7 @@ com_ptr<T> CloneTexture(ID3D11Device* native_device, ID3D11Resource* texture_res
          }
          else
          {
-            static_assert(false, "Clone Resource Type not supported");
+            static_assert(sizeof(T) == 0, "Clone Resource Type not supported");
          }
 
          if (overridden_format != DXGI_FORMAT_UNKNOWN)

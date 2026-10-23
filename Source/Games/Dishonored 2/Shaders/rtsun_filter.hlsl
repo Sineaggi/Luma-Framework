@@ -92,12 +92,37 @@ void main(uint3 id : SV_DispatchThreadID)
             float2 uv = float2(ndc.x * 0.5 + 0.5, 0.5 - ndc.y * 0.5);
             if (all(uv >= 0.0) && all(uv < 1.0))
             {
-                uint2 pp = uint2(uv * float2(Size));
-                float hv, hz;
-                uint ha;
-                UnpackHist(HistPrev[pp], hv, hz, ha);
+                // Bilinear history: the 4 texels around the reprojected position, each kept only if it saw the same
+                // surface (depth test), weights renormalised. A nearest texel fetch flips between neighbours as the TAA
+                // jitter moves the reprojected position across texel boundaries, which made shadow edges wobble.
                 float z_prev_cam = dot(p0 - PrevCamPos, PrevCamFwd);
-                if (ha > 0u && abs(hz - z_prev_cam) <= kDisoccludeTol * max(abs(z_prev_cam), 1e-3))
+                float2 pos = uv * float2(Size) - 0.5;
+                int2 base = int2(floor(pos));
+                float2 f = pos - float2(base);
+                float hv = 0.0, hw = 0.0, hage = 0.0;
+                [unroll] for (int ty = 0; ty < 2; ++ty)
+                [unroll] for (int tx = 0; tx < 2; ++tx)
+                {
+                    int2 t = base + int2(tx, ty);
+                    if (t.x < 0 || t.y < 0 || t.x >= int(Size.x) || t.y >= int(Size.y))
+                        continue;
+                    float tv, tz;
+                    uint ta;
+                    UnpackHist(HistPrev[uint2(t)], tv, tz, ta);
+                    if (ta == 0u || abs(tz - z_prev_cam) > kDisoccludeTol * max(abs(z_prev_cam), 1e-3))
+                        continue;
+                    float w = (tx ? f.x : 1.0 - f.x) * (ty ? f.y : 1.0 - f.y);
+                    hv += w * tv;
+                    hage += w * float(ta);
+                    hw += w;
+                }
+                uint ha = 0u;
+                if (hw > 0.05)
+                {
+                    hv /= hw;
+                    ha = uint(max(hage / hw, 1.0));
+                }
+                if (ha > 0u)
                 {
                     float lo = mn - ClampK, hi = mx + ClampK;
                     float dist = max(max(lo - hv, hv - hi), 0.0);

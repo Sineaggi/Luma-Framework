@@ -2930,16 +2930,6 @@ public:
             ImGui::SetTooltip("Decides once per ray whether cutouts are solid or absent (instead of at every crossed leaf), which skips the per triangle\ncandidate handling: cheaper in foliage (about a quarter of the trace there), slightly different AO under dense vegetation.\nWith \"texture exact\" on, the masks take precedence: the per ray coin only decides cutouts without a mask, so it saves nothing.");
          if (ImGui::Checkbox("RTAO: skip repeated draws", &g_rtao_dedup))
             reshade::set_config_value(runtime, NAME, "RTAODedup", g_rtao_dedup);
-         ImGui::Checkbox("RTAO debug: freeze ray tracing scene", &g_rtao_freeze_scene);
-         if (ImGui::IsItemHovered())
-            ImGui::SetTooltip("Keeps tracing the current ray tracing scene (no new geometry, no removals) until unchecked. Not saved.\n"
-                              "If the RT shadows still change while frozen, the cause is in the trace or the camera, not in what is captured.");
-         if (ImGui::SliderInt("RTAO BLAS builds per frame", &g_rtao_blas_budget, 8, 1024))
-            g_rtao_blas_budget = std::clamp(g_rtao_blas_budget, 8, 1024);
-         if (ImGui::IsItemDeactivatedAfterEdit())
-            reshade::set_config_value(runtime, NAME, "RTAOBlasBudget", g_rtao_blas_budget);
-         if (ImGui::IsItemHovered())
-            ImGui::SetTooltip("New meshes built for ray tracing per frame. A mesh waiting for its build is missing from the scene (late casters).");
          if (ImGui::IsItemHovered())
             ImGui::SetTooltip("Captures an object once per frame even if several passes draw it (depth prepass, G-buffer): saves the per draw\ncapture work on the game's render threads and duplicate per frame BLASes of characters. Turn off if geometry goes missing.");
          if (ImGui::Checkbox("RTAO cutouts: texture exact", &g_rtao_cutouts_exact))
@@ -3049,6 +3039,17 @@ public:
       }
       if (ImGui::IsItemHovered())
          ImGui::SetTooltip("What the trace writes. Check it with \"View AO only\" = RT sun visibility.");
+      // Debug (shared with RTAO's scene), next to the sun output where they are used
+      ImGui::Checkbox("RT debug: freeze ray tracing scene", &g_rtao_freeze_scene);
+      if (ImGui::IsItemHovered())
+         ImGui::SetTooltip("Keeps tracing the current ray tracing scene (no new geometry, no removals) until unchecked. Not saved.\n"
+                           "If the RT shadows still change while frozen, the cause is in the trace or the denoiser, not in what is captured.");
+      if (ImGui::SliderInt("RT BLAS builds per frame", &g_rtao_blas_budget, 8, 1024))
+         g_rtao_blas_budget = std::clamp(g_rtao_blas_budget, 8, 1024);
+      if (ImGui::IsItemDeactivatedAfterEdit())
+         reshade::set_config_value(runtime, NAME, "RTAOBlasBudget", g_rtao_blas_budget);
+      if (ImGui::IsItemHovered())
+         ImGui::SetTooltip("New meshes built for ray tracing per frame. A mesh waiting for its build is missing from the scene (late casters).");
 
       auto& game_device_data = GetGameDeviceData(device_data);
       std::string status;

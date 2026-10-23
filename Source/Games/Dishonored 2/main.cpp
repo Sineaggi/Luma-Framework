@@ -8,6 +8,10 @@
 // Not used by Dishonored 2?
 #define ENABLE_SHADER_CLASS_INSTANCES 1
 
+// RTAO creates a side D3D12 device, which ReShade wraps and reports to Luma like a game device. Without this,
+// Luma's handlers treat it as D3D11, and release builds pop a "non DirectX 11 device" message box mid frame.
+#define CHECK_GRAPHICS_API_COMPATIBILITY 1
+
 #include "../../../Shaders/Dishonored 2/Includes/GameCBuffers.hlsl"
 #include "..\..\Core\core.hpp"
 
@@ -1145,6 +1149,8 @@ public:
 
    static void OnMapBufferRegion(reshade::api::device* device, reshade::api::resource resource, uint64_t offset, uint64_t size, reshade::api::map_access access, void** data)
    {
+      if (device->get_api() != reshade::api::device_api::d3d11) // e.g. RTAO's D3D12 device
+         return;
       ID3D11Buffer* buffer = reinterpret_cast<ID3D11Buffer*>(resource.handle);
       // No need to convert to native DX11 flags
       if (access == reshade::api::map_access::write_only || access == reshade::api::map_access::write_discard || access == reshade::api::map_access::read_write)
@@ -1169,6 +1175,8 @@ public:
 
    static void OnUnmapBufferRegion(reshade::api::device* device, reshade::api::resource resource)
    {
+      if (device->get_api() != reshade::api::device_api::d3d11) // e.g. RTAO's D3D12 device
+         return;
       ID3D11Buffer* buffer = reinterpret_cast<ID3D11Buffer*>(resource.handle);
       DeviceData& device_data = *device->get_private_data<DeviceData>();
       // We assume this buffer is always unmapped before destruction.
@@ -1194,6 +1202,8 @@ public:
 
    static void OnExecuteSecondaryCommandList(reshade::api::command_list* cmd_list, reshade::api::command_list* secondary_cmd_list)
    {
+      if (cmd_list->get_device()->get_api() != reshade::api::device_api::d3d11) // e.g. RTAO's D3D12 device (bundles)
+         return;
       // First, so a deferred RTAO prefix executes before the SR prefix that was split later from the same context
       HandleRTAOCommandList(cmd_list, secondary_cmd_list);
 

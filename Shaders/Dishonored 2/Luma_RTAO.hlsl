@@ -6,6 +6,8 @@
 // composite_ps: replaces the game's SSAO pixel shader. Same output layout XeGTAO uses: x = visibility, y = 1.
 // capture_instances_cs: dispatched next to a captured game draw. Resolves each instance's object to world matrix the
 //    same way the game's vertex shader does (see RTAO_NOTES.md) and writes it to the capture ring shared with D3D12.
+// skin_vertices_cs: dispatched next to a captured skinned (or DYNAMIC vertex buffer) draw. Skins its vertices like the game's VS and
+//    writes them in world space into the skinned vertex ring shared with D3D12.
 
 // Depth (copy passes) or the shared AO (composite)
 Texture2D<float> tex : register(t0);
@@ -71,6 +73,19 @@ cbuffer CaptureParams : register(b0)
     uint4 MvpCB; // byte offsets of cb_mvpmatrixx/y/z/w (clip.c = dot(float4(pos, 1), cb_mvpmatrix[c]))
     uint ViewProjCB; // byte offset of cb_viewprojectionmatrix in the game's PerViewCB (4 rows: clip = world_h x VP)
     uint3 CapturePad2;
+    // skin_vertices_cs only
+    uint SkinVertexCount;
+    uint SkinDstVertex; // first vertex written in SkinOut
+    uint SkinSoup; // 0: thread i skins vertex i of the draw, 1: the vertex of the draw's index i
+    uint SkinSets; // 1: 4 bones, 2: 8 bones
+    uint MtxOffsetCB; // byte offset of cb_mtxoffset in the game's PerInstanceCB
+    uint SkinIndexStart; // Arena byte address of the draw's first index
+    uint SkinIndex32;
+    uint SkinPad;
+    // Streams 0 position, 1 indices0, 2 weights0, 3 indices1, 4 weights1 (components of the two uint4)
+    uint4 StreamBase[2]; // Arena byte address of vertex 0's element
+    uint4 StreamStride[2];
+    uint4 StreamFormat[2]; // RTAO::VertexFormatCode
 };
 
 // The game's PerInstanceCB, bound as is (read past its end returns 0)
@@ -142,15 +157,13 @@ float4 LoadGameCB4(uint byte_offset)
     return asfloat(GameCB[byte_offset >> 4]);
 }
 
-[numthreads(64, 1, 1)]
-void capture_instances_cs(uint3 id : SV_DispatchThreadID)
+// The object to world 3x4 of instance "i" of the draw (rows: world.c = dot(rows[c], float4(pos, 1))), like the game's VS
+uint ResolveInstance(uint i, out float4 rows[3])
 {
-    uint i = id.x;
-    if (i >= InstanceCount)
-        return;
-
     uint instance_offset = InstanceOffsetCB != RTAO_NO_OFFSET ? LoadGameCB(InstanceOffsetCB) : 0;
-    float4 rows[3] = { float4(0, 0, 0, 0), float4(0, 0, 0, 0), float4(0, 0, 0, 0) };
+    rows[0] = float4(0, 0, 0, 0);
+    rows[1] = float4(0, 0, 0, 0);
+    rows[2] = float4(0, 0, 0, 0);
     uint flags = RTAO_FLAG_VALID;
     if (Source == RTAO_SOURCE_DIRECT_INSTANCE_BUFFER)
     {
@@ -201,10 +214,180 @@ void capture_instances_cs(uint3 id : SV_DispatchThreadID)
     }
     if (DepthHackCB != RTAO_NO_OFFSET && asfloat(LoadGameCB(DepthHackCB)) != 1.0)
         flags |= RTAO_FLAG_VIEW_MODEL; // First person view model (depth squeezed): not world geometry
+    return flags;
+}
+
+[numthreads(64, 1, 1)]
+void capture_instances_cs(uint3 id : SV_DispatchThreadID)
+{
+    uint i = id.x;
+    if (i >= InstanceCount)
+        return;
+
+    float4 rows[3];
+    uint flags = ResolveInstance(i, rows);
 
     uint address = ((DstSlot + i) & SlotMask) * 64;
     CaptureRing.Store4(address, asuint(rows[0]));
     CaptureRing.Store4(address + 16, asuint(rows[1]));
     CaptureRing.Store4(address + 32, asuint(rows[2]));
     CaptureRing.Store4(address + 48, uint4(flags, 0, 0, 0));
+}
+
+// ---- Per frame vertex capture (skinned meshes, DYNAMIC vertex buffers). Must match RTAO::GeometryCapture::CaptureFrameDraw
+// (rtao_capture.cpp). Dispatched next to a captured draw (single instance). SkinSets 0: no skinning (dynamic meshes). Replays the game's vertex shader position math: the
+// bone palette blend (ro_matrices, 3 float4 rows per bone, row = (index + cb_mtxoffset.x) * 3, weighted, then
+// model.c = dot(float4(pos, 1), blended row c)), then the instance's object to world (ResolveInstance), and writes
+// world space float3s for the BLAS.
+
+Buffer<float4> Bones : register(t3); // The draw's ro_matrices
+ByteAddressBuffer Arena : register(t4); // The geometry arena (the game's vertex/index buffers copied whole), one view of it
+ByteAddressBuffer DynamicVertices : register(t5); // DYNAMIC vertex buffers, copied at the draw (stream format flag RTAO_FORMAT_DYNAMIC)
+RWByteAddressBuffer SkinOut : register(u1); // float3 per vertex
+
+// Vertex element formats (must match RTAO::VertexFormatCode): kind | components << 4 | bits per component << 8
+#define RTAO_KIND_FLOAT 1
+#define RTAO_KIND_UNORM 2
+#define RTAO_KIND_SNORM 3
+#define RTAO_KIND_UINT 4
+#define RTAO_KIND_SINT 5
+#define RTAO_KIND_HALF 6
+#define RTAO_KIND_RGB10A2_UNORM 7
+#define RTAO_KIND_RGB10A2_UINT 8
+#define RTAO_KIND_BGRA8_UNORM 9
+#define RTAO_FORMAT_DYNAMIC (1u << 16) // RTAO::kVertexFormatDynamicBuffer
+
+uint LoadData(uint address, bool dynamic) // Any byte alignment
+{
+    uint aligned = address & ~3u;
+    uint shift = (address & 3u) * 8u;
+    uint lo = dynamic ? DynamicVertices.Load(aligned) : Arena.Load(aligned);
+    if (shift == 0)
+        return lo;
+    uint hi = dynamic ? DynamicVertices.Load(aligned + 4) : Arena.Load(aligned + 4);
+    return (lo >> shift) | (hi << (32u - shift));
+}
+
+uint LoadArena(uint address)
+{
+    return LoadData(address, false);
+}
+
+uint ElementRaw(uint4 dwords, uint component, uint bits)
+{
+    if (bits == 32)
+        return dwords[component];
+    if (bits == 16)
+        return (dwords[component >> 1] >> ((component & 1u) * 16u)) & 0xFFFFu;
+    return (dwords.x >> (component * 8u)) & 0xFFu;
+}
+
+int SignExtend(uint value, uint bits)
+{
+    uint shift = 32u - bits;
+    return int(value << shift) >> int(shift);
+}
+
+// Like the input assembler: missing components read as (0, 0, 0, 1). "as_uint": the shader input is uint (bit pattern
+// of integers), otherwise the bit pattern of floats.
+uint4 DecodeElement(uint address, uint code, bool as_uint)
+{
+    uint kind = code & 15u, count = (code >> 4) & 15u, bits = (code >> 8) & 0xFFu;
+    bool dynamic = (code & RTAO_FORMAT_DYNAMIC) != 0;
+    uint4 dwords = uint4(LoadData(address, dynamic), 0, 0, 0);
+    if (count * bits > 32)
+    {
+        dwords.y = LoadData(address + 4, dynamic);
+        dwords.z = LoadData(address + 8, dynamic);
+        dwords.w = LoadData(address + 12, dynamic);
+    }
+    if (kind == RTAO_KIND_RGB10A2_UNORM || kind == RTAO_KIND_RGB10A2_UINT)
+    {
+        uint4 raw = uint4(dwords.x & 1023u, (dwords.x >> 10) & 1023u, (dwords.x >> 20) & 1023u, dwords.x >> 30);
+        return kind == RTAO_KIND_RGB10A2_UINT ? raw : asuint(float4(raw) / float4(1023, 1023, 1023, 3));
+    }
+    uint4 result = as_uint ? uint4(0, 0, 0, 1) : asuint(float4(0, 0, 0, 1));
+    [unroll] for (uint c = 0; c < 4; c++)
+    {
+        if (c >= count)
+            break;
+        uint raw = ElementRaw(dwords, c, bits);
+        uint value;
+        if (kind == RTAO_KIND_FLOAT)
+            value = raw;
+        else if (kind == RTAO_KIND_HALF)
+            value = asuint(f16tof32(raw));
+        else if (kind == RTAO_KIND_UNORM || kind == RTAO_KIND_BGRA8_UNORM)
+            value = asuint(float(raw) / float((1u << bits) - 1u));
+        else if (kind == RTAO_KIND_SNORM)
+            value = asuint(max(float(SignExtend(raw, bits)) / float((1u << (bits - 1u)) - 1u), -1.0));
+        else if (kind == RTAO_KIND_SINT)
+            value = uint(SignExtend(raw, bits));
+        else
+            value = raw; // UINT
+        result[c] = value;
+    }
+    if (kind == RTAO_KIND_BGRA8_UNORM)
+        result.xz = result.zx;
+    return result;
+}
+
+uint StreamComponent(uint4 values[2], uint stream)
+{
+    uint4 v = values[stream >> 2];
+    uint c = stream & 3u;
+    return c == 0 ? v.x : (c == 1 ? v.y : (c == 2 ? v.z : v.w));
+}
+
+uint StreamAddress(uint stream, uint vertex)
+{
+    uint4 bases[2] = { StreamBase[0], StreamBase[1] };
+    uint4 strides[2] = { StreamStride[0], StreamStride[1] };
+    return StreamComponent(bases, stream) + vertex * StreamComponent(strides, stream);
+}
+
+uint StreamCode(uint stream)
+{
+    uint4 formats[2] = { StreamFormat[0], StreamFormat[1] };
+    return StreamComponent(formats, stream);
+}
+
+[numthreads(64, 1, 1)]
+void skin_vertices_cs(uint3 id : SV_DispatchThreadID)
+{
+    uint i = id.x;
+    if (i >= SkinVertexCount)
+        return;
+
+    uint vertex = i;
+    if (SkinSoup != 0)
+        vertex = SkinIndex32 != 0 ? LoadArena(SkinIndexStart + i * 4) : (LoadArena(SkinIndexStart + i * 2) & 0xFFFFu);
+
+    float4 rows[3];
+    uint flags = ResolveInstance(0, rows);
+
+    float3 world = asfloat(0x7FC00000u).xxx; // NaN: DXR treats the triangle as inactive (view model, unresolved matrix)
+    if (flags == RTAO_FLAG_VALID)
+    {
+        float4 position = float4(asfloat(DecodeElement(StreamAddress(0, vertex), StreamCode(0), false).xyz), 1.0);
+        uint mtx_offset = SkinSets != 0 ? LoadGameCB(MtxOffsetCB) : 0;
+        float4 bone0 = float4(0, 0, 0, 0), bone1 = float4(0, 0, 0, 0), bone2 = float4(0, 0, 0, 0);
+        [unroll] for (uint set = 0; set < 2; set++)
+        {
+            if (set >= SkinSets)
+                break;
+            uint4 indices = DecodeElement(StreamAddress(1 + set * 2, vertex), StreamCode(1 + set * 2), true);
+            float4 weights = asfloat(DecodeElement(StreamAddress(2 + set * 2, vertex), StreamCode(2 + set * 2), false));
+            [unroll] for (uint b = 0; b < 4; b++)
+            {
+                uint row = (indices[b] + mtx_offset) * 3;
+                bone0 += Bones[row] * weights[b];
+                bone1 += Bones[row + 1] * weights[b];
+                bone2 += Bones[row + 2] * weights[b];
+            }
+        }
+        float4 model = SkinSets != 0 ? float4(dot(position, bone0), dot(position, bone1), dot(position, bone2), 1.0) : position; // No bones: a dynamic mesh
+        world = float3(dot(model, rows[0]), dot(model, rows[1]), dot(model, rows[2]));
+    }
+    SkinOut.Store3((SkinDstVertex + i) * 12, asuint(world));
 }

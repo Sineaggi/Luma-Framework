@@ -158,6 +158,8 @@ namespace
    float g_rtao_radius = 1.5f; // World units (config "RTAORadius")
    int g_rtao_rays = 4; // Per pixel per frame (config "RTAORays")
    int g_rtao_capture_pass = 1; // 0: depth only draws (no render target bound), 1: every depth writing draw (config "RTAOCapturePass")
+   bool g_rtao_skinned = true; // Skinned characters in the ray tracing scene (config "RTAOSkinned")
+   bool g_rtao_dynamic = true; // Meshes with a DYNAMIC vertex buffer (movable objects) in the ray tracing scene (config "RTAODynamic")
 
    bool RTAOOutputIsRayTraced(int output)
    {
@@ -171,6 +173,8 @@ namespace
    std::atomic<bool> g_rtao_capture_active = false; // Set while RTAO traces, so the draw hook costs nothing otherwise
    std::atomic<uint32_t> g_rtao_main_depth_width = 0, g_rtao_main_depth_height = 0; // The main view's depth size
    std::atomic<uint64_t> g_rtao_vs_by_source[5] = {}; // Reflected vertex shaders, by RTAO::MatrixSource
+   std::atomic<uint64_t> g_rtao_vs_skinned = 0; // Reflected skinned vertex shaders (also counted by source)
+   std::atomic<uint64_t> g_rtao_draws_skinned = 0; // Main view skinned draws
    std::atomic<uint64_t> g_rtao_draws_by_source[5] = {}; // Main view draws, by their vertex shader's matrix source
    std::atomic<uint64_t> g_rtao_draws_unknown_shader = 0, g_rtao_draws_unusable_layout = 0, g_rtao_indirect_draws = 0, g_rtao_draws_not_triangle_list = 0;
    // Main view draws whose vertex shader can't be captured, by reason (the reasons are static strings)
@@ -352,6 +356,7 @@ public:
       native_shaders_definitions.emplace(CompileTimeStringHash("DS2 RTAO Depth Pack PS"), ShaderDefinition{ "Luma_RTAO", reshade::api::pipeline_subobject_type::pixel_shader, nullptr, "depth_pack_ps" });
       native_shaders_definitions.emplace(CompileTimeStringHash("DS2 AO View PS"), ShaderDefinition{ "Luma_RTAO", reshade::api::pipeline_subobject_type::pixel_shader, nullptr, "ao_view_ps" });
       native_shaders_definitions.emplace(CompileTimeStringHash("DS2 RTAO Capture CS"), ShaderDefinition{ "Luma_RTAO", reshade::api::pipeline_subobject_type::compute_shader, nullptr, "capture_instances_cs" });
+      native_shaders_definitions.emplace(CompileTimeStringHash("DS2 RTAO Skin CS"), ShaderDefinition{ "Luma_RTAO", reshade::api::pipeline_subobject_type::compute_shader, nullptr, "skin_vertices_cs" });
       native_shaders_definitions.emplace(CompileTimeStringHash("DS2 RTAO Composite PS"), ShaderDefinition{ "Luma_RTAO", reshade::api::pipeline_subobject_type::pixel_shader, nullptr, "composite_ps" });
       native_shaders_definitions.emplace(CompileTimeStringHash("DS2 Pre DLSS CS"), ShaderDefinition{ "Luma_PreDLSS_CS", reshade::api::pipeline_subobject_type::compute_shader });
       native_shaders_definitions.emplace(CompileTimeStringHash("DS2 Post DLSS CS"), ShaderDefinition{ "Luma_PostDLSS_CS", reshade::api::pipeline_subobject_type::compute_shader });
@@ -435,6 +440,8 @@ public:
          output = RTAO_OUTPUT_DEPTH_TEST;
       const bool ray_traced = RTAOOutputIsRayTraced(output);
       g_rtao_capture_active = ray_traced;
+      game_device_data.rtao_capture.skinning_enabled = g_rtao_skinned;
+      game_device_data.rtao_capture.dynamic_enabled = g_rtao_dynamic;
       game_device_data.rtao_last_draw_frame = game_device_data.rtao_frame;
       g_rtao_main_depth_width = depth_desc.Width;
       g_rtao_main_depth_height = depth_desc.Height;
@@ -655,9 +662,11 @@ public:
       const auto capture_cs = device_data.native_compute_shaders.find(CompileTimeStringHash("DS2 RTAO Capture CS"));
       if (capture_cs == device_data.native_compute_shaders.end() || !capture_cs->second)
          return false; // Not compiled (yet)
+      const auto skin_cs = device_data.native_compute_shaders.find(CompileTimeStringHash("DS2 RTAO Skin CS"));
+      ID3D11ComputeShader* skin_shader = skin_cs != device_data.native_compute_shaders.end() ? skin_cs->second.get() : nullptr;
       std::string error;
       auto& rtao = game_device_data.rtao;
-      if (!game_device_data.rtao_capture.Init(native_device, rtao, capture_cs->second.get(), error) || !game_device_data.rtao_pass.Init(rtao.GetDevice(), error) ||
+      if (!game_device_data.rtao_capture.Init(native_device, rtao, capture_cs->second.get(), skin_shader, error) || !game_device_data.rtao_pass.Init(rtao.GetDevice(), error) ||
          !game_device_data.rtao_timer.Init(rtao.GetDevice(), rtao.GetTimestampFrequency(), error))
       {
          game_device_data.rtao_rt_failed = true;
@@ -665,7 +674,10 @@ public:
          return false;
       }
       game_device_data.rtao_rt_ready = true;
-      SetRTAOStatus("ray tracing ready (geometry capture, BLAS/TLAS, RayQuery AO + denoiser)", false);
+      if (game_device_data.rtao_capture.IsSkinningAvailable())
+         SetRTAOStatus("ray tracing ready (geometry capture incl. skinned and dynamic meshes, BLAS/TLAS, RayQuery AO + denoiser)", false);
+      else
+         SetRTAOStatus("ray tracing ready, without skinned/dynamic meshes (" + (skin_shader ? game_device_data.rtao_capture.skinning_error : std::string("skin shader not compiled")) + ")", false);
       return true;
    }
 
@@ -1092,7 +1104,7 @@ public:
       const uint32_t rtao_frames = game_device_data.rtao_frame - game_device_data.rtao_init_frame;
       if (game_device_data.rtao.IsInitialized() && (rtao_frames == 300 || rtao_frames == 3000 || rtao_frames == 30000))
       {
-         char buffer[256];
+         char buffer[512];
          snprintf(buffer, sizeof(buffer), "RTAO: %u frames after init: inline passes %u, deferred splits %u, mapped %u, deferred passes %u, failed %u, dropped %u",
             rtao_frames, game_device_data.rtao_stat_inline_ok.load(), game_device_data.rtao_stat_splits.load(), game_device_data.rtao_stat_mapped.load(),
             game_device_data.rtao_stat_deferred_ok.load(), game_device_data.rtao_stat_failed.load(), game_device_data.rtao_stat_dropped.load());
@@ -1104,6 +1116,11 @@ public:
                (unsigned long long)stats.draws_captured, (unsigned long long)stats.draws_seen, (unsigned long long)stats.meshes, (unsigned long long)stats.meshes_ready,
                (unsigned long long)(game_device_data.rtao_blas_bytes.load() >> 20), (unsigned long long)(stats.arena_vertex_bytes >> 20), game_device_data.rtao_tlas_instances.load(),
                (unsigned long long)g_rtao_indirect_draws.load(), (unsigned long long)g_rtao_draws_unknown_shader.load(), game_device_data.rtao_gpu_us.load() / 1000.0);
+            reshade::log::message(reshade::log::level::info, buffer);
+            snprintf(buffer, sizeof(buffer), "RTAO: per frame meshes: skinned draws %llu main view / %llu captured (instanced %llu, copy pending %llu), dynamic %llu captured (instanced %llu, too large %llu), last frame %llu draws %llu vertices, over budget %llu, BLAS builds %llu refits %llu failed %llu",
+               (unsigned long long)g_rtao_draws_skinned.load(), (unsigned long long)stats.skinned_captured, (unsigned long long)stats.skinned_instanced, (unsigned long long)stats.skinned_waiting,
+               (unsigned long long)stats.dynamic_captured, (unsigned long long)stats.dynamic_instanced, (unsigned long long)stats.dynamic_too_large, (unsigned long long)stats.frame_draws,
+               (unsigned long long)stats.frame_vertices, (unsigned long long)stats.frame_overflow, (unsigned long long)stats.frame_blas_builds, (unsigned long long)stats.frame_blas_refits, (unsigned long long)stats.frame_blas_failed);
             reshade::log::message(reshade::log::level::info, buffer);
             std::string reasons = "RTAO: main view draws not captured:";
             {
@@ -1609,6 +1626,8 @@ public:
             RTAO::VertexShaderInfo info;
             RTAO::ReflectVertexShader(desc->code, desc->code_size, info);
             g_rtao_vs_by_source[(std::min)(uint32_t(info.source), 4u)]++;
+            if (info.skinned)
+               g_rtao_vs_skinned++;
             const std::unique_lock lock(g_rtao_shader_mutex);
             g_rtao_vertex_shaders[pipeline.handle] = info;
          }
@@ -1710,16 +1729,31 @@ public:
             layout_info = layout_it->second;
       }
       g_rtao_draws_by_source[(std::min)(uint32_t(vs_info.source), 4u)]++;
-      if (vs_info.source == RTAO::MatrixSource::None)
+      if (vs_info.skinned)
+         g_rtao_draws_skinned++;
+      if (vs_info.source == RTAO::MatrixSource::None || (vs_info.skinned && !g_rtao_skinned))
       {
          const std::lock_guard lock(g_rtao_skip_reason_mutex);
-         g_rtao_skip_reasons[vs_info.skip_reason ? vs_info.skip_reason : "unknown"]++;
+         g_rtao_skip_reasons[vs_info.source == RTAO::MatrixSource::None ? (vs_info.skip_reason ? vs_info.skip_reason : "unknown") : "skinned (off)"]++;
          return false;
       }
       if (!layout_info.has_position || layout_info.position_per_instance)
       {
          g_rtao_draws_unusable_layout++;
          return false;
+      }
+      if (vs_info.skinned)
+      {
+         for (uint32_t set = 0; set < vs_info.skin_sets; set++)
+         {
+            const auto& indices = layout_info.skin_indices[set];
+            const auto& weights = layout_info.skin_weights[set];
+            if (!indices.present || !weights.present || indices.per_instance || weights.per_instance)
+            {
+               g_rtao_draws_unusable_layout++;
+               return false;
+            }
+         }
       }
 
       RTAO::DrawInfo draw;
@@ -1764,6 +1798,30 @@ public:
          context->VSGetShaderResources(vs_info.instance_buffer_slot, 1, &instance_buffer);
       if (vs_info.instance_index_slot != RTAO::kNoOffset)
          context->VSGetShaderResources(vs_info.instance_index_slot, 1, &instance_index);
+      // Skinned: the bone palette and the vertex streams of the skin indices/weights (often another slot)
+      com_ptr<ID3D11ShaderResourceView> bones;
+      com_ptr<ID3D11Buffer> skin_buffers[4];
+      if (vs_info.skinned)
+      {
+         context->VSGetShaderResources(vs_info.bones_slot, 1, &bones);
+         draw.bones = bones.get();
+         for (uint32_t set = 0; set < vs_info.skin_sets; set++)
+         {
+            const RTAO::InputLayoutInfo::Element* elements[2] = { &layout_info.skin_indices[set], &layout_info.skin_weights[set] };
+            RTAO::DrawInfo::Stream* streams[2] = { &draw.skin_indices[set], &draw.skin_weights[set] };
+            for (uint32_t k = 0; k < 2; k++)
+            {
+               UINT skin_stride = 0, skin_offset = 0;
+               com_ptr<ID3D11Buffer>& buffer = skin_buffers[set * 2 + k];
+               context->IAGetVertexBuffers(elements[k]->slot, 1, &buffer, &skin_stride, &skin_offset);
+               streams[k]->buffer = buffer.get();
+               streams[k]->stride = skin_stride;
+               streams[k]->offset = skin_offset;
+               streams[k]->element_offset = elements[k]->offset;
+               streams[k]->format = elements[k]->format;
+            }
+         }
+      }
       draw.vertex_buffer = vertex_buffer.get();
       draw.vertex_buffer_offset = offset;
       draw.vertex_stride = stride;
@@ -2091,6 +2149,8 @@ public:
       reshade::get_config_value(runtime, NAME, "RTAORadius", g_rtao_radius);
       reshade::get_config_value(runtime, NAME, "RTAORays", g_rtao_rays);
       reshade::get_config_value(runtime, NAME, "RTAOCapturePass", g_rtao_capture_pass);
+      reshade::get_config_value(runtime, NAME, "RTAOSkinned", g_rtao_skinned);
+      reshade::get_config_value(runtime, NAME, "RTAODynamic", g_rtao_dynamic);
       reshade::get_config_value(runtime, NAME, "RTAOStrength", g_rtao_strength);
       g_rtao_strength = std::clamp(g_rtao_strength, 0.25f, 4.f);
       g_rtao_radius = std::clamp(g_rtao_radius, 0.05f, 50.f);
@@ -2202,6 +2262,14 @@ public:
             reshade::set_config_value(runtime, NAME, "RTAOCapturePass", g_rtao_capture_pass);
          if (ImGui::IsItemHovered())
             ImGui::SetTooltip("Which main view draws feed the ray tracing scene. Use \"All\" if the coverage view shows missing (grey) geometry.");
+         if (ImGui::Checkbox("RTAO: skinned characters", &g_rtao_skinned))
+            reshade::set_config_value(runtime, NAME, "RTAOSkinned", g_rtao_skinned);
+         if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("Characters (skinned meshes) occlude in the ray traced AO: their vertices are skinned again in a compute pass every frame\nand get a BLAS refit per draw. Costs some GPU time per visible character.");
+         if (ImGui::Checkbox("RTAO: dynamic meshes (doors, windows)", &g_rtao_dynamic))
+            reshade::set_config_value(runtime, NAME, "RTAODynamic", g_rtao_dynamic);
+         if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("Movable objects whose vertices the game rewrites every frame (openable doors, windows, cabinets):\ncopied at each draw and built into a per frame BLAS.");
          if (ImGui::SliderFloat("RTAO Strength", &g_rtao_strength, 0.25f, 4.f, "%.2f"))
             g_rtao_strength = std::clamp(g_rtao_strength, 0.25f, 4.f);
          if (ImGui::IsItemDeactivatedAfterEdit())
@@ -2226,8 +2294,15 @@ public:
             ImGui::Text("Meshes %llu (%llu with a BLAS, %llu failed), BLAS %llu (%.1f MB), buffers copied %llu (arena %.1f MB)", (unsigned long long)stats.meshes, (unsigned long long)stats.meshes_ready,
                (unsigned long long)stats.blas_failed, (unsigned long long)game_device_data.rtao_blas_count.load(), game_device_data.rtao_blas_bytes.load() / 1048576.0, (unsigned long long)stats.buffers_copied, stats.arena_vertex_bytes / 1048576.0);
             ImGui::Text("TLAS instances %u, instances read back last frame %llu, view model instances %llu, draws after the AO pass (left out) %llu", game_device_data.rtao_tlas_instances.load(), (unsigned long long)stats.frame_instances, (unsigned long long)stats.view_model_instances, (unsigned long long)stats.after_ao_records);
-            ImGui::Text("Vertex shaders reflected: none %llu, direct %llu, indexed %llu, cbuffer %llu, MVP %llu", (unsigned long long)g_rtao_vs_by_source[0].load(), (unsigned long long)g_rtao_vs_by_source[1].load(),
-               (unsigned long long)g_rtao_vs_by_source[2].load(), (unsigned long long)g_rtao_vs_by_source[3].load(), (unsigned long long)g_rtao_vs_by_source[4].load());
+            ImGui::Text("Vertex shaders reflected: none %llu, direct %llu, indexed %llu, cbuffer %llu, MVP %llu (skinned %llu)", (unsigned long long)g_rtao_vs_by_source[0].load(), (unsigned long long)g_rtao_vs_by_source[1].load(),
+               (unsigned long long)g_rtao_vs_by_source[2].load(), (unsigned long long)g_rtao_vs_by_source[3].load(), (unsigned long long)g_rtao_vs_by_source[4].load(), (unsigned long long)g_rtao_vs_skinned.load());
+            ImGui::Text("Skinned draws: main view %llu, captured %llu, skipped: instanced %llu, copy pending %llu", (unsigned long long)g_rtao_draws_skinned.load(), (unsigned long long)stats.skinned_captured,
+               (unsigned long long)stats.skinned_instanced, (unsigned long long)stats.skinned_waiting);
+            ImGui::Text("Dynamic meshes: captured %llu, skipped: instanced %llu, copy pending %llu, too large %llu", (unsigned long long)stats.dynamic_captured, (unsigned long long)stats.dynamic_instanced,
+               (unsigned long long)stats.dynamic_waiting, (unsigned long long)stats.dynamic_too_large);
+            ImGui::Text("Per frame meshes last frame: %llu draws, %llu vertices; soup %llu / indexed %llu, over budget %llu; BLAS builds %llu, refits %llu, failed %llu, live %llu (%.1f MB)",
+               (unsigned long long)stats.frame_draws, (unsigned long long)stats.frame_vertices, (unsigned long long)stats.frame_soup, (unsigned long long)stats.frame_indexed, (unsigned long long)stats.frame_overflow,
+               (unsigned long long)stats.frame_blas_builds, (unsigned long long)stats.frame_blas_refits, (unsigned long long)stats.frame_blas_failed, (unsigned long long)stats.frame_blas_count, stats.frame_blas_bytes / 1048576.0);
             ImGui::TreePop();
          }
       }

@@ -102,6 +102,53 @@ namespace RTAO
       bool barrier_owed = false;
    };
 
+   // Deforming meshes (skinned characters): one BLAS per caller identity, built (ALLOW_UPDATE, PREFER_FAST_BUILD) the
+   // first time and refit in place every later frame while the topology stays the same. A full rebuild every
+   // kMaxRefits frames keeps the BVH from degrading when the pose drifts far from the one it was built for (or when an
+   // identity ends up on another character drawing the same mesh). Entries not updated for kEvictFrames are released.
+   // Scratch memory is one buffer sub-allocated per frame (sized to the previous frames' need, a too-small frame uses
+   // a temporary one), so builds in a frame don't serialize on a shared scratch.
+   class DynamicBlasSet
+   {
+   public:
+      static constexpr uint32_t kMaxRefits = 30;
+      static constexpr uint32_t kEvictFrames = 2;
+
+      ~DynamicBlasSet() { Clear(nullptr, 0); }
+
+      void BeginFrame();
+      // Records a build or refit into ctx.list (the vertices/indices must be readable by the build). Returns the BLAS
+      // address, 0 on failure. Call EndFrame() after the frame's updates, before the TLAS build.
+      D3D12_GPU_VIRTUAL_ADDRESS Update(const BuildContext& ctx, uint64_t key, const GpuMesh& mesh, bool& refit, std::string& error);
+      // UAV barrier for the frame's builds, evicts unused entries
+      void EndFrame(const BuildContext& ctx);
+      void Clear(Retirer* retirer, uint64_t fence_value);
+
+      size_t Count() const { return entries.size(); }
+      uint64_t ResultBytes() const { return result_bytes; }
+
+   private:
+      bool AllocateScratch(const BuildContext& ctx, uint64_t size, D3D12_GPU_VIRTUAL_ADDRESS& out, std::string& error);
+
+      struct Entry
+      {
+         ID3D12Resource* result = nullptr;
+         uint64_t bytes = 0;
+         uint64_t update_scratch = 0;
+         uint32_t vertex_count = 0, index_count = 0;
+         DXGI_FORMAT index_format = DXGI_FORMAT_UNKNOWN;
+         D3D12_GPU_VIRTUAL_ADDRESS indices = 0;
+         uint32_t last_frame = 0;
+         uint32_t refits = 0;
+      };
+      std::unordered_map<uint64_t, Entry> entries;
+      uint64_t result_bytes = 0;
+      uint32_t frame = 0;
+      bool barrier_owed = false;
+      ID3D12Resource* scratch = nullptr;
+      uint64_t scratch_capacity = 0, scratch_used = 0, scratch_peak = 0;
+   };
+
    class TlasBuilder
    {
    public:
@@ -120,6 +167,10 @@ namespace RTAO
       void AddInstance(uint64_t instance_key, uint64_t blas_key, const float object_to_world[3][4], uint8_t mask = 0xFF);
       void RemoveInstance(uint64_t instance_key);
       size_t RetainedCount();
+      // An instance for the current frame only (dropped at the next BeginFrame), with its BLAS given directly (e.g. from
+      // a DynamicBlasSet). Not thread safe: call from the recording thread, between BeginFrame and Build.
+      void AddFrameInstance(D3D12_GPU_VIRTUAL_ADDRESS blas, const float object_to_world[3][4], uint8_t mask = 0xFF);
+      size_t FrameInstanceCount() const { return frame_instances.size(); }
 
       // Builds the TLAS from every retained instance whose BLAS is in "blases" (the others are skipped). "out" stays
       // valid until the next Build. An empty scene still builds a valid (empty) TLAS.
@@ -141,6 +192,7 @@ namespace RTAO
       };
       std::mutex mutex;
       std::unordered_map<uint64_t, Instance> instances;
+      std::vector<D3D12_RAYTRACING_INSTANCE_DESC> frame_instances;
       uint32_t frame = 0;
 
       static constexpr uint32_t kSlots = 3; // Matches Interop's frames in flight

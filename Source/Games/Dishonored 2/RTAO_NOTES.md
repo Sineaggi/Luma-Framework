@@ -48,6 +48,18 @@ skinned result is in model space, then goes through the family 1/2/3 transform. 
 binds bones). For RT that means either replaying the skinning in our own compute pass (inputs: the VB, the
 bone buffer SRV, cb_mtxoffset) or capturing post-VS positions with stream output.
 
+Checked on all 1930 skinned VS of the dump (disassembly scan): every one uses `cb_mtxoffset.x` of PerInstanceCB
+(cb2) added to the skin indices, 3 rows per bone, model space result (`dot(float4(pos, 1), blended row)`), then
+the family transform. Split: 4 bones (SKININDICES0/WEIGHTS0) 360, 8 bones (0 and 1) 1570; direct instance buffer
+639, indexed 649, cb_modelmatrix 477, MVP only 165. `ro_matrices` is `Buffer<float4>`, slot t0 or t2 (reflected).
+
+Implemented (rtao-skin): `skin_vertices_cs` replays that per skinned draw from the arena copy of the VBs and
+writes world space vertices; one BLAS per draw, refit every frame, current-frame-only TLAS instance (see
+rtao_capture.h). Meshes with DYNAMIC vertex buffers (doors, windows) take the same path without bones.
+
+Raw SRVs on the geometry arena (D3D11, RTX 4090): on a buffer of 512 MB or more, only views of exactly 2^27
+elements (512 MB) at multiples of 512 MB are accepted (anything else E_INVALIDARG); smaller buffers take any view.
+
 ## GPU culling (risk)
 
 CS `0x2537D38B` ("arkcullgeometry") reads `ro_arkcullgeometry_vertexdata/indexdata/instancedata` plus the

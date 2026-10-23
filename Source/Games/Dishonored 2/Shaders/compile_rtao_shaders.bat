@@ -1,7 +1,7 @@
 @echo off
 rem Compiles the D3D12 side RTAO shaders to DXIL headers embedded in the addon (rtao_pass.cpp includes them).
 rem RayQuery needs shader model 6.5, which only DXC can compile. Re-run after editing any .hlsl/.hlsli here
-rem and commit the regenerated headers. Uses the DXC from the Windows SDK (dxc.exe + dxil.dll, so the output is signed).
+rem (rtao_cutout.hlsli included) and commit the regenerated headers. Uses the DXC from the Windows SDK (dxc.exe + dxil.dll, so the output is signed).
 setlocal
 set "DXC="
 for /f "delims=" %%d in ('dir /b /ad /o-n "%ProgramFiles(x86)%\Windows Kits\10\bin\10.*" 2^>nul') do (

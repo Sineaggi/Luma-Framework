@@ -1,7 +1,10 @@
 // RT sun shadows trace: per pixel, RayCount inline ray queries (DXR 1.1) from the world position reconstructed from
 // depth toward the directional light, jittered inside the light's disc (soft penumbra, F4 RtShadows' ConeSampleDisk).
-// Writes raw visibility (1 = lit) for rtsun_filter.hlsl. Same TLAS, bias and cutout handling as rtao_trace.hlsl.
+// Writes raw visibility (1 = lit) for rtsun_filter.hlsl. Same TLAS, bias and cutout handling as rtao_trace.hlsl
+// (texture exact masks through rtao_cutout.hlsli, the stochastic opacity / fast cutouts for cutouts without a mask).
+// Always full resolution (RTAO Quality doesn't apply: a hard shadow edge doesn't survive a half resolution upsample).
 #include "rtsun_common.hlsli"
+#include "rtao_cutout.hlsli"
 
 RaytracingAccelerationStructure Scene : register(t0);
 RWTexture2D<float> VisRaw : register(u0);
@@ -84,11 +87,14 @@ void main(uint3 id : SV_DispatchThreadID)
     // Same offset as the AO trace: grows with distance to stay above the depth reconstruction error
     float3 origin = p0 + n * (Bias + view_z * 0.002);
 
-    // Cutouts: as in rtao_trace.hlsl (each crossing stops the ray with probability CutoutOpacity)
-    const uint ray_flags = CutoutOpacity >= 1.0 ? RAY_FLAG_FORCE_OPAQUE : RAY_FLAG_NONE;
-    const uint ray_mask = CutoutOpacity <= 0.0 ? (0xFF & ~kInstanceMaskCutout) : 0xFF;
+    // Cutouts: exactly as rtao_trace.hlsl. A candidate cutout triangle is tested against its material's alpha mask
+    // (texture exact); without a mask, it stops the ray with probability CutoutOpacity (per crossing, or per ray with
+    // fast cutouts). With masks off, opacity 1 forces everything opaque and 0 leaves cutouts out.
+    const uint ray_flags = (CutoutOpacity >= 1.0 && CutoutExact == 0) ? RAY_FLAG_FORCE_OPAQUE : RAY_FLAG_NONE;
+    const uint ray_mask = (CutoutOpacity <= 0.0 && CutoutExact == 0) ? (0xFF & ~kInstanceMaskCutout) : 0xFF;
     uint rays = max(RayCount, 1u);
     float lit = 0.0;
+    const float coin_offset = float(Hash(px.x * 0x632BE5ABu + Hash(px.y + Hash(Frame + 0x165667B1u))) & 0xFFFF) / 65536.0;
     for (uint i = 0; i < rays; i++)
     {
         RayDesc ray;
@@ -96,20 +102,41 @@ void main(uint3 id : SV_DispatchThreadID)
         ray.Direction = ConeTan > 0.0 ? ConeSampleDisk(L, ConeTan, Random2(px, i)) : L;
         ray.TMin = 0.0;
         ray.TMax = TMax;
+        uint flags_i = ray_flags, mask_i = ray_mask;
+        int fallback_coin = -1;
+        if (CutoutMode != 0 && CutoutOpacity > 0.0 && CutoutOpacity < 1.0)
+        {
+            const float u = frac((float(i) + coin_offset) / float(rays));
+            const float p = CutoutMode == 2 ? 1.0 - (1.0 - CutoutOpacity) * (1.0 - CutoutOpacity) : CutoutOpacity;
+            if (CutoutExact != 0)
+                fallback_coin = u < p ? 1 : 0;
+            else if (u < p)
+                flags_i |= RAY_FLAG_FORCE_OPAQUE;
+            else
+                mask_i &= ~kInstanceMaskCutout;
+        }
         RayQuery<RAY_FLAG_ACCEPT_FIRST_HIT_AND_END_SEARCH | RAY_FLAG_SKIP_PROCEDURAL_PRIMITIVES> q;
-        q.TraceRayInline(Scene, ray_flags, ray_mask, ray);
+        q.TraceRayInline(Scene, flags_i, mask_i, ray);
         const uint seed = Hash(px.x * 0x9E3779B9u + Hash(px.y + Hash(Frame * 64 + i + 0x68E31DA4u)));
         while (q.Proceed())
         {
             if (q.CandidateType() == CANDIDATE_NON_OPAQUE_TRIANGLE && (q.CandidateInstanceID() & kInstanceIdCutoutBit) != 0)
             {
-                uint h = Hash(seed ^ Hash(q.CandidateInstanceIndex() * 0x8DA6B343u + q.CandidatePrimitiveIndex()));
-                if (float(h & 0xFFFFFF) / 16777216.0 < CutoutOpacity)
+                int solid = CutoutAlphaTest(q.CandidateInstanceID(), q.CandidatePrimitiveIndex(), q.CandidateTriangleBarycentrics());
+                if (solid < 0 && fallback_coin >= 0)
+                    solid = fallback_coin;
+                if (solid < 0)
+                {
+                    uint h = Hash(seed ^ Hash(q.CandidateInstanceIndex() * 0x8DA6B343u + q.CandidatePrimitiveIndex()));
+                    solid = float(h & 0xFFFFFF) / 16777216.0 < CutoutOpacity ? 1 : 0;
+                }
+                if (solid > 0)
                     q.CommitNonOpaqueTriangleHit();
             }
         }
         if (q.CommittedStatus() != COMMITTED_TRIANGLE_HIT)
             lit += 1.0;
     }
+    CutoutFlushCounters();
     VisRaw[px] = lit / float(rays);
 }

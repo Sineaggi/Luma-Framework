@@ -49,8 +49,11 @@ namespace RTSun
       float bias;
       uint32_t debug_mode;
       float cutout_opacity;
+      uint32_t cutout_mode;
+      uint32_t cutout_exact;
+      uint32_t pad[2];
    };
-   static_assert(sizeof(SunConstants) == 256);
+   static_assert(sizeof(SunConstants) == 272);
 
    enum class Output : uint32_t
    {
@@ -76,7 +79,10 @@ namespace RTSun
       float bias = 0.02f; // World units, plus a view distance proportional term in the shader (as the AO)
       float alpha_min = 1.f / 32.f;
       float clamp_k = 1.f / 16.f;
+      // Cutouts, as the AO's (RTAO::PassSettings): stochastic opacity, fast cutouts (per ray), texture exact masks
       float cutout_opacity = 0.5f;
+      uint32_t cutout_mode = 0;
+      bool cutout_exact = true;
       Output output = Output::Denoised;
       bool reset_history = false;
    };
@@ -96,8 +102,12 @@ namespace RTSun
       ID3D11ShaderResourceView* GetSRV();
 
       // Inside an Interop recorder, after the TLAS of the frame was built: trace + filter into the private texture,
-      // then copy it into the shared one. Needs EnsureTargets at info.ao_width x info.ao_height.
-      bool Record(ID3D12GraphicsCommandList4* list, const RTAO::RecordInfo& info, D3D12_GPU_VIRTUAL_ADDRESS tlas, const SunSettings& settings, RTAO::Retirer& retirer, std::string& error);
+      // then copy it into the shared one. Needs EnsureTargets at info.ao_width x info.ao_height. Always full resolution
+      // (RTAO Quality's half resolution trace doesn't apply). "cutouts": the RTAO texture exact cutout resources
+      // (GeometryCapture::GetCutoutBindings), null: stochastic cutouts only.
+      bool Record(ID3D12GraphicsCommandList4* list, const RTAO::RecordInfo& info, D3D12_GPU_VIRTUAL_ADDRESS tlas, const SunSettings& settings, RTAO::Retirer& retirer, std::string& error, const RTAO::CutoutBindings* cutouts = nullptr);
+      // Cutout candidates the sun trace resolved, one frame read back a few frames late (as RTAO::AOPass's)
+      RTAO::AOPass::CutoutCounters GetCutoutCounters() const { return cutout_counters; }
 
       double LastGpuMs() const { return timer.LastMs(); }
       uint32_t TraceCount() const { return trace_count.load(); }
@@ -117,9 +127,18 @@ namespace RTSun
       RTAO::GpuTimer timer;
 
       static constexpr uint32_t kSlots = 3;
-      static constexpr uint32_t kConstantsStride = 256;
+      static constexpr uint32_t kConstantsStride = 512; // CBV alignment 256, constants 272
       ID3D12Resource* constants_upload = nullptr;
       uint8_t* constants_mapped = nullptr;
+      // Texture exact cutouts (Shaders/rtao_cutout.hlsli): stand-ins when nothing is bound, and the candidate counters
+      ID3D12Resource* dummy_buffer = nullptr;
+      ID3D12Resource* counters = nullptr; // 256 bytes, COMMON outside the trace
+      ID3D12Resource* counters_readback = nullptr; // kSlots x 16 bytes
+      bool counters_pending[kSlots] = {};
+      uint32_t counters_last[3] = {};
+      bool counters_have_last = false;
+      RTAO::AOPass::CutoutCounters cutout_counters;
+      ID3D12Resource* bound_atlas = nullptr; // The atlas the heap's descriptor 10 points at (identity only)
 
       // Targets (under "mutex")
       uint32_t width = 0, height = 0;
@@ -133,7 +152,8 @@ namespace RTSun
       ID3D11ShaderResourceView* srv11 = nullptr;
       std::vector<IUnknown*> graveyard; // D3D12 objects to retire at the next Record
 
-      // Descriptors (recorder thread). Per history parity p, 5 from p * 5: [depth SRV, raw UAV, vis UAV, hist prev, hist cur]
+      // Descriptors (recorder thread). Per history parity p, 5 from p * 5: [depth SRV, raw UAV, vis UAV, hist prev, hist cur],
+      // then [10] the cutout atlas SRV
       ID3D12DescriptorHeap* heap = nullptr;
       uint32_t descriptor_size = 0;
       uint32_t heap_generation = UINT32_MAX; // Interop targets generation the heap was made for

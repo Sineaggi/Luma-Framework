@@ -6,8 +6,10 @@
 // RT sun shadows (rtsun_test.inl): the sun pass on the same scene, the light capture, the screen shadows shaders.
 //
 // Build (x64 Native Tools prompt, from this folder):
-//   cl /nologo /std:c++20 /EHsc /O2 /I.. rtao_interop_test.cpp ..\rtao_interop.cpp ..\rtao_accel.cpp ..\rtao_pass.cpp ..\rtao_capture.cpp ..\rtsun_pass.cpp d3d11.lib d3dcompiler.lib
+//   cl /nologo /std:c++20 /EHsc /O2 /I.. rtao_interop_test.cpp ..\rtao_interop.cpp ..\rtao_accel.cpp ..\rtao_pass.cpp ..\rtao_capture.cpp ..\rtao_alpha.cpp ..\rtsun_pass.cpp d3d11.lib d3dcompiler.lib
 // Run from this folder (it reads the shaders by relative path): rtao_interop_test.exe
+// Benchmark (no debug layer): rtao_interop_test.exe bench [folder for .pgm images], RTAO_BENCH_FILTER=<name part> to
+// run only some configurations (see RunBenchmark / BenchConfigs).
 
 #ifndef NOMINMAX
 #define NOMINMAX
@@ -16,6 +18,7 @@
 #include "rtao_accel.h"
 #include "rtao_capture.h"
 #include "rtao_pass.h"
+#include "rtsun_pass.h"
 
 #include <d3dcompiler.h>
 #include <algorithm>
@@ -616,13 +619,20 @@ static void TestReflection()
       const char* file;
       bool discard;
       bool alpha_tested;
+      // Texture exact (alpha tested only): alpha slot, reference (cbuffer offset or kNoOffset + immediate), uv scale/bias
+      bool exact = false;
+      uint32_t slot = 0;
+      uint32_t ref_cb = RTAO::kNoOffset;
+      float ref = 0.5f;
+      uint32_t scalebias_cb = RTAO::kNoOffset;
    };
    const PsCase ps_cases[] = {
-      { "0x048591C8.ps_5_0.cso", true, true }, // depth only: diffuse alpha vs cb_defaultalphatest
-      { "0x00376C8C.ps_5_0.cso", true, true }, // forward lit, cb_defaultalphatest
-      { "0x009040D6.ps_5_0.cso", true, true }, // vegetation (cb_vegetanim_*): diffuse alpha vs a hardcoded 0.5
-      { "0x00C30E15.ps_5_0.cso", true, true }, // vegetation depth only: alpha test 0.5, then LOD dithering
-      { "0x116EF527.ps_5_0.cso", true, true }, // hair (cb_hairalphatest)
+      { "0x048591C8.ps_5_0.cso", true, true, true, 0, 32, 0.5f, 16 }, // depth only: diffuse alpha vs cb_defaultalphatest, uv scale/bias
+      { "0x00376C8C.ps_5_0.cso", true, true, true, 7, 364, 0.5f, 128 }, // forward lit, cb_defaultalphatest
+      { "0x009040D6.ps_5_0.cso", true, true, true, 7, RTAO::kNoOffset, 0.5f, 560 }, // vegetation (cb_vegetanim_*): diffuse alpha vs a hardcoded 0.5
+      { "0x00C30E15.ps_5_0.cso", true, true, true, 0, RTAO::kNoOffset, 0.5f, 0 }, // vegetation depth only: alpha test 0.5, then LOD dithering
+      { "0x116EF527.ps_5_0.cso", true, true, true, 0, 64, 0.5f, RTAO::kNoOffset }, // hair (cb_hairalphatest), raw TEXCOORD
+      { "0x00C4313E.ps_5_0.cso", true, true, true, 8, 628, 0.5f, RTAO::kNoOffset }, // hair, forward lit: scale/bias used elsewhere, not for the alpha
       { "0x013962FA.ps_5_0.cso", true, false }, // LOD dithering only (pixel position): opaque
       { "0x008D47EA.ps_5_0.cso", true, false }, // discard on a DOF blur map: not a material alpha
       { "0x0293C36F.ps_5_0.cso", true, false }, // dissolve effect only (noise textures vs threshold): opaque
@@ -635,8 +645,13 @@ static void TestReflection()
          continue;
       RTAO::PixelShaderInfo info;
       RTAO::ReflectPixelShader(code.data(), code.size(), info);
-      printf("reflect %s: discard %d, alpha tested %d\n", c.file, int(info.discard), int(info.alpha_tested));
+      printf("reflect %s: discard %d, alpha tested %d, texture exact %d (alpha t%d.%c, cb%d, reference @%d / %.3f, scale/bias @%d)\n", c.file, int(info.discard), int(info.alpha_tested), int(info.texture_exact),
+         int(info.alpha_slot), "xyzw"[info.alpha_channel & 3], int(info.material_cb_slot), int(info.alpha_ref_cb), info.alpha_ref, int(info.uv_scalebias_cb));
       CHECK(info.discard == c.discard && info.alpha_tested == c.alpha_tested, "%s: expected discard %d, alpha tested %d", c.file, int(c.discard), int(c.alpha_tested));
+      if (c.alpha_tested)
+         CHECK(info.texture_exact == c.exact && info.alpha_slot == c.slot && info.alpha_channel == 3 && info.alpha_ref_cb == c.ref_cb && std::fabs(info.alpha_ref - c.ref) < 1e-6f && info.uv_scalebias_cb == c.scalebias_cb &&
+                  (c.ref_cb == RTAO::kNoOffset && c.scalebias_cb == RTAO::kNoOffset ? true : info.material_cb_slot == 2),
+            "%s: texture exact reflection", c.file);
       tested++;
    }
    if (tested == 0)
@@ -908,9 +923,17 @@ static void TestGeometryCapture(ID3D11Device* device, ID3D11DeviceContext* conte
    settings.cam_fwd[0] = f.x; settings.cam_fwd[1] = f.y; settings.cam_fwd[2] = f.z;
 
    uint32_t last_tlas_cutouts = 0;
+   bool repeat_draws = false; // Another pass drawing the direct family again, once as is and once with rewritten bindings
    auto run_frame = [&](RTAO::FilterMode filter_mode, uint32_t debug_mode) {
       // The "game" draws: two families on the immediate context, the third (and the view model) on a deferred one
       CHECK(capture.CaptureDraw(context, draw_direct), "capture (direct)");
+      if (repeat_draws)
+      {
+         CHECK(capture.CaptureDraw(context, draw_direct), "repeated draw");
+         RTAO::DrawInfo rewritten = draw_direct;
+         rewritten.binding_version = 7;
+         CHECK(capture.CaptureDraw(deferred, rewritten), "draw with rewritten per instance data");
+      }
       CHECK(capture.CaptureDraw(context, draw_indexed), "capture (indexed)");
       CHECK(capture.CaptureDraw(context, draw_mvp), "capture (MVP only)");
       CHECK(capture.CaptureDraw(context, draw_cutout), "capture (cutout, wind)");
@@ -950,7 +973,7 @@ static void TestGeometryCapture(ID3D11Device* device, ID3D11DeviceContext* conte
          if (!tlas.Build(ctx, blases, info.frame_slot, top, count, err))
             return false;
          last_tlas_cutouts = tlas.LastCutoutCount();
-         if (!pass.Record(list, info, top, settings, retirer, err))
+         if (!pass.Record(list, info, top, settings, retirer, err, &timer))
             return false;
          timer.End(list, info.frame_slot);
          return true;
@@ -1018,6 +1041,24 @@ static void TestGeometryCapture(ID3D11Device* device, ID3D11DeviceContext* conte
    const float near_mvp = average(raw, is_near_mvp_box, c[5]);
    printf("next to the MVP family box: %.3f (%d px)\n", near_mvp, c[5]);
    CHECK(c[5] > 5 && near_mvp < 0.8f, "MVP family box occludes");
+   CHECK(timer.LastSpanCount() == 2 && timer.LastSpanMs(0) > 0.0 && std::fabs(timer.LastSpanMs(0) + timer.LastSpanMs(1) - timer.LastMs()) < 1e-6,
+      "GPU timer: the pass marks the end of the trace (2 spans that add up, got %u)", timer.LastSpanCount());
+
+   // Dedup: a repeat of a draw in the same frame (same mesh and bindings) is skipped, one whose per instance data was
+   // rewritten in between (another binding version) is captured
+   {
+      const RTAO::CaptureStats before = capture.GetStats();
+      repeat_draws = true;
+      for (int i = 0; i < 4; i++)
+         raw = run_frame(RTAO::FilterMode::Off, 0);
+      repeat_draws = false;
+      const RTAO::CaptureStats after = capture.GetStats();
+      printf("dedup: %llu repeated draws skipped in 4 frames, %llu captured, TLAS instances %llu\n", (unsigned long long)(after.dedup_draws - before.dedup_draws),
+         (unsigned long long)(after.draws_captured - before.draws_captured), (unsigned long long)after.tlas_instances);
+      CHECK(after.dedup_draws - before.dedup_draws == 4, "one repeated draw per frame skipped");
+      CHECK(after.draws_captured - before.draws_captured == 4 * 7, "6 draws + the rewritten one captured per frame");
+      CHECK(after.tlas_instances == kBoxCount, "same TLAS (got %llu)", (unsigned long long)after.tlas_instances);
+   }
 
    // BLAS coverage debug: the captured geometry must line up with the depth
    std::vector<float> coverage = run_frame(RTAO::FilterMode::Off, 3);
@@ -1060,6 +1101,61 @@ static void TestGeometryCapture(ID3D11Device* device, ID3D11DeviceContext* conte
    CHECK(near_cutout[0] > 0.97f, "opacity 0 must leave the cutout box out");
    CHECK(near_cutout[2] < 0.8f, "opacity 1 must make the cutout box solid");
    CHECK(near_cutout[1] < near_cutout[0] - 0.03f && near_cutout[1] > near_cutout[2] + 0.03f, "opacity 0.5 must occlude between no box and a solid box");
+
+   // Fast cutouts (one coin per ray, no candidate loop): also partial
+   {
+      settings.cutout_mode = 2;
+      double sum = 0;
+      int count = 0;
+      for (int frame = 0; frame < 16; frame++)
+         sum += average(run_frame(RTAO::FilterMode::Off, 0), is_near_cutout, count);
+      settings.cutout_mode = 0;
+      const float fast = float(sum / 16);
+      printf("fast cutouts, opacity 0.5: next to the cutout box %.3f\n", fast);
+      CHECK(fast < near_cutout[0] - 0.03f && fast > near_cutout[2] + 0.03f, "fast cutouts at 0.5 must occlude between no box and a solid box");
+   }
+
+   // Quality Low (half resolution trace + upsample in the denoiser) converges to about the full resolution result
+   {
+      settings.half_res = false;
+      settings.reset_history = true;
+      std::vector<float> full, half;
+      for (int frame = 0; frame < 32; frame++)
+      {
+         full = run_frame(RTAO::FilterMode::Temporal, 0);
+         settings.reset_history = false;
+      }
+      settings.half_res = true;
+      settings.reset_history = true;
+      for (int frame = 0; frame < 32; frame++)
+      {
+         half = run_frame(RTAO::FilterMode::Temporal, 0);
+         settings.reset_history = false;
+      }
+      settings.half_res = false;
+      int count = 0;
+      const float full_corner = average(full, is_corner, count), half_corner = average(half, is_corner, count);
+      const float full_under = average(full, is_under_floating, count), half_under = average(half, is_under_floating, count);
+      const float half_open = average(half, is_open_ground, count), half_sky = average(half, is_sky, count);
+      double diff = 0;
+      int geometry = 0;
+      bool finite = true;
+      for (UINT i = 0; i < W * H; i++)
+      {
+         finite = finite && std::isfinite(half[i]) && half[i] >= 0.f && half[i] <= 1.f;
+         if (hit_id[i] >= 0)
+         {
+            diff += std::fabs(half[i] - full[i]);
+            geometry++;
+         }
+      }
+      printf("quality low (half res, 32 frames): wall corner %.3f (full res %.3f), under the floating box %.3f (%.3f), open ground %.3f, sky %.3f, mean abs diff to full res %.4f\n", half_corner, full_corner,
+         half_under, full_under, half_open, half_sky, diff / std::max(geometry, 1));
+      CHECK(finite, "half resolution AO must be finite and in [0, 1]");
+      CHECK(std::fabs(half_corner - full_corner) < 0.06f && std::fabs(half_under - full_under) < 0.06f, "half resolution must match full resolution in the corners");
+      CHECK(half_open > 0.97f && half_sky > 0.999f, "half resolution: open ground and sky unoccluded");
+      CHECK(diff / std::max(geometry, 1) < 0.03, "half resolution close to full resolution overall");
+   }
 
    CHECK(interop.WaitForIdle(5000), "WaitForIdle");
    retirer.ReleaseAll();
@@ -1446,6 +1542,7 @@ static void TestFrameMeshes(ID3D11Device* device, ID3D11DeviceContext* context, 
    settings.cam_fwd[0] = f.x; settings.cam_fwd[1] = f.y; settings.cam_fwd[2] = f.z;
 
    uint32_t tlas_count = 0;
+   bool repeat_draws = false; // Draws two of the per frame meshes a second time (another pass): skipped as duplicates
    auto run_frame = [&](int pose, uint32_t debug_mode) {
       // The pose: bones (DEFAULT buffer) and the dynamic vertices (Map discard), as the game would update them
       palette = make_palette(pose);
@@ -1471,6 +1568,11 @@ static void TestFrameMeshes(ID3D11Device* device, ID3D11DeviceContext* context, 
       CHECK(!capture.CaptureDraw(context, draw_instanced), "an instanced skinned draw must be skipped");
       CHECK(capture.CaptureDraw(context, draw_dynamic), "capture (dynamic vertex buffer)");
       CHECK(capture.CaptureDraw(deferred, draw2), "capture (skinned, MVP only, deferred)");
+      if (repeat_draws)
+      {
+         CHECK(capture.CaptureDraw(context, draw1), "repeated skinned draw");
+         CHECK(capture.CaptureDraw(deferred, draw_dynamic), "repeated dynamic draw (other context)");
+      }
       ID3D11CommandList* command_list = nullptr;
       deferred->FinishCommandList(FALSE, &command_list);
       capture.OnFinishCommandList(deferred, command_list);
@@ -1578,6 +1680,19 @@ static void TestFrameMeshes(ID3D11Device* device, ID3D11DeviceContext* context, 
       CHECK(frame_hits > 500 && matched > hits * 0.98 && frame_matched > frame_hits * 0.98, "per frame meshes must line up with the depth (pose %d)", pose);
    }
 
+   // Repeated draws in a frame: no second skinning dispatch, no second per frame BLAS
+   {
+      const RTAO::CaptureStats before = capture.GetStats();
+      repeat_draws = true;
+      run_frame(0, 0);
+      repeat_draws = false;
+      const RTAO::CaptureStats after = capture.GetStats();
+      printf("frame meshes dedup: %llu repeated draws skipped, last frame %llu per frame meshes, TLAS %u\n", (unsigned long long)(after.dedup_frame_meshes - before.dedup_frame_meshes),
+         (unsigned long long)after.frame_draws, tlas_count);
+      CHECK(after.dedup_frame_meshes - before.dedup_frame_meshes == 2, "the 2 repeated per frame draws must be skipped");
+      CHECK(after.skinned_captured - before.skinned_captured == 3 && after.frame_draws == 4 && tlas_count == 5, "no duplicate per frame BLAS");
+   }
+
    CHECK(interop.WaitForIdle(5000), "WaitForIdle");
    retirer.ReleaseAll();
    pass.Shutdown(nullptr, 0);
@@ -1589,11 +1704,1147 @@ static void TestFrameMeshes(ID3D11Device* device, ID3D11DeviceContext* context, 
       p->Release();
 }
 
+// ---- Texture exact cutouts: an alpha tested wall whose BC3 texture is a 2x2 alpha checker, captured through the real
+// D3D11 path (material mask rendered by alpha_strip_cs into the shared strip, copied into the atlas; uv scale/bias and
+// alpha reference read from the draw's material cbuffer by capture_instances_cs). The ground AO in front of it must follow
+// the mask: occluded in front of the solid lower quadrant, open in front of the hole.
+
+// A BC3 block (4x4 texels) of uniform alpha, black color
+static void Bc3Block(uint8_t alpha, uint8_t out[16])
+{
+   std::memset(out, 0, 16);
+   out[0] = alpha;
+   out[1] = alpha; // a0 == a1: every index decodes to a0
+}
+
+// A BC3 64x64 texture with its mips whose alpha is a "cells" x "cells" checker (solid where (u cell + v cell) is odd,
+// i.e. for 2 cells the lower left and upper right quadrants), black color
+static void MakeCheckerBc3(ID3D11Device* device, UINT cells, ID3D11Texture2D*& texture, ID3D11ShaderResourceView*& srv)
+{
+   const UINT T = 64, mips = 7;
+   std::vector<std::vector<uint8_t>> mip_data(mips);
+   std::vector<D3D11_SUBRESOURCE_DATA> init(mips);
+   for (UINT m = 0; m < mips; m++)
+   {
+      const UINT size = (std::max)(T >> m, 1u), blocks = (std::max)((size + 3) / 4, 1u);
+      const bool resolved = size >= 4 * cells; // Smaller mips average the checker
+      mip_data[m].resize(blocks * blocks * 16);
+      for (UINT by = 0; by < blocks; by++)
+         for (UINT bx = 0; bx < blocks; bx++)
+         {
+            const UINT cu = UINT((bx * 4 + 2.f) / float(blocks * 4) * cells), cv = UINT((by * 4 + 2.f) / float(blocks * 4) * cells);
+            Bc3Block(resolved ? (((cu + cv) & 1) ? 255 : 0) : 128, &mip_data[m][(by * blocks + bx) * 16]);
+         }
+      init[m] = { mip_data[m].data(), blocks * 16, 0 };
+   }
+   D3D11_TEXTURE2D_DESC texture_desc = { T, T, mips, 1, DXGI_FORMAT_BC3_UNORM, { 1, 0 }, D3D11_USAGE_IMMUTABLE, D3D11_BIND_SHADER_RESOURCE, 0, 0 };
+   HRESULT hr = device->CreateTexture2D(&texture_desc, init.data(), &texture);
+   CHECK(SUCCEEDED(hr), "BC3 texture 0x%08lX", (unsigned long)hr);
+   srv = nullptr;
+   if (texture)
+      device->CreateShaderResourceView(texture, nullptr, &srv);
+}
+
+static void TestCutoutTextures(ID3D11Device* device, ID3D11DeviceContext* context, RTAO::Interop& interop, ID3D11VertexShader* copy_vs, ID3D11PixelShader* depth_ps)
+{
+   std::string error;
+   const UINT W = 320, H = 180;
+   CHECK(interop.EnsureTargets(device, W, H, W, H, error), "EnsureTargets: %s", error.c_str());
+
+   const V3 eye = { 0, 4, -9 }, target = { 0, 0.5f, 0 }, up = { 0, 1, 0 };
+   const V3 f = Normalize(Sub(target, eye)), r = Normalize(Cross(up, f)), u = Cross(f, r);
+   Mat4 view;
+   view(0, 0) = r.x; view(0, 1) = u.x; view(0, 2) = f.x;
+   view(1, 0) = r.y; view(1, 1) = u.y; view(1, 2) = f.y;
+   view(2, 0) = r.z; view(2, 1) = u.z; view(2, 2) = f.z;
+   view(3, 0) = -Dot(r, eye); view(3, 1) = -Dot(u, eye); view(3, 2) = -Dot(f, eye); view(3, 3) = 1;
+   const float n = 0.1f, fr = 1000.f, sy = 1.f / std::tan(3.14159265f / 6.f), sx = sy / (float(W) / float(H));
+   Mat4 proj;
+   proj(0, 0) = sx;
+   proj(1, 1) = sy;
+   proj(2, 2) = -n / (fr - n);
+   proj(2, 3) = 1;
+   proj(3, 2) = n * fr / (fr - n);
+   const Mat4 view_proj = Mul(view, proj), inv_view_proj = Inverse(view_proj);
+
+   // Depth: the ground only (the wall is only in the ray tracing scene)
+   std::vector<float> depth(W * H, 0.f);
+   std::vector<V3> hit_pos(W * H);
+   std::vector<bool> ground(W * H, false);
+   for (UINT y = 0; y < H; y++)
+      for (UINT x = 0; x < W; x++)
+      {
+         float v[4] = { (x + 0.5f) / W * 2.f - 1.f, 1.f - (y + 0.5f) / H * 2.f, 0.5f, 1.f }, w[4] = {};
+         for (int c = 0; c < 4; c++)
+            for (int k = 0; k < 4; k++)
+               w[c] += v[k] * inv_view_proj(k, c);
+         const V3 dir = Normalize(Sub({ w[0] / w[3], w[1] / w[3], w[2] / w[3] }, eye));
+         float t;
+         if (!RayBox(eye, dir, kBoxes[0], t))
+            continue;
+         const V3 p = { eye.x + dir.x * t, eye.y + dir.y * t, eye.z + dir.z * t };
+         hit_pos[y * W + x] = p;
+         ground[y * W + x] = true;
+         float clip[4] = {};
+         const float pv[4] = { p.x, p.y, p.z, 1.f };
+         for (int c = 0; c < 4; c++)
+            for (int k = 0; k < 4; k++)
+               clip[c] += pv[k] * view_proj(k, c);
+         depth[y * W + x] = clip[2] / clip[3];
+      }
+   D3D11_TEXTURE2D_DESC depth_desc = { W, H, 1, 1, DXGI_FORMAT_R32_FLOAT, { 1, 0 }, D3D11_USAGE_DEFAULT, D3D11_BIND_SHADER_RESOURCE, 0, 0 };
+   D3D11_SUBRESOURCE_DATA depth_data = { depth.data(), W * 4, 0 };
+   ID3D11Texture2D* depth_texture = nullptr;
+   device->CreateTexture2D(&depth_desc, &depth_data, &depth_texture);
+   ID3D11ShaderResourceView* depth_srv = nullptr;
+   device->CreateShaderResourceView(depth_texture, nullptr, &depth_srv);
+
+   // The wall: x -3..3, y 0..2, z 0 (world space, identity model matrix). Positions in slot 0 (float3), TEXCOORD0 in slot 1
+   // (R16G16_FLOAT): u = (x + 3) / 6, v = 1 - y / 2. 16 bit indices after 3 unrelated ones.
+   const float positions[4 * 3] = { -3, 0, 0, 3, 0, 0, 3, 2, 0, -3, 2, 0 };
+   const uint16_t uvs[4 * 2] = { ToHalf(0.f), ToHalf(1.f), ToHalf(1.f), ToHalf(1.f), ToHalf(1.f), ToHalf(0.f), ToHalf(0.f), ToHalf(0.f) };
+   const uint16_t indices[3 + 6] = { 7, 7, 7, 0, 1, 2, 0, 2, 3 };
+   ID3D11Buffer* position_vb = MakeBuffer(device, D3D11_BIND_VERTEX_BUFFER, positions, sizeof(positions));
+   ID3D11Buffer* uv_vb = MakeBuffer(device, D3D11_BIND_VERTEX_BUFFER, uvs, sizeof(uvs));
+   ID3D11Buffer* ib = MakeBuffer(device, D3D11_BIND_INDEX_BUFFER, indices, sizeof(indices));
+
+   // The texture: BC3 64x64 with its mips, alpha 2x2 checker: solid where (u < 0.5) == (v >= 0.5), i.e. the lower left and
+   // upper right quadrants of the wall
+   ID3D11Texture2D* alpha_texture = nullptr;
+   ID3D11ShaderResourceView* alpha_srv = nullptr;
+   MakeCheckerBc3(device, 2, alpha_texture, alpha_srv);
+
+   // Vertex shader: cbuffer rows (as in the game: z @160, y @176, x @192, depth hack @464). Pixel shader material cbuffer
+   // like 0x048591C8: cb_layer0_scalebias @16, cb_defaultalphatest @32.
+   std::vector<float> vs_cb(480 / 4, 0.f);
+   const float rows[12] = { 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0 };
+   std::memcpy(&vs_cb[192 / 4], &rows[0], 16);
+   std::memcpy(&vs_cb[176 / 4], &rows[4], 16);
+   std::memcpy(&vs_cb[160 / 4], &rows[8], 16);
+   vs_cb[464 / 4] = 1.f;
+   ID3D11Buffer* instance_cb = MakeBuffer(device, D3D11_BIND_CONSTANT_BUFFER, vs_cb.data(), 480);
+   auto make_material_cb = [&](float bias_u) {
+      std::vector<float> cb(48 / 4, 0.f);
+      cb[16 / 4 + 0] = 1.f;
+      cb[16 / 4 + 1] = 1.f;
+      cb[16 / 4 + 2] = bias_u;
+      cb[32 / 4] = 0.5f;
+      return MakeBuffer(device, D3D11_BIND_CONSTANT_BUFFER, cb.data(), 48);
+   };
+   ID3D11Buffer* material_cb = make_material_cb(0.f);
+   ID3D11Buffer* shifted_cb = make_material_cb(0.5f); // Shifts u by half the texture: the checker swaps sides
+
+   RTAO::VertexShaderInfo cb_vs;
+   cb_vs.source = RTAO::MatrixSource::ConstantBuffer;
+   cb_vs.skip_reason = nullptr;
+   cb_vs.instance_cb_slot = 2;
+   cb_vs.row_cb[0] = 192;
+   cb_vs.row_cb[1] = 176;
+   cb_vs.row_cb[2] = 160;
+   cb_vs.depth_hack_cb = 464;
+   RTAO::PixelShaderInfo ps_info;
+   ps_info.discard = ps_info.alpha_tested = ps_info.texture_exact = true;
+   ps_info.alpha_slot = 0;
+   ps_info.alpha_channel = 3;
+   ps_info.material_cb_slot = 2;
+   ps_info.alpha_ref_cb = 32;
+   ps_info.uv_scalebias_cb = 16;
+
+   RTAO::DrawInfo draw;
+   draw.vs = &cb_vs;
+   draw.vertex_buffer = position_vb;
+   draw.vertex_stride = 12;
+   draw.position_format = DXGI_FORMAT_R32G32B32_FLOAT;
+   draw.index_buffer = ib;
+   draw.index_format = DXGI_FORMAT_R16_UINT;
+   draw.index_count = 6;
+   draw.first_index = 3;
+   draw.instance_cb = instance_cb;
+   draw.cutout = true;
+   draw.ps = &ps_info;
+   draw.alpha_srv = alpha_srv;
+   draw.material_cb = material_cb;
+   draw.uv.buffer = uv_vb;
+   draw.uv.stride = 4;
+   draw.uv.format = DXGI_FORMAT_R16G16_FLOAT;
+
+   ID3DBlob* cs_code = Compile(L"..\\..\\..\\..\\Shaders\\Dishonored 2\\Luma_RTAO.hlsl", "capture_instances_cs", "cs_5_0");
+   ID3D11ComputeShader* capture_cs = nullptr;
+   device->CreateComputeShader(cs_code->GetBufferPointer(), cs_code->GetBufferSize(), nullptr, &capture_cs);
+   cs_code->Release();
+   ID3DBlob* strip_code = Compile(L"..\\..\\..\\..\\Shaders\\Dishonored 2\\Luma_RTAO.hlsl", "alpha_strip_cs", "cs_5_0");
+   ID3D11ComputeShader* strip_cs = nullptr;
+   device->CreateComputeShader(strip_code->GetBufferPointer(), strip_code->GetBufferSize(), nullptr, &strip_cs);
+   strip_code->Release();
+
+   RTAO::GeometryCapture capture;
+   CHECK(capture.Init(device, interop, capture_cs, nullptr, error), "GeometryCapture::Init: %s", error.c_str());
+   CHECK(capture.InitCutouts(device, interop, strip_cs, error), "GeometryCapture::InitCutouts: %s", error.c_str());
+   capture_cs->Release();
+   strip_cs->Release();
+
+   RTAO::Retirer retirer;
+   RTAO::BlasCache blases;
+   RTAO::TlasBuilder tlas;
+   RTAO::AOPass pass;
+   CHECK(pass.Init(interop.GetDevice(), error), "AOPass::Init: %s", error.c_str());
+   RTAO::GpuTimer timer;
+   CHECK(timer.Init(interop.GetDevice(), interop.GetTimestampFrequency(), error), "GpuTimer::Init: %s", error.c_str());
+   RTAO::PassSettings settings;
+   std::memcpy(settings.view_proj, view_proj.m, sizeof(settings.view_proj));
+   std::memcpy(settings.inv_view_proj, inv_view_proj.m, sizeof(settings.inv_view_proj));
+   settings.cam_pos[0] = eye.x; settings.cam_pos[1] = eye.y; settings.cam_pos[2] = eye.z;
+   settings.cam_fwd[0] = f.x; settings.cam_fwd[1] = f.y; settings.cam_fwd[2] = f.z;
+   settings.filter_mode = RTAO::FilterMode::Off;
+   settings.ray_count = 8;
+   // RT sun shadows through the same cutouts (recorded after the AO when sun_on, as the addon does)
+   RTSun::SunPass sun;
+   RTSun::SunSettings sun_settings;
+   bool sun_on = false;
+
+   auto run_frame = [&]() {
+      CHECK(capture.CaptureDraw(context, draw), "capture (textured cutout)");
+      ID3D11RenderTargetView* rtv = interop.GetDepthRTV();
+      D3D11_VIEWPORT viewport = { 0, 0, (float)W, (float)H, 0, 1 };
+      context->RSSetViewports(1, &viewport);
+      context->OMSetRenderTargets(1, &rtv, nullptr);
+      context->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP);
+      context->VSSetShader(copy_vs, nullptr, 0);
+      context->PSSetShader(depth_ps, nullptr, 0);
+      context->PSSetShaderResources(0, 1, &depth_srv);
+      context->Draw(4, 0);
+      ID3D11RenderTargetView* null_rtv = nullptr;
+      context->OMSetRenderTargets(1, &null_rtv, nullptr);
+      rtv->Release();
+      CHECK(interop.Run(context, [&](ID3D12GraphicsCommandList4* list, const RTAO::RecordInfo& info, std::string& err) {
+         retirer.Collect(info.completed_fence_value);
+         timer.Collect(info.frame_slot);
+         timer.Begin(list, info.frame_slot);
+         if (!capture.Record(list, info, blases, tlas, retirer, 64, err))
+            return false;
+         const RTAO::BuildContext ctx = { info.device, list, &retirer, info.submit_fence_value };
+         D3D12_GPU_VIRTUAL_ADDRESS top = 0;
+         uint32_t count = 0;
+         if (!tlas.Build(ctx, blases, info.frame_slot, top, count, err))
+            return false;
+         if (!pass.Record(list, info, top, settings, retirer, err, nullptr, &capture.GetCutoutBindings()))
+            return false;
+         timer.End(list, info.frame_slot);
+         if (sun_on && !sun.Record(list, info, top, sun_settings, retirer, err, &capture.GetCutoutBindings()))
+            return false;
+         return true;
+      }, error), "Run (cutout textures): %s", error.c_str());
+      capture.OnPresent();
+      ID3D11ShaderResourceView* ao_srv = interop.GetAOSRV();
+      UINT w = 0, h = 0;
+      std::vector<float> ao = ReadAO(device, context, ao_srv, w, h);
+      ao_srv->Release();
+      return ao;
+   };
+
+   // Ground pixels just in front of the wall, left (solid lower quadrant) and right (hole in the lower quadrant)
+   auto in_front = [&](UINT i, bool left) {
+      if (!ground[i])
+         return false;
+      const V3 p = hit_pos[i];
+      return p.z > -0.35f && p.z < -0.05f && (left ? (p.x > -2.5f && p.x < -0.75f) : (p.x > 0.75f && p.x < 2.5f));
+   };
+   auto measure = [&](float& left, float& right, float& ms) {
+      double sum[2] = {}, time = 0;
+      int count[2] = {}, timed = 0;
+      for (int frame = 0; frame < 16; frame++)
+      {
+         std::vector<float> ao = run_frame();
+         for (UINT i = 0; i < W * H; i++)
+            for (int side = 0; side < 2; side++)
+               if (in_front(i, side == 0))
+               {
+                  sum[side] += ao[i];
+                  count[side]++;
+               }
+         if (frame >= 4)
+         {
+            time += timer.LastMs();
+            timed++;
+         }
+      }
+      CHECK(count[0] > 16 * 20 && count[1] > 16 * 20, "pixels in front of the wall (%d / %d)", count[0] / 16, count[1] / 16);
+      left = float(sum[0] / (std::max)(count[0], 1));
+      right = float(sum[1] / (std::max)(count[1], 1));
+      ms = float(time / (std::max)(timed, 1));
+   };
+
+   for (int i = 0; i < 6; i++) // The mask is copied at the first pass, the instance arrives 3 frames late
+      run_frame();
+   const RTAO::CutoutStats stats = capture.GetCutoutStats();
+   printf("cutout textures: materials %llu (masked %llu), atlas slices %llu, records %llu, strips rendered %llu copied %llu, draws with a mask %llu\n", (unsigned long long)stats.materials,
+      (unsigned long long)stats.materials_ready, (unsigned long long)stats.atlas_slices_used, (unsigned long long)stats.records, (unsigned long long)stats.strips_rendered, (unsigned long long)stats.strips_copied,
+      (unsigned long long)stats.draws_exact);
+   CHECK(stats.materials == 1 && stats.materials_ready == 1 && stats.atlas_slices_used == 1 && stats.strips_copied == 1, "one material with a mask");
+   CHECK(stats.records == 1 && stats.draws_exact == 6 && stats.draws_no_material == 0, "one record, every draw with a material");
+
+   float exact_left, exact_right, exact_ms, shifted_left, shifted_right, shifted_ms, stochastic_left, stochastic_right, stochastic_ms;
+   settings.cutout_opacity = 0.5f;
+   settings.cutout_exact = true;
+   measure(exact_left, exact_right, exact_ms);
+   const RTAO::AOPass::CutoutCounters counters = pass.GetCutoutCounters();
+   // The scale/bias comes from the draw's cbuffer: u + 0.5 swaps the checker's sides (a new record, same material)
+   draw.material_cb = shifted_cb;
+   for (int i = 0; i < 4; i++)
+      run_frame();
+   measure(shifted_left, shifted_right, shifted_ms);
+   draw.material_cb = material_cb;
+   for (int i = 0; i < 4; i++)
+      run_frame();
+   settings.cutout_exact = false;
+   measure(stochastic_left, stochastic_right, stochastic_ms);
+   settings.cutout_exact = true;
+   // Quality Low (half resolution trace, upsampled by the filter) and fast cutouts (per ray coin): masks keep deciding
+   float low_left, low_right, low_ms, fast_left, fast_right, fast_ms;
+   settings.half_res = true;
+   measure(low_left, low_right, low_ms);
+   settings.half_res = false;
+   settings.cutout_mode = 2;
+   measure(fast_left, fast_right, fast_ms);
+   const RTAO::AOPass::CutoutCounters fast_counters = pass.GetCutoutCounters();
+   settings.cutout_mode = 0;
+   const RTAO::CutoutStats after = capture.GetCutoutStats();
+   printf("ground AO in front of the textured cutout wall (raw, 16 frames), left (solid below) / right (hole below): texture exact %.3f / %.3f, "
+          "u shifted by 0.5 %.3f / %.3f, stochastic (opacity 0.5) %.3f / %.3f\n", exact_left, exact_right, shifted_left, shifted_right, stochastic_left, stochastic_right);
+   printf("cutout candidates per frame: masked %llu (%llu solid), stochastic %llu; records %llu; RT pass GPU time: texture exact %.3f ms, stochastic %.3f ms\n", (unsigned long long)counters.exact_tests,
+      (unsigned long long)counters.exact_hits, (unsigned long long)counters.fallback_tests, (unsigned long long)after.records, exact_ms, stochastic_ms);
+   CHECK(exact_left < exact_right - 0.1f, "texture exact: the solid quadrant must occlude more than the hole");
+   CHECK(shifted_right < shifted_left - 0.1f, "the uv scale/bias must move the mask");
+   CHECK(std::fabs(stochastic_left - stochastic_right) < 0.05f, "stochastic: both sides alike");
+   printf("texture exact in the other modes, left / right: half resolution trace (Low) %.3f / %.3f, fast cutouts %.3f / %.3f (masked candidates %llu, stochastic %llu)\n", low_left, low_right, fast_left, fast_right,
+      (unsigned long long)fast_counters.exact_tests, (unsigned long long)fast_counters.fallback_tests);
+   CHECK(low_left < low_right - 0.1f, "texture exact at half resolution");
+   CHECK(fast_left < fast_right - 0.1f && fast_counters.exact_tests > 0, "texture exact with fast cutouts (masks take precedence)");
+   CHECK(counters.exact_tests > 0 && counters.exact_hits > 0 && counters.exact_hits < counters.exact_tests && counters.fallback_tests == 0, "masked candidates counted");
+   CHECK(after.records == 2, "the shifted scale/bias is a second record");
+
+   // RT sun shadows: the light behind the wall, 45 degrees up, so the ground just in front of it sees the wall's lower
+   // quadrants: shadowed by the solid one (left), lit through the hole (right). Masks as the AO's, stochastic without.
+   CHECK(sun.Init(interop.GetDevice(), interop.GetTimestampFrequency(), error), "SunPass::Init: %s", error.c_str());
+   CHECK(sun.EnsureTargets(device, W, H, error), "SunPass::EnsureTargets: %s", error.c_str());
+   std::memcpy(sun_settings.view_proj, view_proj.m, sizeof(sun_settings.view_proj));
+   std::memcpy(sun_settings.inv_view_proj, inv_view_proj.m, sizeof(sun_settings.inv_view_proj));
+   std::memcpy(sun_settings.cam_pos, settings.cam_pos, sizeof(sun_settings.cam_pos));
+   std::memcpy(sun_settings.cam_fwd, settings.cam_fwd, sizeof(sun_settings.cam_fwd));
+   const V3 sun_l = Normalize({ 0.f, 1.f, 1.f });
+   sun_settings.light_dir[0] = sun_l.x; sun_settings.light_dir[1] = sun_l.y; sun_settings.light_dir[2] = sun_l.z;
+   sun_settings.angular_diameter_deg = 0.f;
+   sun_settings.ray_count = 4;
+   sun_settings.t_max = 100.f;
+   sun_settings.output = RTSun::Output::Raw;
+   sun_settings.cutout_opacity = 0.5f;
+   sun_on = true;
+   auto measure_sun = [&](float& left, float& right) {
+      double sum[2] = {};
+      int count[2] = {};
+      for (int frame = 0; frame < 8; frame++)
+      {
+         run_frame();
+         ID3D11ShaderResourceView* sun_srv = sun.GetSRV();
+         UINT w = 0, h = 0;
+         const std::vector<float> vis = ReadAO(device, context, sun_srv, w, h);
+         sun_srv->Release();
+         for (UINT i = 0; i < W * H; i++)
+            for (int side = 0; side < 2; side++)
+               if (in_front(i, side == 0))
+               {
+                  sum[side] += vis[i];
+                  count[side]++;
+               }
+      }
+      left = float(sum[0] / (std::max)(count[0], 1));
+      right = float(sum[1] / (std::max)(count[1], 1));
+   };
+   float sun_exact_left, sun_exact_right, sun_stochastic_left, sun_stochastic_right, sun_fast_left, sun_fast_right;
+   sun_settings.cutout_exact = true;
+   measure_sun(sun_exact_left, sun_exact_right);
+   for (int i = 0; i < 3; i++)
+      run_frame(); // Counters are read back a few frames late
+   const RTAO::AOPass::CutoutCounters sun_counters = sun.GetCutoutCounters();
+   sun_settings.cutout_mode = 2;
+   measure_sun(sun_fast_left, sun_fast_right);
+   sun_settings.cutout_mode = 0;
+   sun_settings.cutout_exact = false;
+   measure_sun(sun_stochastic_left, sun_stochastic_right);
+   sun_on = false;
+   printf("RT sun through the textured cutout wall (raw, 8 frames), left (solid below) / right (hole below): texture exact %.3f / %.3f, fast cutouts %.3f / %.3f, "
+          "stochastic (opacity 0.5) %.3f / %.3f; masked candidates %llu (%llu solid), stochastic %llu\n", sun_exact_left, sun_exact_right, sun_fast_left, sun_fast_right,
+      sun_stochastic_left, sun_stochastic_right, (unsigned long long)sun_counters.exact_tests, (unsigned long long)sun_counters.exact_hits, (unsigned long long)sun_counters.fallback_tests);
+   CHECK(sun_exact_left < 0.1f && sun_exact_right > 0.9f, "RT sun, texture exact: shadow of the solid quadrant, light through the hole");
+   CHECK(sun_fast_left < 0.1f && sun_fast_right > 0.9f, "RT sun, texture exact with fast cutouts");
+   CHECK(std::fabs(sun_stochastic_left - sun_stochastic_right) < 0.1f && sun_stochastic_left > 0.3f && sun_stochastic_left < 0.7f, "RT sun, stochastic: both sides half lit");
+   CHECK(sun_counters.exact_tests > 0 && sun_counters.exact_hits > 0 && sun_counters.fallback_tests == 0, "RT sun: masked candidates counted");
+
+   CHECK(interop.WaitForIdle(5000), "WaitForIdle");
+   retirer.ReleaseAll();
+   sun.Shutdown(nullptr, 0);
+   timer.Shutdown();
+   pass.Shutdown(nullptr, 0);
+   tlas.Clear(nullptr, 0);
+   blases.Clear(nullptr, 0);
+   capture.Shutdown();
+   for (IUnknown* p : std::initializer_list<IUnknown*>{ position_vb, uv_vb, ib, alpha_texture, alpha_srv, instance_cb, material_cb, shifted_cb, depth_srv, depth_texture })
+      p->Release();
+}
+
+// Opt-in (RTAO_PERF=1) cost of the texture exact path in a cutout heavy view: 1920x1080, 4 rays, a "hedge" of 16 cutout
+// layers (an 8x8 alpha checker, one instanced draw) standing on the ground the camera looks at
+static void TestCutoutPerf(ID3D11Device* device, ID3D11DeviceContext* context, RTAO::Interop& interop, ID3D11VertexShader* copy_vs, ID3D11PixelShader* depth_ps)
+{
+   std::string error;
+   const UINT W = 1920, H = 1080, layers = 16;
+   CHECK(interop.EnsureTargets(device, W, H, W, H, error), "EnsureTargets: %s", error.c_str());
+   const V3 eye = { 0, 4, -9 }, target = { 0, 0.5f, 0 }, up = { 0, 1, 0 };
+   const V3 f = Normalize(Sub(target, eye)), r = Normalize(Cross(up, f)), u = Cross(f, r);
+   Mat4 view;
+   view(0, 0) = r.x; view(0, 1) = u.x; view(0, 2) = f.x;
+   view(1, 0) = r.y; view(1, 1) = u.y; view(1, 2) = f.y;
+   view(2, 0) = r.z; view(2, 1) = u.z; view(2, 2) = f.z;
+   view(3, 0) = -Dot(r, eye); view(3, 1) = -Dot(u, eye); view(3, 2) = -Dot(f, eye); view(3, 3) = 1;
+   const float n = 0.1f, fr = 1000.f, sy = 1.f / std::tan(3.14159265f / 6.f), sx = sy / (float(W) / float(H));
+   Mat4 proj;
+   proj(0, 0) = sx;
+   proj(1, 1) = sy;
+   proj(2, 2) = -n / (fr - n);
+   proj(2, 3) = 1;
+   proj(3, 2) = n * fr / (fr - n);
+   const Mat4 view_proj = Mul(view, proj), inv_view_proj = Inverse(view_proj);
+   std::vector<float> depth(W * H, 0.f);
+   for (UINT y = 0; y < H; y++)
+      for (UINT x = 0; x < W; x++)
+      {
+         float v[4] = { (x + 0.5f) / W * 2.f - 1.f, 1.f - (y + 0.5f) / H * 2.f, 0.5f, 1.f }, w[4] = {};
+         for (int c = 0; c < 4; c++)
+            for (int k = 0; k < 4; k++)
+               w[c] += v[k] * inv_view_proj(k, c);
+         const V3 dir = Normalize(Sub({ w[0] / w[3], w[1] / w[3], w[2] / w[3] }, eye));
+         float t;
+         if (!RayBox(eye, dir, kBoxes[0], t))
+            continue;
+         const float pv[4] = { eye.x + dir.x * t, eye.y + dir.y * t, eye.z + dir.z * t, 1.f };
+         float clip[4] = {};
+         for (int c = 0; c < 4; c++)
+            for (int k = 0; k < 4; k++)
+               clip[c] += pv[k] * view_proj(k, c);
+         depth[y * W + x] = clip[2] / clip[3];
+      }
+   D3D11_TEXTURE2D_DESC depth_desc = { W, H, 1, 1, DXGI_FORMAT_R32_FLOAT, { 1, 0 }, D3D11_USAGE_DEFAULT, D3D11_BIND_SHADER_RESOURCE, 0, 0 };
+   D3D11_SUBRESOURCE_DATA depth_data = { depth.data(), W * 4, 0 };
+   ID3D11Texture2D* depth_texture = nullptr;
+   device->CreateTexture2D(&depth_desc, &depth_data, &depth_texture);
+   ID3D11ShaderResourceView* depth_srv = nullptr;
+   device->CreateShaderResourceView(depth_texture, nullptr, &depth_srv);
+
+   // One wall (x -6..6, y 0..2), as 16 instances (direct instance buffer, rows at 48) every 0.25 m in z from -2
+   const float positions[4 * 3] = { -6, 0, 0, 6, 0, 0, 6, 2, 0, -6, 2, 0 };
+   const float uvs[4 * 2] = { 0, 1, 4, 1, 4, 0, 0, 0 }; // The checker 4 times across
+   const uint32_t indices[6] = { 0, 1, 2, 0, 2, 3 };
+   ID3D11Buffer* position_vb = MakeBuffer(device, D3D11_BIND_VERTEX_BUFFER, positions, sizeof(positions));
+   ID3D11Buffer* uv_vb = MakeBuffer(device, D3D11_BIND_VERTEX_BUFFER, uvs, sizeof(uvs));
+   ID3D11Buffer* ib = MakeBuffer(device, D3D11_BIND_INDEX_BUFFER, indices, sizeof(indices));
+   std::vector<float> instances(layers * 24, 0.f);
+   for (UINT i = 0; i < layers; i++)
+   {
+      const float rows[12] = { 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, -2.f + 0.25f * i };
+      std::memcpy(&instances[i * 24 + 12], rows, sizeof(rows));
+   }
+   ID3D11Buffer* instance_buffer = MakeBuffer(device, D3D11_BIND_SHADER_RESOURCE, instances.data(), UINT(instances.size() * 4), D3D11_USAGE_IMMUTABLE, D3D11_RESOURCE_MISC_BUFFER_STRUCTURED, 96);
+   ID3D11ShaderResourceView* instance_srv = nullptr;
+   device->CreateShaderResourceView(instance_buffer, nullptr, &instance_srv);
+   const float material[8] = { 0, 0, 0, 0, 0.5f, 0, 0, 0 }; // cb_defaultalphatest @16, no scale/bias
+   ID3D11Buffer* material_cb = MakeBuffer(device, D3D11_BIND_CONSTANT_BUFFER, material, sizeof(material));
+   ID3D11Texture2D* alpha_texture = nullptr;
+   ID3D11ShaderResourceView* alpha_srv = nullptr;
+   MakeCheckerBc3(device, 8, alpha_texture, alpha_srv);
+
+   RTAO::VertexShaderInfo direct_vs;
+   direct_vs.source = RTAO::MatrixSource::DirectInstanceBuffer;
+   direct_vs.skip_reason = nullptr;
+   direct_vs.instance_buffer_slot = 0;
+   direct_vs.instance_buffer_stride = 96;
+   direct_vs.record_row0 = 48;
+   RTAO::PixelShaderInfo ps_info;
+   ps_info.discard = ps_info.alpha_tested = ps_info.texture_exact = true;
+   ps_info.alpha_slot = 0;
+   ps_info.material_cb_slot = 2;
+   ps_info.alpha_ref_cb = 16;
+   RTAO::DrawInfo draw;
+   draw.vs = &direct_vs;
+   draw.vertex_buffer = position_vb;
+   draw.vertex_stride = 12;
+   draw.position_format = DXGI_FORMAT_R32G32B32_FLOAT;
+   draw.index_buffer = ib;
+   draw.index_format = DXGI_FORMAT_R32_UINT;
+   draw.index_count = 6;
+   draw.instance_count = layers;
+   draw.instance_buffer = instance_srv;
+   draw.cutout = true;
+   draw.ps = &ps_info;
+   draw.alpha_srv = alpha_srv;
+   draw.material_cb = material_cb;
+   draw.uv.buffer = uv_vb;
+   draw.uv.stride = 8;
+   draw.uv.format = DXGI_FORMAT_R32G32_FLOAT;
+
+   ID3DBlob* cs_code = Compile(L"..\\..\\..\\..\\Shaders\\Dishonored 2\\Luma_RTAO.hlsl", "capture_instances_cs", "cs_5_0");
+   ID3D11ComputeShader* capture_cs = nullptr;
+   device->CreateComputeShader(cs_code->GetBufferPointer(), cs_code->GetBufferSize(), nullptr, &capture_cs);
+   cs_code->Release();
+   ID3DBlob* strip_code = Compile(L"..\\..\\..\\..\\Shaders\\Dishonored 2\\Luma_RTAO.hlsl", "alpha_strip_cs", "cs_5_0");
+   ID3D11ComputeShader* strip_cs = nullptr;
+   device->CreateComputeShader(strip_code->GetBufferPointer(), strip_code->GetBufferSize(), nullptr, &strip_cs);
+   strip_code->Release();
+   RTAO::GeometryCapture capture;
+   CHECK(capture.Init(device, interop, capture_cs, nullptr, error), "GeometryCapture::Init: %s", error.c_str());
+   CHECK(capture.InitCutouts(device, interop, strip_cs, error), "GeometryCapture::InitCutouts: %s", error.c_str());
+   capture_cs->Release();
+   strip_cs->Release();
+   RTAO::Retirer retirer;
+   RTAO::BlasCache blases;
+   RTAO::TlasBuilder tlas;
+   RTAO::AOPass pass;
+   CHECK(pass.Init(interop.GetDevice(), error), "AOPass::Init: %s", error.c_str());
+   RTAO::GpuTimer timer;
+   CHECK(timer.Init(interop.GetDevice(), interop.GetTimestampFrequency(), error), "GpuTimer::Init: %s", error.c_str());
+   RTAO::PassSettings settings;
+   std::memcpy(settings.view_proj, view_proj.m, sizeof(settings.view_proj));
+   std::memcpy(settings.inv_view_proj, inv_view_proj.m, sizeof(settings.inv_view_proj));
+   settings.cam_pos[0] = eye.x; settings.cam_pos[1] = eye.y; settings.cam_pos[2] = eye.z;
+   settings.cam_fwd[0] = f.x; settings.cam_fwd[1] = f.y; settings.cam_fwd[2] = f.z;
+   settings.ray_count = 4;
+
+   auto run_frame = [&]() {
+      CHECK(capture.CaptureDraw(context, draw), "capture (perf)");
+      ID3D11RenderTargetView* rtv = interop.GetDepthRTV();
+      D3D11_VIEWPORT viewport = { 0, 0, (float)W, (float)H, 0, 1 };
+      context->RSSetViewports(1, &viewport);
+      context->OMSetRenderTargets(1, &rtv, nullptr);
+      context->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP);
+      context->VSSetShader(copy_vs, nullptr, 0);
+      context->PSSetShader(depth_ps, nullptr, 0);
+      context->PSSetShaderResources(0, 1, &depth_srv);
+      context->Draw(4, 0);
+      ID3D11RenderTargetView* null_rtv = nullptr;
+      context->OMSetRenderTargets(1, &null_rtv, nullptr);
+      rtv->Release();
+      CHECK(interop.Run(context, [&](ID3D12GraphicsCommandList4* list, const RTAO::RecordInfo& info, std::string& err) {
+         retirer.Collect(info.completed_fence_value);
+         if (!capture.Record(list, info, blases, tlas, retirer, 64, err))
+            return false;
+         const RTAO::BuildContext ctx = { info.device, list, &retirer, info.submit_fence_value };
+         D3D12_GPU_VIRTUAL_ADDRESS top = 0;
+         uint32_t count = 0;
+         if (!tlas.Build(ctx, blases, info.frame_slot, top, count, err))
+            return false;
+         timer.Collect(info.frame_slot);
+         timer.Begin(list, info.frame_slot); // The pass only (trace + filter)
+         if (!pass.Record(list, info, top, settings, retirer, err, nullptr, &capture.GetCutoutBindings()))
+            return false;
+         timer.End(list, info.frame_slot);
+         return true;
+      }, error), "Run (perf): %s", error.c_str());
+      capture.OnPresent();
+   };
+   auto measure = [&](bool exact, float opacity, const char* name) {
+      settings.cutout_exact = exact;
+      settings.cutout_opacity = opacity;
+      for (int i = 0; i < 8; i++)
+         run_frame();
+      double ms = 0;
+      for (int i = 0; i < 32; i++)
+      {
+         run_frame();
+         ms += timer.LastMs();
+      }
+      interop.WaitForIdle(5000);
+      const RTAO::AOPass::CutoutCounters counters = pass.GetCutoutCounters();
+      printf("perf %s: AO pass %.3f ms (1920x1080, 4 rays, %u cutout layers), candidates per frame: masked %llu (%llu solid), stochastic %llu\n", name, ms / 32, layers,
+         (unsigned long long)counters.exact_tests, (unsigned long long)counters.exact_hits, (unsigned long long)counters.fallback_tests);
+   };
+   for (int i = 0; i < 6; i++)
+      run_frame();
+   measure(true, 0.5f, "texture exact");
+   measure(false, 0.5f, "stochastic 0.5");
+   measure(false, 1.f, "opaque (opacity 1)");
+   measure(true, 0.5f, "texture exact");
+
+   CHECK(interop.WaitForIdle(5000), "WaitForIdle");
+   retirer.ReleaseAll();
+   timer.Shutdown();
+   pass.Shutdown(nullptr, 0);
+   tlas.Clear(nullptr, 0);
+   blases.Clear(nullptr, 0);
+   capture.Shutdown();
+   for (IUnknown* p : std::initializer_list<IUnknown*>{ position_vb, uv_vb, ib, instance_buffer, instance_srv, material_cb, alpha_texture, alpha_srv, depth_srv, depth_texture })
+      p->Release();
+}
+// ---- Benchmark ("rtao_interop_test.exe bench", without RTAO_D3D12_DEBUG): a heavy synthetic street at 3440x1440
+// (Karnaca docks like: ~2900 TLAS instances, ~650 of them foliage cutouts made of thousands of overlapping leaf cards),
+// depth rasterized by D3D11, then BLAS/TLAS + the AO pass. Prints the GPU time per span (TLAS build, trace, filter)
+// and, per configuration, the error of the denoised AO against a 128 ray reference (static and moving camera).
+
+struct BenchMesh
+{
+   std::vector<float> positions;
+   std::vector<uint32_t> indices;
+   std::vector<float> uvs; // Foliage: per card 0..1 (texture exact cutouts)
+};
+
+static uint32_t BenchRand(uint32_t& state)
+{
+   state = state * 1664525u + 1013904223u;
+   return state >> 8;
+}
+static float BenchRandF(uint32_t& state) { return float(BenchRand(state) & 0xFFFF) / 65535.f; }
+static V3 Add(V3 a, V3 b) { return { a.x + b.x, a.y + b.y, a.z + b.z }; }
+static V3 Scale(V3 a, float s) { return { a.x * s, a.y * s, a.z * s }; }
+
+// Leaf cards: "count" random quads of half size [h0, h1], centers in an ellipsoid of radii "r" around "center"
+static BenchMesh MakeFoliage(uint32_t seed, uint32_t count, V3 center, V3 r, float h0, float h1)
+{
+   BenchMesh mesh;
+   uint32_t s = seed;
+   for (uint32_t i = 0; i < count; i++)
+   {
+      V3 p;
+      do
+         p = { BenchRandF(s) * 2 - 1, BenchRandF(s) * 2 - 1, BenchRandF(s) * 2 - 1 };
+      while (Dot(p, p) > 1.f);
+      p = Add(center, { p.x * r.x, p.y * r.y, p.z * r.z });
+      V3 d1 = Normalize({ BenchRandF(s) * 2 - 1, BenchRandF(s) * 2 - 1, BenchRandF(s) * 2 - 1 });
+      V3 d2 = Normalize(Cross(d1, Normalize({ BenchRandF(s) * 2 - 1, BenchRandF(s) * 2 - 1, BenchRandF(s) * 2 - 1 })));
+      const float h = h0 + (h1 - h0) * BenchRandF(s);
+      d1 = Scale(d1, h);
+      d2 = Scale(d2, h);
+      const uint32_t base = uint32_t(mesh.positions.size() / 3);
+      const V3 corners[4] = { Sub(Sub(p, d1), d2), Sub(Add(p, d1), d2), Add(Add(p, d1), d2), Add(Sub(p, d1), d2) };
+      for (const V3& c : corners)
+         mesh.positions.insert(mesh.positions.end(), { c.x, c.y, c.z });
+      mesh.uvs.insert(mesh.uvs.end(), { 0, 0, 1, 0, 1, 1, 0, 1 });
+      mesh.indices.insert(mesh.indices.end(), { base, base + 1, base + 2, base, base + 2, base + 3 });
+   }
+   return mesh;
+}
+
+static void WritePgm(const char* path, const std::vector<float>& image, UINT w, UINT h, UINT x0, UINT y0, UINT cw, UINT ch)
+{
+   FILE* file = fopen(path, "wb");
+   if (!file)
+      return;
+   fprintf(file, "P5\n%u %u\n255\n", cw, ch);
+   std::vector<uint8_t> row(cw);
+   for (UINT y = y0; y < y0 + ch && y < h; y++)
+   {
+      for (UINT x = 0; x < cw; x++)
+         row[x] = uint8_t(std::clamp(image[y * w + std::min(x0 + x, w - 1)], 0.f, 1.f) * 255.f + 0.5f);
+      fwrite(row.data(), 1, cw, file);
+   }
+   fclose(file);
+}
+
+struct BenchConfig
+{
+   const char* name;
+   RTAO::PassSettings settings; // Camera fields are filled per frame
+};
+
+static void RunBenchmark(ID3D11Device* device, ID3D11DeviceContext* context, RTAO::Interop& interop, ID3D11VertexShader* copy_vs, ID3D11PixelShader* depth_ps, const std::vector<BenchConfig>& configs, const char* image_dir)
+{
+   std::string error;
+   const UINT W = 3440, H = 1440;
+   CHECK(interop.EnsureTargets(device, W, H, W, H, error), "EnsureTargets: %s", error.c_str());
+
+   // Meshes: 0 cube (buildings, details, crates, trunks, ground), 1 tree canopy, 2 bush
+   std::vector<BenchMesh> meshes(3);
+   meshes[0].positions.assign(kCubeVertices, kCubeVertices + 24);
+   meshes[0].indices.assign(kCubeIndices, kCubeIndices + 36);
+   meshes[1] = MakeFoliage(1, 1200, { 0, 5, 0 }, { 2.6f, 2.f, 2.6f }, 0.3f, 0.45f);
+   meshes[2] = MakeFoliage(2, 250, { 0, 0.7f, 0 }, { 0.9f, 0.7f, 0.9f }, 0.15f, 0.25f);
+
+   struct Instance
+   {
+      uint32_t mesh;
+      float xform[3][4];
+      bool cutout;
+   };
+   std::vector<Instance> instances;
+   auto add_box = [&](V3 mn, V3 mx) {
+      Instance in = { 0, { { mx.x - mn.x, 0, 0, mn.x }, { 0, mx.y - mn.y, 0, mn.y }, { 0, 0, mx.z - mn.z, mn.z } }, false };
+      instances.push_back(in);
+   };
+   auto add_mesh = [&](uint32_t mesh, V3 at, float yaw, float scale, bool cutout) {
+      const float c = std::cos(yaw) * scale, s = std::sin(yaw) * scale;
+      Instance in = { mesh, { { c, 0, s, at.x }, { 0, scale, 0, at.y }, { -s, 0, c, at.z } }, cutout };
+      instances.push_back(in);
+   };
+   // Streets every P along x and z (6 m wide), 10 x 10 blocks of buildings with balconies, crates along the walls,
+   // trees on both sidewalks of the streets running along x, bushes at the walls
+   uint32_t seed = 7;
+   const float P = 16.f;
+   add_box({ -40, -1, -40 }, { 10 * P + 40, 0, 10 * P + 40 });
+   for (int bx = 0; bx < 10; bx++)
+      for (int bz = 0; bz < 10; bz++)
+      {
+         const float x0 = bx * P + 3, z0 = bz * P + 3, height = 6 + 10 * BenchRandF(seed);
+         add_box({ x0, 0, z0 }, { x0 + 10, height, z0 + 10 });
+         for (int d = 0; d < 6; d++)
+         {
+            const float y = 2.5f + d * 1.5f, x = x0 + 1 + 7 * BenchRandF(seed);
+            if (y < height)
+               add_box({ x, y, z0 - 0.8f }, { x + 1.6f, y + 0.15f, z0 });
+         }
+         for (int c = 0; c < 12; c++)
+         {
+            const float x = x0 + 10 * BenchRandF(seed), size = 0.5f + 0.7f * BenchRandF(seed);
+            const float z = BenchRandF(seed) < 0.5f ? z0 - 0.3f - size : z0 + 10.3f;
+            add_box({ x, 0, z }, { x + size, size, z + size });
+         }
+         for (int b = 0; b < 3; b++)
+            add_mesh(2, { x0 + 10 * BenchRandF(seed), 0, BenchRandF(seed) < 0.5f ? z0 - 0.6f : z0 + 10.6f }, 6.28f * BenchRandF(seed), 0.8f + 0.5f * BenchRandF(seed), true);
+      }
+   for (int street = 0; street <= 10; street++)
+      for (int side = 0; side < 2; side++)
+         for (float x = 1.5f; x < 10 * P; x += 10.f)
+         {
+            const V3 at = { x + 2 * BenchRandF(seed), 0, street * P + (side ? 2.f : -2.f) };
+            add_box({ at.x - 0.15f, 0, at.z - 0.15f }, { at.x + 0.15f, 3.5f, at.z + 0.15f });
+            add_mesh(1, at, 6.28f * BenchRandF(seed), 0.8f + 0.4f * BenchRandF(seed), true);
+         }
+   uint32_t cutouts = 0;
+   size_t triangles = 0;
+   for (const Instance& in : instances)
+   {
+      cutouts += in.cutout;
+      triangles += meshes[in.mesh].indices.size() / 3;
+   }
+   printf("bench scene: %zu instances (%u cutouts), %zu triangles, %ux%u\n", instances.size(), cutouts, triangles, W, H);
+
+   // D3D11 depth: every instance's triangles pre-transformed into one buffer, reversed Z
+   std::vector<float> world;
+   world.reserve(triangles * 9);
+   for (const Instance& in : instances)
+      for (uint32_t index : meshes[in.mesh].indices)
+      {
+         const float* p = &meshes[in.mesh].positions[index * 3];
+         for (int r = 0; r < 3; r++)
+            world.push_back(in.xform[r][0] * p[0] + in.xform[r][1] * p[1] + in.xform[r][2] * p[2] + in.xform[r][3]);
+      }
+   ID3D11Buffer* world_vb = MakeBuffer(device, D3D11_BIND_VERTEX_BUFFER, world.data(), UINT(world.size() * 4));
+   const char* vs_source = "cbuffer C : register(b0) { row_major float4x4 VP; }; float4 main(float3 p : POSITION) : SV_Position { return mul(float4(p, 1), VP); }";
+   ID3DBlob* vs_blob = nullptr;
+   ID3DBlob* vs_errors = nullptr;
+   D3DCompile(vs_source, strlen(vs_source), "bench_vs", nullptr, nullptr, "main", "vs_5_0", 0, 0, &vs_blob, &vs_errors);
+   if (!vs_blob)
+   {
+      printf("bench VS: %s\n", vs_errors ? (const char*)vs_errors->GetBufferPointer() : "?");
+      g_failures++;
+      return;
+   }
+   ID3D11VertexShader* bench_vs = nullptr;
+   device->CreateVertexShader(vs_blob->GetBufferPointer(), vs_blob->GetBufferSize(), nullptr, &bench_vs);
+   const D3D11_INPUT_ELEMENT_DESC element = { "POSITION", 0, DXGI_FORMAT_R32G32B32_FLOAT, 0, 0, D3D11_INPUT_PER_VERTEX_DATA, 0 };
+   ID3D11InputLayout* layout = nullptr;
+   device->CreateInputLayout(&element, 1, vs_blob->GetBufferPointer(), vs_blob->GetBufferSize(), &layout);
+   vs_blob->Release();
+   D3D11_TEXTURE2D_DESC depth_desc = { W, H, 1, 1, DXGI_FORMAT_R32_TYPELESS, { 1, 0 }, D3D11_USAGE_DEFAULT, D3D11_BIND_DEPTH_STENCIL | D3D11_BIND_SHADER_RESOURCE, 0, 0 };
+   ID3D11Texture2D* depth_texture = nullptr;
+   device->CreateTexture2D(&depth_desc, nullptr, &depth_texture);
+   D3D11_DEPTH_STENCIL_VIEW_DESC dsv_desc = {};
+   dsv_desc.Format = DXGI_FORMAT_D32_FLOAT;
+   dsv_desc.ViewDimension = D3D11_DSV_DIMENSION_TEXTURE2D;
+   ID3D11DepthStencilView* dsv = nullptr;
+   device->CreateDepthStencilView(depth_texture, &dsv_desc, &dsv);
+   D3D11_SHADER_RESOURCE_VIEW_DESC srv_desc = {};
+   srv_desc.Format = DXGI_FORMAT_R32_FLOAT;
+   srv_desc.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D;
+   srv_desc.Texture2D.MipLevels = 1;
+   ID3D11ShaderResourceView* depth_srv = nullptr;
+   device->CreateShaderResourceView(depth_texture, &srv_desc, &depth_srv);
+   D3D11_DEPTH_STENCIL_DESC ds_desc = {};
+   ds_desc.DepthEnable = TRUE;
+   ds_desc.DepthWriteMask = D3D11_DEPTH_WRITE_MASK_ALL;
+   ds_desc.DepthFunc = D3D11_COMPARISON_GREATER;
+   ID3D11DepthStencilState* ds_state = nullptr;
+   device->CreateDepthStencilState(&ds_desc, &ds_state);
+   D3D11_RASTERIZER_DESC rs_desc = {};
+   rs_desc.FillMode = D3D11_FILL_SOLID;
+   rs_desc.CullMode = D3D11_CULL_NONE;
+   rs_desc.DepthClipEnable = TRUE;
+   ID3D11RasterizerState* rs_state = nullptr;
+   device->CreateRasterizerState(&rs_desc, &rs_state);
+   D3D11_BUFFER_DESC cb_desc = { 64, D3D11_USAGE_DEFAULT, D3D11_BIND_CONSTANT_BUFFER, 0, 0, 0 };
+   ID3D11Buffer* vp_cb = nullptr;
+   device->CreateBuffer(&cb_desc, nullptr, &vp_cb);
+   D3D11_TEXTURE2D_DESC staging_desc = depth_desc;
+   staging_desc.Usage = D3D11_USAGE_STAGING;
+   staging_desc.BindFlags = 0;
+   staging_desc.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+   ID3D11Texture2D* depth_staging = nullptr;
+   device->CreateTexture2D(&staging_desc, nullptr, &depth_staging);
+
+   struct Camera
+   {
+      Mat4 view_proj, inv_view_proj;
+      V3 eye, fwd;
+   };
+   // Street level, looking down a tree lined street; "t" moves the camera forward and turns it a little
+   auto make_camera = [&](float t) {
+      Camera cam;
+      cam.eye = { 20 + t * 0.04f, 1.7f, 5 * P + 0.5f };
+      const float yaw = 0.15f + t * 0.004f;
+      const V3 target = Add(cam.eye, { std::cos(yaw), -0.12f, std::sin(yaw) });
+      const V3 up = { 0, 1, 0 };
+      const V3 f = Normalize(Sub(target, cam.eye)), r = Normalize(Cross(up, f)), u = Cross(f, r);
+      cam.fwd = f;
+      Mat4 view;
+      view(0, 0) = r.x; view(0, 1) = u.x; view(0, 2) = f.x;
+      view(1, 0) = r.y; view(1, 1) = u.y; view(1, 2) = f.y;
+      view(2, 0) = r.z; view(2, 1) = u.z; view(2, 2) = f.z;
+      view(3, 0) = -Dot(r, cam.eye); view(3, 1) = -Dot(u, cam.eye); view(3, 2) = -Dot(f, cam.eye); view(3, 3) = 1;
+      const float n = 0.1f, fr = 2000.f, sy = 1.f / std::tan(0.5f * 1.0f), sx = sy / (float(W) / float(H));
+      Mat4 proj;
+      proj(0, 0) = sx;
+      proj(1, 1) = sy;
+      proj(2, 2) = -n / (fr - n);
+      proj(2, 3) = 1;
+      proj(3, 2) = n * fr / (fr - n);
+      cam.view_proj = Mul(view, proj);
+      cam.inv_view_proj = Inverse(cam.view_proj);
+      return cam;
+   };
+   std::vector<uint8_t> sky_mask; // Of the last rasterized camera
+   auto rasterize = [&](const Camera& cam, bool read_mask) {
+      context->UpdateSubresource(vp_cb, 0, nullptr, cam.view_proj.m, 0, 0);
+      context->ClearDepthStencilView(dsv, D3D11_CLEAR_DEPTH, 0.f, 0);
+      D3D11_VIEWPORT viewport = { 0, 0, (float)W, (float)H, 0, 1 };
+      context->RSSetViewports(1, &viewport);
+      context->RSSetState(rs_state);
+      context->OMSetDepthStencilState(ds_state, 0);
+      context->OMSetRenderTargets(0, nullptr, dsv);
+      context->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+      context->IASetInputLayout(layout);
+      const UINT stride = 12, offset = 0;
+      context->IASetVertexBuffers(0, 1, &world_vb, &stride, &offset);
+      context->VSSetShader(bench_vs, nullptr, 0);
+      context->VSSetConstantBuffers(0, 1, &vp_cb);
+      context->PSSetShader(nullptr, nullptr, 0);
+      context->Draw(UINT(world.size() / 3), 0);
+      context->OMSetRenderTargets(0, nullptr, nullptr);
+      context->RSSetState(nullptr);
+      context->OMSetDepthStencilState(nullptr, 0);
+      if (read_mask)
+      {
+         context->CopyResource(depth_staging, depth_texture);
+         D3D11_MAPPED_SUBRESOURCE mapped;
+         context->Map(depth_staging, 0, D3D11_MAP_READ, 0, &mapped);
+         sky_mask.assign(W * H, 0);
+         for (UINT y = 0; y < H; y++)
+            for (UINT x = 0; x < W; x++)
+               sky_mask[y * W + x] = ((const float*)((const uint8_t*)mapped.pData + y * mapped.RowPitch))[x] <= 0.f;
+         context->Unmap(depth_staging, 0);
+      }
+      // Into the interop's depth (what DrawRTAO does)
+      ID3D11RenderTargetView* rtv = interop.GetDepthRTV();
+      context->OMSetRenderTargets(1, &rtv, nullptr);
+      context->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP);
+      context->IASetInputLayout(nullptr);
+      context->VSSetShader(copy_vs, nullptr, 0);
+      context->PSSetShader(depth_ps, nullptr, 0);
+      context->PSSetShaderResources(0, 1, &depth_srv);
+      context->Draw(4, 0);
+      ID3D11ShaderResourceView* null_srv = nullptr;
+      context->PSSetShaderResources(0, 1, &null_srv);
+      ID3D11RenderTargetView* null_rtv = nullptr;
+      context->OMSetRenderTargets(1, &null_rtv, nullptr);
+      rtv->Release();
+   };
+
+   RTAO::Retirer retirer;
+   RTAO::BlasCache blases;
+   RTAO::TlasBuilder tlas;
+   RTAO::AOPass pass;
+   RTAO::GpuTimer timer;
+   CHECK(pass.Init(interop.GetDevice(), error), "AOPass::Init: %s", error.c_str());
+   CHECK(timer.Init(interop.GetDevice(), interop.GetTimestampFrequency(), error), "GpuTimer::Init: %s", error.c_str());
+   uint32_t tlas_count = 0;
+
+   // Texture exact cutouts: the foliage meshes' indices and uvs in a shared "arena" (copied by D3D11 like the capture
+   // does), one material whose mask is a round leaf (alpha 1 inside a radius 0.4 disc: about half of each card), rendered
+   // through alpha_strip_cs
+   RTAO::CutoutMaterials bench_cutouts;
+   ID3D12Resource* arena12 = nullptr;
+   ID3D11Buffer* arena11 = nullptr;
+   ID3D11Texture2D* leaf_texture = nullptr;
+   ID3D11ShaderResourceView* leaf_srv = nullptr;
+   uint64_t leaf_material = 0;
+   RTAO::CutoutGeometry foliage_geometry[3] = {};
+   {
+      std::vector<uint8_t> arena;
+      for (uint32_t m = 1; m < meshes.size(); m++)
+      {
+         foliage_geometry[m].index_offset = uint32_t(arena.size());
+         const uint8_t* indices = reinterpret_cast<const uint8_t*>(meshes[m].indices.data());
+         arena.insert(arena.end(), indices, indices + meshes[m].indices.size() * 4);
+         foliage_geometry[m].uv_offset = uint32_t(arena.size());
+         const uint8_t* uvs = reinterpret_cast<const uint8_t*>(meshes[m].uvs.data());
+         arena.insert(arena.end(), uvs, uvs + meshes[m].uvs.size() * 4);
+         foliage_geometry[m].uv_stride = 8;
+         foliage_geometry[m].uv_code = RTAO::VertexFormatCode(DXGI_FORMAT_R32G32_FLOAT);
+         foliage_geometry[m].index32 = 1;
+      }
+      CHECK(interop.CreateSharedBuffer(device, arena.size(), arena12, arena11, error), "bench arena: %s", error.c_str());
+      ID3D11Buffer* source = MakeBuffer(device, D3D11_BIND_VERTEX_BUFFER, arena.data(), UINT(arena.size()));
+      context->CopySubresourceRegion(arena11, 0, 0, 0, 0, source, 0, nullptr);
+      source->Release();
+      std::vector<uint32_t> texels(64 * 64);
+      for (UINT y = 0; y < 64; y++)
+         for (UINT x = 0; x < 64; x++)
+         {
+            const float u = (x + 0.5f) / 64.f - 0.5f, v = (y + 0.5f) / 64.f - 0.5f;
+            texels[y * 64 + x] = (u * u + v * v < 0.16f ? 0xFF000000u : 0u) | 0x00204020u;
+         }
+      D3D11_TEXTURE2D_DESC leaf_desc = { 64, 64, 1, 1, DXGI_FORMAT_R8G8B8A8_UNORM, { 1, 0 }, D3D11_USAGE_IMMUTABLE, D3D11_BIND_SHADER_RESOURCE, 0, 0 };
+      D3D11_SUBRESOURCE_DATA leaf_data = { texels.data(), 64 * 4, 0 };
+      device->CreateTexture2D(&leaf_desc, &leaf_data, &leaf_texture);
+      device->CreateShaderResourceView(leaf_texture, nullptr, &leaf_srv);
+      ID3DBlob* strip_code = Compile(L"..\\..\\..\\..\\Shaders\\Dishonored 2\\Luma_RTAO.hlsl", "alpha_strip_cs", "cs_5_0");
+      ID3D11ComputeShader* strip_cs = nullptr;
+      device->CreateComputeShader(strip_code->GetBufferPointer(), strip_code->GetBufferSize(), nullptr, &strip_cs);
+      strip_code->Release();
+      CHECK(bench_cutouts.Init(device, interop, strip_cs, error), "bench cutouts: %s", error.c_str());
+      strip_cs->Release();
+      uint32_t tile = RTAO::CutoutMaterials::kNoTile;
+      leaf_material = bench_cutouts.AcquireMaterial(leaf_srv, 3, tile);
+      CHECK(leaf_material && tile != RTAO::CutoutMaterials::kNoTile && bench_cutouts.RecordStrip(context, leaf_srv, 3, tile), "bench leaf mask");
+      bench_cutouts.OnStripExecuted(leaf_material, tile); // Immediate context: executed by the next Run
+   }
+   // One frame: TLAS (all instances re-added, like the capture's readback), AO pass. Spans: BLAS, TLAS, trace, filter.
+   auto run = [&](const Camera& cam, RTAO::PassSettings settings) {
+      std::memcpy(settings.view_proj, cam.view_proj.m, sizeof(settings.view_proj));
+      std::memcpy(settings.inv_view_proj, cam.inv_view_proj.m, sizeof(settings.inv_view_proj));
+      settings.cam_pos[0] = cam.eye.x; settings.cam_pos[1] = cam.eye.y; settings.cam_pos[2] = cam.eye.z;
+      settings.cam_fwd[0] = cam.fwd.x; settings.cam_fwd[1] = cam.fwd.y; settings.cam_fwd[2] = cam.fwd.z;
+      settings.reversed_z = true;
+      CHECK(interop.Run(context, [&](ID3D12GraphicsCommandList4* list, const RTAO::RecordInfo& info, std::string& err) {
+         retirer.Collect(info.completed_fence_value);
+         timer.Collect(info.frame_slot);
+         timer.Begin(list, info.frame_slot);
+         const RTAO::BuildContext ctx = { info.device, list, &retirer, info.submit_fence_value };
+         for (uint32_t m = 0; m < meshes.size(); m++)
+         {
+            RTAO::CpuMesh mesh = { meshes[m].positions.data(), uint32_t(meshes[m].positions.size() / 3), 12, meshes[m].indices.data(), uint32_t(meshes[m].indices.size()) };
+            if (!blases.BuildFromCpu(ctx, m, mesh, err))
+               return false;
+         }
+         blases.FlushBarrier(list);
+         uint32_t records[3] = { RTAO::kNoCutoutRecord, RTAO::kNoCutoutRecord, RTAO::kNoCutoutRecord };
+         static const float identity_scalebias[4] = { 1, 1, 0, 0 };
+         for (uint32_t m = 1; m < meshes.size(); m++)
+            records[m] = bench_cutouts.ResolveRecord(leaf_material, foliage_geometry[m], identity_scalebias, 0.5f);
+         RTAO::CutoutBindings bindings;
+         if (!bench_cutouts.Record(list, info, retirer, arena12, bindings, err))
+            return false;
+         timer.Mark(list, info.frame_slot);
+         tlas.BeginFrame();
+         for (size_t i = 0; i < instances.size(); i++)
+            tlas.AddInstance(i, instances[i].mesh, instances[i].xform, instances[i].cutout ? RTAO::kInstanceMaskCutout : RTAO::kInstanceMaskOpaque, records[instances[i].mesh]);
+         D3D12_GPU_VIRTUAL_ADDRESS top = 0;
+         if (!tlas.Build(ctx, blases, info.frame_slot, top, tlas_count, err))
+            return false;
+         timer.Mark(list, info.frame_slot);
+         if (!pass.Record(list, info, top, settings, retirer, err, &timer, &bindings))
+            return false;
+         timer.End(list, info.frame_slot);
+         return true;
+      }, error), "Run (bench): %s", error.c_str());
+   };
+   auto read_ao = [&]() {
+      ID3D11ShaderResourceView* ao_srv = interop.GetAOSRV();
+      UINT w = 0, h = 0;
+      std::vector<float> ao = ReadAO(device, context, ao_srv, w, h);
+      ao_srv->Release();
+      return ao;
+   };
+   auto mae = [&](const std::vector<float>& a, const std::vector<float>& b) {
+      double sum = 0;
+      size_t count = 0;
+      for (size_t i = 0; i < a.size(); i++)
+         if (!sky_mask[i])
+         {
+            sum += std::fabs(a[i] - b[i]);
+            count++;
+         }
+      return count ? sum / count : 0.0;
+   };
+
+   // References: 128 rays, no denoiser, at the static pose and at the end of the camera move
+   const int kMoveFrames = 24;
+   const Camera cam_static = make_camera(0.f), cam_moved = make_camera(float(kMoveFrames));
+   RTAO::PassSettings reference_settings;
+   reference_settings.ray_count = 128;
+   reference_settings.filter_mode = RTAO::FilterMode::Off;
+   reference_settings.strength = 1.f;
+   // [exact][pose]: a configuration is compared with the reference of its own cutout model (stochastic opacity 0.5, or
+   // the leaf masks)
+   std::vector<float> references[2][2];
+   for (int exact = 0; exact < 2; exact++)
+      for (int pose = 0; pose < 2; pose++)
+      {
+         reference_settings.cutout_exact = exact != 0;
+         rasterize(pose ? cam_moved : cam_static, true);
+         run(pose ? cam_moved : cam_static, reference_settings);
+         references[exact][pose] = read_ao();
+      }
+   const std::vector<float>* reference = references[0];
+   size_t sky = 0;
+   for (uint8_t s : sky_mask)
+      sky += s;
+   printf("bench: TLAS %u instances, %.1f%% sky\n", tlas_count, 100.0 * sky / sky_mask.size());
+   if (image_dir)
+   {
+      char path[512];
+      snprintf(path, sizeof(path), "%s\\reference.pgm", image_dir);
+      WritePgm(path, reference[1], W, H, 0, 0, W, H);
+      snprintf(path, sizeof(path), "%s\\reference_static.pgm", image_dir);
+      WritePgm(path, reference[0], W, H, 0, 0, W, H);
+   }
+
+   const char* filter = getenv("RTAO_BENCH_FILTER"); // Only the configurations whose name contains it
+   for (const BenchConfig& config : configs)
+   {
+      if (filter && !strstr(config.name, filter))
+         continue;
+      RTAO::PassSettings settings = config.settings;
+      settings.strength = 1.f;
+      reference = references[settings.cutout_exact ? 1 : 0];
+      settings.reset_history = true;
+      // Static camera: converge, time, measure flicker and error
+      rasterize(cam_static, true);
+      // Medians over the timed frames (other GPU work on the machine makes single frames noisy)
+      std::vector<double> span_samples[RTAO::GpuTimer::kMaxMarks + 2];
+      const int kWarmup = 40, kTimed = 60;
+      std::vector<float> previous, current;
+      double flicker = 0;
+      for (int frame = 0; frame < kWarmup + kTimed; frame++)
+      {
+         run(cam_static, settings);
+         settings.reset_history = false;
+         if (frame >= kWarmup)
+         {
+            for (uint32_t s = 0; s < RTAO::GpuTimer::kMaxMarks + 1; s++)
+               span_samples[s].push_back(timer.LastSpanMs(s));
+            span_samples[RTAO::GpuTimer::kMaxMarks + 1].push_back(timer.LastMs());
+         }
+         if (frame >= kWarmup + kTimed - 4)
+         {
+            previous.swap(current);
+            current = read_ao();
+            if (!previous.empty())
+               flicker += mae(current, previous) / 3.0;
+         }
+      }
+      const double static_error = mae(current, reference[0]);
+      if (image_dir)
+      {
+         char path[512];
+         snprintf(path, sizeof(path), "%s\\%s_static.pgm", image_dir, config.name);
+         WritePgm(path, current, W, H, 0, 0, W, H);
+      }
+      // Moving camera: from a converged history, kMoveFrames frames of motion, error at the last pose
+      for (int frame = 1; frame <= kMoveFrames; frame++)
+      {
+         const Camera cam = make_camera(float(frame));
+         rasterize(cam, frame == kMoveFrames);
+         run(cam, settings);
+      }
+      const std::vector<float> moved = read_ao();
+      const double moving_error = mae(moved, reference[1]);
+      auto median = [&](uint32_t s) {
+         std::vector<double>& v = span_samples[s];
+         std::sort(v.begin(), v.end());
+         return v.empty() ? 0.0 : v[v.size() / 2];
+      };
+      printf("%-34s GPU %.3f ms (BLAS %.3f, TLAS %.3f, trace %.3f, filter %.3f) | error static %.4f moving %.4f, flicker %.4f\n", config.name, median(RTAO::GpuTimer::kMaxMarks + 1), median(0), median(1), median(2), median(3),
+         static_error, moving_error, flicker);
+      if (image_dir)
+      {
+         char path[512];
+         snprintf(path, sizeof(path), "%s\\%s.pgm", image_dir, config.name);
+         WritePgm(path, moved, W, H, 0, 0, W, H);
+      }
+   }
+
+   CHECK(interop.WaitForIdle(5000), "WaitForIdle");
+   retirer.ReleaseAll();
+   timer.Shutdown();
+   pass.Shutdown(nullptr, 0);
+   tlas.Clear(nullptr, 0);
+   blases.Clear(nullptr, 0);
+   bench_cutouts.Shutdown();
+   for (IUnknown* p : std::initializer_list<IUnknown*>{ world_vb, bench_vs, layout, depth_texture, dsv, depth_srv, ds_state, rs_state, vp_cb, depth_staging, arena11, arena12, leaf_texture, leaf_srv })
+      if (p)
+         p->Release();
+}
+
+static std::vector<BenchConfig> BenchConfigs()
+{
+   std::vector<BenchConfig> configs;
+   RTAO::PassSettings base;
+   base.cutout_exact = false; // The stochastic cutouts (texture exact variants at the end)
+   configs.push_back({ "high_4rays_opacity0.5", base });
+   RTAO::PassSettings s = base;
+   s.cutout_opacity = 1.f;
+   configs.push_back({ "high_4rays_opacity1", s });
+   s.cutout_opacity = 0.f;
+   configs.push_back({ "high_4rays_opacity0", s });
+   s = base;
+   s.ray_count = 2;
+   configs.push_back({ "medium_2rays", s });
+   s.ray_count = 1;
+   configs.push_back({ "1ray", s });
+   s = base;
+   s.cutout_mode = 1;
+   configs.push_back({ "high_4rays_perray", s });
+   s.cutout_mode = 2;
+   configs.push_back({ "high_4rays_perray_sq", s });
+   s = base;
+   s.half_res = true;
+   configs.push_back({ "low_half_4rays", s });
+   s.ray_count = 2;
+   configs.push_back({ "low_half_2rays", s });
+   s.ray_count = 4;
+   s.cutout_mode = 2;
+   configs.push_back({ "low_half_4rays_fastcutouts", s });
+   s = base;
+   s.ray_count = 2;
+   s.cutout_mode = 2;
+   configs.push_back({ "medium_2rays_perray_sq", s });
+   // Texture exact cutouts (round leaf masks)
+   s = base;
+   s.cutout_exact = true;
+   configs.push_back({ "high_4rays_exact", s });
+   s.ray_count = 2;
+   configs.push_back({ "medium_2rays_exact", s });
+   s.ray_count = 4;
+   s.half_res = true;
+   configs.push_back({ "low_half_4rays_exact", s });
+   s.cutout_mode = 2;
+   configs.push_back({ "low_half_4rays_fastcutouts_exact", s });
+   return configs;
+}
+
 #include "rtsun_test.inl"
 
-int main()
+int main(int argc, char** argv)
 {
    setvbuf(stdout, nullptr, _IONBF, 0);
+   const bool bench = argc > 1 && strcmp(argv[1], "bench") == 0;
+   const char* image_dir = bench && argc > 2 ? argv[2] : nullptr;
    // RTAO_D3D12_DEBUG=1: D3D12 debug layer + GPU based validation (messages go to the debugger output)
    if (GetEnvironmentVariableA("RTAO_D3D12_DEBUG", nullptr, 0) != 0)
    {
@@ -1697,6 +2948,14 @@ int main()
       }
    }
 
+   if (bench)
+   {
+      RunBenchmark(device, context, interop, vs, ps, BenchConfigs(), image_dir);
+      interop.Shutdown();
+      printf(g_failures ? "FAILED (%d)\n" : "PASSED\n", g_failures);
+      return g_failures ? 1 : 0;
+   }
+
    TestTlasRetention();
    TestSharedBuffer(device, context, interop);
    TestRayTracedScene(device, context, interop, vs, ps);
@@ -1706,6 +2965,9 @@ int main()
    TestSunShadows(device, context, interop, vs, ps);
    TestLightCapture(device, context);
    TestScreenShadowsShader(device, context);
+   TestCutoutTextures(device, context, interop, vs, ps);
+   if (GetEnvironmentVariableA("RTAO_PERF", nullptr, 0) != 0)
+      TestCutoutPerf(device, context, interop, vs, ps);
 
    // With RTAO_D3D12_DEBUG set: any D3D12 validation error fails the test
    ID3D12InfoQueue* info_queue = nullptr;

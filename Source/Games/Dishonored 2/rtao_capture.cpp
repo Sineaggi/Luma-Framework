@@ -76,6 +76,19 @@ namespace RTAO
          return h * 0xFF51AFD7ED558CCDull;
       }
 
+      float HalfToFloat(uint32_t h)
+      {
+         const uint32_t sign = (h >> 15) & 1, exponent = (h >> 10) & 31, mantissa = h & 1023;
+         float value;
+         if (exponent == 0)
+            value = std::ldexp(float(mantissa), -24);
+         else if (exponent == 31)
+            value = mantissa ? NAN : INFINITY;
+         else
+            value = std::ldexp(float(mantissa | 1024), int(exponent) - 25);
+         return sign ? -value : value;
+      }
+
       void Transition(ID3D12GraphicsCommandList* list, ID3D12Resource* resource, D3D12_RESOURCE_STATES before, D3D12_RESOURCE_STATES after)
       {
          D3D12_RESOURCE_BARRIER barrier = {};
@@ -100,18 +113,23 @@ namespace RTAO
          params.record_row0 = draw.vs->record_row0;
          std::memcpy(params.mvp_cb, draw.vs->mvp_cb, sizeof(params.mvp_cb));
          params.view_proj_cb = draw.vs->view_proj_cb;
+         // Cutouts: the draw's alpha reference and uv scale/bias, from its pixel shader's cbuffer (b3)
+         const bool material = draw.ps && draw.material_cb;
+         params.alpha_ref_cb = material ? draw.ps->alpha_ref_cb : kNoOffset;
+         params.uv_scalebias_cb = material ? draw.ps->uv_scalebias_cb : kNoOffset;
+         params.alpha_ref_const = draw.ps ? draw.ps->alpha_ref : 0.5f;
 
-         constexpr UINT kSrvs = 6, kUavs = 2;
+         constexpr UINT kCbs = 4, kSrvs = 6, kUavs = 2;
          ID3D11DeviceContext1* context1 = nullptr;
          context->QueryInterface(IID_PPV_ARGS(&context1));
          ID3D11ComputeShader* old_cs = nullptr;
          context->CSGetShader(&old_cs, nullptr, nullptr);
-         ID3D11Buffer* old_cbs[3] = {};
-         UINT old_cb_first[3] = {}, old_cb_num[3] = {};
+         ID3D11Buffer* old_cbs[kCbs] = {};
+         UINT old_cb_first[kCbs] = {}, old_cb_num[kCbs] = {};
          if (context1)
-            context1->CSGetConstantBuffers1(0, 3, old_cbs, old_cb_first, old_cb_num);
+            context1->CSGetConstantBuffers1(0, kCbs, old_cbs, old_cb_first, old_cb_num);
          else
-            context->CSGetConstantBuffers(0, 3, old_cbs);
+            context->CSGetConstantBuffers(0, kCbs, old_cbs);
          ID3D11ShaderResourceView* old_srvs[kSrvs] = {};
          context->CSGetShaderResources(0, kSrvs, old_srvs);
          ID3D11UnorderedAccessView* old_uavs[kUavs] = {};
@@ -125,8 +143,8 @@ namespace RTAO
             context->Unmap(params_cb, 0);
 
             context->CSSetShader(shader, nullptr, 0);
-            ID3D11Buffer* cbs[3] = { params_cb, draw.instance_cb, source == MatrixSource::MvpConstantBuffer ? draw.per_view_cb : nullptr };
-            if (context1 && (draw.instance_cb_num_constants != 0 || draw.per_view_cb_num_constants != 0))
+            ID3D11Buffer* cbs[kCbs] = { params_cb, draw.instance_cb, source == MatrixSource::MvpConstantBuffer ? draw.per_view_cb : nullptr, material ? draw.material_cb : nullptr };
+            if (context1 && (draw.instance_cb_num_constants != 0 || draw.per_view_cb_num_constants != 0 || (material && draw.material_cb_num_constants != 0)))
             {
                // A buffer bound whole (num 0) gets its own size, in the multiples of 16 constants D3D11.1 wants
                auto whole = [](ID3D11Buffer* buffer) -> UINT {
@@ -136,13 +154,14 @@ namespace RTAO
                   buffer->GetDesc(&desc);
                   return (std::min)(4096u, ((desc.ByteWidth / 16) + 15) & ~15u);
                };
-               UINT first[3] = { 0, draw.instance_cb_first_constant, draw.per_view_cb_first_constant };
-               UINT num[3] = { 16, draw.instance_cb_num_constants ? draw.instance_cb_num_constants : whole(cbs[1]), draw.per_view_cb_num_constants ? draw.per_view_cb_num_constants : whole(cbs[2]) };
-               context1->CSSetConstantBuffers1(0, 3, cbs, first, num);
+               UINT first[kCbs] = { 0, draw.instance_cb_first_constant, draw.per_view_cb_first_constant, material ? draw.material_cb_first_constant : 0 };
+               UINT num[kCbs] = { 16, draw.instance_cb_num_constants ? draw.instance_cb_num_constants : whole(cbs[1]), draw.per_view_cb_num_constants ? draw.per_view_cb_num_constants : whole(cbs[2]),
+                  (material && draw.material_cb_num_constants) ? draw.material_cb_num_constants : whole(cbs[3]) };
+               context1->CSSetConstantBuffers1(0, kCbs, cbs, first, num);
             }
             else
             {
-               context->CSSetConstantBuffers(0, 3, cbs);
+               context->CSSetConstantBuffers(0, kCbs, cbs);
             }
             ID3D11ShaderResourceView* srvs[kSrvs] = {
                source == MatrixSource::IndexedInstanceBuffer ? draw.instance_index : nullptr,
@@ -163,9 +182,9 @@ namespace RTAO
 
          context->CSSetShader(old_cs, nullptr, 0);
          if (context1)
-            context1->CSSetConstantBuffers1(0, 3, old_cbs, old_cb_first, old_cb_num);
+            context1->CSSetConstantBuffers1(0, kCbs, old_cbs, old_cb_first, old_cb_num);
          else
-            context->CSSetConstantBuffers(0, 3, old_cbs);
+            context->CSSetConstantBuffers(0, kCbs, old_cbs);
          context->CSSetShaderResources(0, kSrvs, old_srvs);
          UINT keep_counts[kUavs] = { UINT(-1), UINT(-1) };
          context->CSSetUnorderedAccessViews(0, kUavs, old_uavs, keep_counts);
@@ -462,6 +481,14 @@ namespace RTAO
             element.offset = offset;
             element.per_instance = e.InputSlotClass == D3D11_INPUT_PER_INSTANCE_DATA;
          }
+         if (_stricmp(e.SemanticName, "VERTEX_TEXCOORD") == 0 && e.SemanticIndex == 0)
+         {
+            info.texcoord0.present = true;
+            info.texcoord0.format = e.Format;
+            info.texcoord0.slot = e.InputSlot;
+            info.texcoord0.offset = offset;
+            info.texcoord0.per_instance = e.InputSlotClass == D3D11_INPUT_PER_INSTANCE_DATA;
+         }
       }
       return info;
    }
@@ -573,11 +600,31 @@ namespace RTAO
 
    namespace
    {
+      // The first read of an "alpha_slots" texture in program order, and how its coordinate is formed (texture exact
+      // cutouts replay it: see rtao_alpha.h)
+      struct AlphaRead
+      {
+         bool found = false;
+         bool sampled = false; // sample*/gather4* (normalized uv), not ld (texel coordinates)
+         uint32_t address_type = 0; // Operand type of the coordinate: 1 input (v#), 0 temp (r#), other: unknown
+         // A temp coordinate's producer: "mov r, v#" (direct) or "mad r, v#, cbS[k], cbS[k]" (scale/bias at cbS[k])
+         bool direct = false;
+         bool scalebias = false;
+         uint32_t scalebias_cb_slot = 0, scalebias_register = 0;
+         // The reference, if the first use of the value read is "add r, value, l(-reference)" (vegetation: 0.5)
+         bool reference_found = false;
+         float reference = 0.5f;
+         // Internal: where the counted channel landed (temp register component), and whether its first use was seen
+         bool value_tracked = false, value_checked = false;
+         uint32_t value_register = 0, value_component = 0;
+      };
+
       // Forward data flow over the shader program: which temp register components hold a value derived from a read of
       // one of the "alpha_slots" textures, and whether a discard's condition (or an enclosing if) is such a value.
       // Per component for temps (r#), one flag per indexable temp array (x#). Conservative where it doesn't matter
-      // (all components a source operand selects taint every written component).
-      bool DiscardReadsTextures(const uint8_t* bytes, size_t code_size, const bool (&alpha_slots)[128])
+      // (all components a source operand selects taint every written component). "channel_mask": which channels of the
+      // texture read count (bit c: channel c, through the resource swizzle). "read": receives the first alpha read.
+      bool DiscardReadsTextures(const uint8_t* bytes, size_t code_size, const bool (&alpha_slots)[128], uint32_t channel_mask = 0xF, AlphaRead* read = nullptr)
       {
          auto u32 = [&](size_t offset) {
             uint32_t v;
@@ -604,13 +651,16 @@ namespace RTAO
 
          enum : uint32_t
          {
-            kTemp = 0, kIndexableTemp = 3, kImmediate32 = 4, kImmediate64 = 5, kResource = 7,
+            kTemp = 0, kInput = 1, kIndexableTemp = 3, kImmediate32 = 4, kImmediate64 = 5, kResource = 7, kConstantBuffer = 8,
          };
          struct Operand
          {
             uint32_t type;
             uint32_t index; // First index (register number), if any
             uint32_t components; // Bit mask: write mask (dest) or components read (source)
+            uint32_t index2; // Second index (cb#[index2]), if any
+            uint32_t swizzle; // Source component c reads component (swizzle >> 2c) & 3
+            uint32_t immediate; // Immediate32: the first value
          };
          // Decodes one operand at "i" (advanced past it). False if malformed.
          std::function<bool(size_t&, size_t, Operand&)> parse = [&](size_t& i, size_t end, Operand& op) -> bool {
@@ -624,16 +674,22 @@ namespace RTAO
                ext = token(i++) >> 31;
             }
             const uint32_t num_components = t & 3, selection = (t >> 2) & 3;
-            op = { (t >> 12) & 0xFF, 0, 0 };
+            op = { (t >> 12) & 0xFF, 0, 0, 0, 0xE4, 0 };
             if (num_components == 2)
             {
                if (selection == 0)
                   op.components = (t >> 4) & 0xF;
                else if (selection == 1)
+               {
+                  op.swizzle = (t >> 4) & 0xFF;
                   for (uint32_t c = 0; c < 4; c++)
                      op.components |= 1u << ((t >> (4 + 2 * c)) & 3);
+               }
                else
+               {
                   op.components = 1u << ((t >> 4) & 3);
+                  op.swizzle = ((t >> 4) & 3) * 0x55;
+               }
             }
             else if (num_components == 1)
             {
@@ -642,6 +698,8 @@ namespace RTAO
             if (op.type == kImmediate32 || op.type == kImmediate64)
             {
                const size_t count = num_components == 1 ? 1 : (num_components == 2 ? 4 : 0);
+               if (count && i < end)
+                  op.immediate = token(i);
                i += count * (op.type == kImmediate64 ? 2 : 1);
                return i <= end;
             }
@@ -655,6 +713,8 @@ namespace RTAO
                      return false;
                   if (d == 0)
                      op.index = token(i);
+                  else if (d == 1)
+                     op.index2 = token(i);
                   i++;
                }
                else if (representation == 1 || representation == 4) // Immediate64 (+ relative)
@@ -703,34 +763,116 @@ namespace RTAO
             return op == 45 || op == 46 || (op >= 69 && op <= 74) || op == 109 || (op >= 126 && op <= 128);
          };
 
-         for (size_t i = 2; i < tokens;)
-         {
+         // Decodes the instruction at "i": opcode, operands, end. False if malformed.
+         auto decode = [&](size_t i, uint32_t& op, size_t& end, Operand (&operands)[8], uint32_t& count) -> bool {
             const uint32_t t = token(i);
-            const uint32_t op = t & 0x7FF;
+            op = t & 0x7FF;
             const size_t length = op == kOpCustomData ? (i + 1 < tokens ? token(i + 1) : 0) : ((t >> 24) & 0x7F);
             if (length == 0 || i + length > tokens)
+               return false;
+            end = i + length;
+            count = 0;
+            if (op == kOpCustomData || is_declaration(op))
+               return true;
+            size_t j = i + 1;
+            for (uint32_t ext = t >> 31; ext && j < end;)
+               ext = token(j++) >> 31;
+            while (j < end && count < 8)
+               if (!parse(j, end, operands[count++]))
+                  return false;
+            return true;
+         };
+         std::vector<size_t> writers; // Per temp register component (4 per register): the last instruction writing it
+         bool read_recorded = false;
+
+         for (size_t i = 2; i < tokens;)
+         {
+            uint32_t op = 0, count = 0;
+            size_t end = 0;
+            Operand operands[8];
+            if (!decode(i, op, end, operands, count))
                return false; // Malformed
-            const size_t end = i + length;
             if (op == kOpCustomData || is_declaration(op))
             {
                i = end;
                continue;
             }
-            size_t j = i + 1;
-            for (uint32_t ext = t >> 31; ext && j < end;)
-               ext = token(j++) >> 31;
-            Operand operands[8];
-            uint32_t count = 0;
-            while (j < end && count < 8)
-               if (!parse(j, end, operands[count++]))
-                  return false;
             const uint32_t dests = (std::min)(dest_count(op), count);
+            if (read && read->value_tracked && !read->value_checked)
+            {
+               // The first instruction reading the value: "add r, value, l(-reference)"?
+               for (uint32_t k = dests; k < count; k++)
+               {
+                  const Operand& source = operands[k];
+                  if (source.type != kTemp || source.index != read->value_register || (source.components & (1u << read->value_component)) == 0)
+                     continue;
+                  read->value_checked = true;
+                  const Operand* other = (op == 0 && count == dests + 2) ? &operands[k == dests ? dests + 1 : dests] : nullptr;
+                  if (other && other->type == kImmediate32)
+                  {
+                     float value;
+                     std::memcpy(&value, &other->immediate, 4);
+                     if (-value > 0.f && -value < 1.f)
+                     {
+                        read->reference_found = true;
+                        read->reference = -value;
+                     }
+                  }
+                  break;
+               }
+               for (uint32_t k = 0; k < dests && !read->value_checked; k++)
+                  if (operands[k].type == kTemp && operands[k].index == read->value_register && (operands[k].components & (1u << read->value_component)) != 0)
+                     read->value_checked = true; // Overwritten unused
+            }
             bool tainted = false;
+            uint32_t read_mask = 0; // Dest components holding a counted channel of an alpha texture read
             for (uint32_t k = dests; k < count; k++)
             {
                tainted = tainted || taint_of(operands[k]);
-               if (reads_texture(op) && operands[k].type == kResource && operands[k].index < 128 && alpha_slots[operands[k].index])
-                  tainted = true;
+               if (reads_texture(op) && operands[k].type == kResource && operands[k].index < 128 && alpha_slots[operands[k].index] && dests > 0)
+               {
+                  for (uint32_t c = 0; c < 4; c++)
+                     if (channel_mask & (1u << ((operands[k].swizzle >> (2 * c)) & 3)))
+                        read_mask |= 1u << c;
+                  if (read && !read_recorded && count > dests)
+                  {
+                     // The coordinate (first source) and, for a temp, its producer
+                     read_recorded = true;
+                     const Operand& address = operands[dests];
+                     read->found = true;
+                     read->sampled = op != 45 && op != 46;
+                     const uint32_t value_components = read_mask & operands[0].components;
+                     if (operands[0].type == kTemp && value_components != 0)
+                     {
+                        read->value_tracked = true;
+                        read->value_register = operands[0].index;
+                        for (uint32_t c = 4; c-- > 0;)
+                           if (value_components & (1u << c))
+                              read->value_component = c;
+                     }
+                     read->address_type = address.type;
+                     const size_t writer_index = address.type == kTemp ? size_t(address.index) * 4 + (address.swizzle & 3) : SIZE_MAX;
+                     if (writer_index < writers.size() && writers[writer_index] != 0)
+                     {
+                        uint32_t w_op = 0, w_count = 0;
+                        size_t w_end = 0;
+                        Operand w[8];
+                        if (decode(writers[writer_index], w_op, w_end, w, w_count))
+                        {
+                           constexpr uint32_t kOpMad = 50, kOpMov = 54;
+                           if (w_op == kOpMov && w_count == 2 && w[1].type == kInput)
+                              read->direct = true;
+                           else if (w_op == kOpMad && w_count == 4 && w[1].type == kInput && w[2].type == kConstantBuffer && w[3].type == kConstantBuffer && w[2].index == w[3].index &&
+                              w[2].index2 == w[3].index2)
+                           {
+                              read->scalebias = true;
+                              read->scalebias_cb_slot = w[2].index;
+                              read->scalebias_register = w[2].index2;
+                           }
+                        }
+                     }
+                  }
+               }
             }
             for (uint32_t k = 0; k < dests; k++)
             {
@@ -738,16 +880,24 @@ namespace RTAO
                if (d.type == kTemp && d.index < 4096)
                {
                   if (d.index >= temps.size())
+                  {
                      temps.resize(d.index + 1, 0);
-                  temps[d.index] = uint8_t(tainted ? (temps[d.index] | d.components) : (temps[d.index] & ~d.components));
+                     writers.resize(size_t(d.index + 1) * 4, 0);
+                  }
+                  const uint32_t taint_mask = tainted ? d.components : (d.components & read_mask);
+                  temps[d.index] = uint8_t((temps[d.index] & ~d.components) | taint_mask);
+                  for (uint32_t c = 0; c < 4; c++)
+                     if (d.components & (1u << c))
+                        writers[size_t(d.index) * 4 + c] = i;
                }
                else if (d.type == kIndexableTemp && d.index < 4096)
                {
                   if (d.index >= indexable.size())
                      indexable.resize(d.index + 1, 0);
-                  indexable[d.index] |= tainted ? 1 : 0;
+                  indexable[d.index] |= (tainted || read_mask) ? 1 : 0;
                }
             }
+            tainted = tainted || read_mask != 0; // For a texture read used as an if/discard condition directly
             if (op == kOpIf)
                if_stack.push_back(tainted);
             else if (op == kOpEndIf && !if_stack.empty())
@@ -790,8 +940,84 @@ namespace RTAO
          for (UINT k = 0; k < (std::max)(bind.BindCount, 1u) && bind.BindPoint + k < 128; k++)
             alpha_slots[bind.BindPoint + k] = any = true;
       }
-      reflection->Release();
       out.alpha_tested = any && DiscardReadsTextures(static_cast<const uint8_t*>(code), code_size, alpha_slots);
+      if (out.alpha_tested)
+      {
+         // Which texture: the first slot that alone makes a discard depend on it. Which channel: alpha first.
+         AlphaRead read;
+         for (uint32_t slot = 0; slot < 128 && out.alpha_slot == kNoOffset; slot++)
+         {
+            if (!alpha_slots[slot])
+               continue;
+            bool single[128] = {};
+            single[slot] = true;
+            for (uint32_t channel : { 3u, 0u, 1u, 2u })
+            {
+               AlphaRead candidate;
+               if (DiscardReadsTextures(static_cast<const uint8_t*>(code), code_size, single, 1u << channel, &candidate))
+               {
+                  out.alpha_slot = slot;
+                  out.alpha_channel = channel;
+                  read = candidate;
+                  break;
+               }
+            }
+         }
+         // The alpha reference and the uv scale/bias (used variables only): same cbuffer in every alpha tested shader of
+         // the game's dump (PerInstanceCB, see RTAO_NOTES.md "Texture exact cutouts")
+         for (UINT c = 0; c < desc.ConstantBuffers; c++)
+         {
+            ID3D11ShaderReflectionConstantBuffer* cb = reflection->GetConstantBufferByIndex(c);
+            D3D11_SHADER_BUFFER_DESC cb_desc = {};
+            if (!cb || FAILED(cb->GetDesc(&cb_desc)) || !cb_desc.Name || cb_desc.Type != D3D_CT_CBUFFER)
+               continue;
+            uint32_t ref = kNoOffset, scalebias = kNoOffset;
+            for (UINT v = 0; v < cb_desc.Variables; v++)
+            {
+               D3D11_SHADER_VARIABLE_DESC var = {};
+               if (FAILED(cb->GetVariableByIndex(v)->GetDesc(&var)) || !var.Name || (var.uFlags & D3D_SVF_USED) == 0)
+                  continue;
+               if (strcmp(var.Name, "cb_defaultalphatest") == 0 || strcmp(var.Name, "cb_hairalphatest") == 0)
+                  ref = var.StartOffset;
+               else if (strcmp(var.Name, "cb_layer0_scalebias") == 0)
+                  scalebias = var.StartOffset;
+            }
+            if (ref == kNoOffset && scalebias == kNoOffset)
+               continue;
+            D3D11_SHADER_INPUT_BIND_DESC bind = {};
+            if (FAILED(reflection->GetResourceBindingDescByName(cb_desc.Name, &bind)))
+               continue;
+            if (out.material_cb_slot != kNoOffset && out.material_cb_slot != bind.BindPoint)
+               continue; // Spread over two cbuffers: keep the first (never seen in the game)
+            out.material_cb_slot = bind.BindPoint;
+            if (ref != kNoOffset)
+               out.alpha_ref_cb = ref;
+            if (scalebias != kNoOffset)
+               out.uv_scalebias_cb = scalebias;
+         }
+         // The coordinate of the alpha read: an interpolator as is, or "interpolator * cb_layer0_scalebias.xy + .zw" (the two
+         // forms of the 1406 non FX alpha tested shaders of the dump but 8). Anything else stays on the stochastic fallback.
+         if (read.found && read.sampled)
+         {
+            if (read.address_type == 1 || read.direct)
+            {
+               out.uv_scalebias_cb = kNoOffset;
+               out.texture_exact = true;
+            }
+            else if (read.scalebias && out.uv_scalebias_cb != kNoOffset && read.scalebias_cb_slot == out.material_cb_slot && read.scalebias_register * 16 == out.uv_scalebias_cb)
+            {
+               out.texture_exact = true;
+            }
+         }
+         if (!out.texture_exact)
+            out.uv_scalebias_cb = kNoOffset;
+         // Without a reference constant: the immediate the value is compared to (vegetation 0.5). Other forms (alpha against
+         // a dither pattern or a dissolve noise, ~160 shaders) keep 0.5, which approximates their coverage.
+         if (out.alpha_ref_cb == kNoOffset && read.reference_found)
+            out.alpha_ref = read.reference;
+         out.alpha_ref_exact = out.alpha_ref_cb != kNoOffset || read.reference_found;
+      }
+      reflection->Release();
       return true;
    }
 
@@ -1007,10 +1233,23 @@ namespace RTAO
       meshes.clear();
       context_records.clear();
       list_records.clear();
+      frame_identities.clear();
       executed.clear();
       for (auto& r : readback_records)
          r.clear();
       vertex_arena_used = index_arena_used = 0;
+      cutouts.Shutdown();
+      cutout_bindings = {};
+   }
+
+   bool GeometryCapture::InitCutouts(ID3D11Device* device, Interop& interop, ID3D11ComputeShader* strip_cs, std::string& error)
+   {
+      if (!ring11)
+      {
+         error = "capture not initialized";
+         return false;
+      }
+      return cutouts.Init(device, interop, strip_cs, error);
    }
 
    bool GeometryCapture::EnsureBufferCopy(ID3D11DeviceContext* context, ID3D11Buffer* buffer, bool, std::vector<Rec>& records)
@@ -1088,8 +1327,60 @@ namespace RTAO
       key = HashCombine(key, index_start);
       key = HashCombine(key, (uint64_t(draw.index_count) << 32) | uint64_t(draw.index_format));
 
+      // Per frame identity: the mesh plus everything that selects its instances' data. A second draw of it in the same
+      // frame (another pass) would capture the same instances again (or another per frame BLAS of the same pose).
+      uint64_t identity = 0;
+      if (dedup_enabled.load(std::memory_order_relaxed))
+      {
+         identity = HashCombine(key, uint64_t(uintptr_t(draw.instance_cb)));
+         identity = HashCombine(identity, (uint64_t(draw.instance_cb_first_constant) << 32) | draw.instance_cb_num_constants);
+         identity = HashCombine(identity, uint64_t(uintptr_t(draw.instance_buffer)));
+         identity = HashCombine(identity, uint64_t(uintptr_t(draw.instance_index)));
+         identity = HashCombine(identity, uint64_t(uintptr_t(draw.per_view_cb)) ^ (uint64_t(draw.per_view_cb_first_constant) << 44));
+         identity = HashCombine(identity, uint64_t(uintptr_t(draw.bones)));
+         identity = HashCombine(identity, uint64_t(draw.instance_count) | (uint64_t(draw.cutout) << 32) | (uint64_t(frame_mesh) << 33));
+         identity = HashCombine(identity, draw.binding_version);
+         identity |= 1; // Never 0
+         const std::lock_guard lock(mutex);
+         if (frame_identities.count(identity))
+         {
+            (frame_mesh ? stats.dedup_frame_meshes : stats.dedup_draws)++;
+            return true; // Its instances are in this frame's records already
+         }
+      }
+
       if (frame_mesh)
-         return CaptureFrameDraw(context, draw, key, index_start, index_size, dynamic_vertices);
+         return CaptureFrameDraw(context, draw, key, identity, index_start, index_size, dynamic_vertices);
+
+      // Texture exact cutouts: the draw's material (its alpha texture), whose mask is rendered at its first draw
+      uint64_t material = 0;
+      if (draw.cutout && draw.ps && draw.ps->texture_exact && draw.alpha_srv && draw.uv.buffer && draw.uv.stride && cutouts_exact.load(std::memory_order_relaxed))
+      {
+         const uint32_t uv_code = VertexFormatCode(draw.uv.format);
+         const uint32_t kind = uv_code & 15, components = (uv_code >> 4) & 15;
+         if ((kind == 1 || kind == 2 || kind == 3 || kind == 6) && components >= 2) // float, unorm, snorm, half (rtao_cutout.hlsli)
+         {
+            uint32_t tile = CutoutMaterials::kNoTile;
+            material = cutouts.AcquireMaterial(draw.alpha_srv, draw.ps->alpha_channel, tile);
+            if (tile != CutoutMaterials::kNoTile)
+            {
+               if (cutouts.RecordStrip(context, draw.alpha_srv, draw.ps->alpha_channel, tile))
+               {
+                  std::vector<Rec> strip(1, Rec{});
+                  strip[0].type = Rec::AlphaStrip;
+                  strip[0].mesh_key = material;
+                  strip[0].first_slot = tile;
+                  const std::lock_guard lock(mutex);
+                  QueueLocked(context, strip);
+               }
+               else
+               {
+                  cutouts.AbandonStrip(material, tile);
+               }
+            }
+         }
+      }
+      CutoutGeometry geometry;
 
       std::vector<Rec> local;
       uint32_t dst_slot;
@@ -1130,6 +1421,26 @@ namespace RTAO
             meshes.emplace(key, mesh);
             stats.meshes = meshes.size();
          }
+         if (material)
+         {
+            // TEXCOORD0 in the arena too (usually the same buffer as the positions), next to the mesh's indices
+            const int64_t uv_zero = int64_t(draw.uv.offset) + int64_t(draw.base_vertex) * int64_t(draw.uv.stride) + int64_t(draw.uv.element_offset);
+            auto ib = buffers.find(draw.index_buffer);
+            if (uv_zero < 0 || ib == buffers.end() || !EnsureBufferCopy(context, draw.uv.buffer, true, local))
+               material = 0;
+            else
+            {
+               const uint64_t index_offset = ib->second.arena_offset + index_start;
+               const uint64_t uv_offset = buffers[draw.uv.buffer].arena_offset + uint64_t(uv_zero);
+               geometry.index_offset = uint32_t(index_offset);
+               geometry.uv_offset = uint32_t(uv_offset);
+               geometry.uv_stride = draw.uv.stride;
+               geometry.uv_code = VertexFormatCode(draw.uv.format);
+               geometry.index32 = index_size == 4 ? 1 : 0;
+               if (index_offset > UINT32_MAX || uv_offset > UINT32_MAX)
+                  material = 0;
+            }
+         }
          dst_slot = uint32_t(ring_head % kRingSlots);
          ring_head += draw.instance_count;
       }
@@ -1139,7 +1450,10 @@ namespace RTAO
       params.instance_count = draw.instance_count;
       params.dst_slot = dst_slot;
       params.slot_mask = kRingSlots - 1;
-      const bool dispatched = DispatchCapture(context, params_cb, draw, params, capture_cs, nullptr, nullptr, nullptr, ring_uav, 0, (draw.instance_count + 63) / 64);
+      RTAO::DrawInfo capture_draw = draw;
+      if (!material)
+         capture_draw.ps = nullptr; // No reference/scale-bias reads
+      const bool dispatched = DispatchCapture(context, params_cb, capture_draw, params, capture_cs, nullptr, nullptr, nullptr, ring_uav, 0, (draw.instance_count + 63) / 64);
 
       const std::lock_guard lock(mutex);
       if (dispatched)
@@ -1150,7 +1464,11 @@ namespace RTAO
          record.mesh_key = key;
          record.first_slot = dst_slot;
          record.count = draw.instance_count;
+         record.material = draw.cutout ? material : 0;
+         record.geometry = geometry;
          local.push_back(record);
+         if (identity)
+            frame_identities.insert(identity);
          stats.draws_captured++;
          stats.instances_captured += draw.instance_count;
          if (draw.vs->wind)
@@ -1162,6 +1480,7 @@ namespace RTAO
          {
             stats.cutout_draws++;
             stats.cutout_instances += draw.instance_count;
+            cutouts.CountDraw(material != 0);
          }
       }
       else
@@ -1186,7 +1505,7 @@ namespace RTAO
       }
    }
 
-   bool GeometryCapture::CaptureFrameDraw(ID3D11DeviceContext* context, const DrawInfo& draw, uint64_t key, uint64_t index_start, uint32_t index_size, bool dynamic_vertices)
+   bool GeometryCapture::CaptureFrameDraw(ID3D11DeviceContext* context, const DrawInfo& draw, uint64_t key, uint64_t identity, uint64_t index_start, uint32_t index_size, bool dynamic_vertices)
    {
       const bool skinned = draw.vs->skinned;
       auto skip = [&](CaptureSkip reason) {
@@ -1401,6 +1720,8 @@ namespace RTAO
          record.index_count = index_count;
          record.index_format = soup ? DXGI_FORMAT_UNKNOWN : draw.index_format;
          local.push_back(record);
+         if (identity)
+            frame_identities.insert(identity);
          stats.draws_captured++;
          stats.instances_captured++;
          (skinned ? stats.skinned_captured : stats.dynamic_captured)++;
@@ -1422,6 +1743,10 @@ namespace RTAO
             auto it = buffers.find(record.buffer);
             if (it != buffers.end())
                it->second.executed = true;
+         }
+         else if (record.type == Rec::AlphaStrip)
+         {
+            cutouts.OnStripExecuted(record.mesh_key, record.first_slot); // Copied at the next D3D12 pass, whenever drawn
          }
          else if (after_ao_pass)
          {
@@ -1486,6 +1811,7 @@ namespace RTAO
       const std::lock_guard lock(mutex);
       frame++;
       after_ao_pass = false;
+      frame_identities.clear();
       // Command lists the game finished but never executed (or released)
       for (auto it = list_records.begin(); it != list_records.end();)
       {
@@ -1498,6 +1824,10 @@ namespace RTAO
                   auto b = buffers.find(record.buffer);
                   if (b != buffers.end() && !b->second.executed)
                      buffers.erase(b);
+               }
+               else if (record.type == Rec::AlphaStrip)
+               {
+                  cutouts.AbandonStrip(record.mesh_key, record.first_slot);
                }
             it = list_records.erase(it);
          }
@@ -1512,6 +1842,7 @@ namespace RTAO
          stats.late_records += executed.size();
          executed.clear();
       }
+      cutouts.OnPresent();
    }
 
    void GeometryCapture::OnDestroyBuffer(ID3D11Buffer* buffer)
@@ -1599,6 +1930,22 @@ namespace RTAO
             uint64_t index = 0;
             for (const auto& r : readback_records[slot])
             {
+               // Texture exact cutouts: the draw's uv scale/bias and alpha reference (capture_instances_cs wrote them next to
+               // every instance; they come from the draw's cbuffer, so its first instance has them) select its record
+               uint32_t cutout_record = kNoCutoutRecord;
+               if (r.material && (r.mask & kInstanceMaskCutout) && r.count)
+               {
+                  uint32_t words[3];
+                  std::memcpy(words, data + index * 64 + 52, sizeof(words));
+                  const float scalebias[4] = { HalfToFloat(words[0] & 0xFFFF), HalfToFloat(words[0] >> 16), HalfToFloat(words[1] & 0xFFFF), HalfToFloat(words[1] >> 16) };
+                  float alpha_ref;
+                  std::memcpy(&alpha_ref, &words[2], 4);
+                  bool finite = std::isfinite(alpha_ref);
+                  for (float v : scalebias)
+                     finite = finite && std::isfinite(v);
+                  if (finite)
+                     cutout_record = cutouts.ResolveRecord(r.material, r.geometry, scalebias, alpha_ref);
+               }
                for (uint32_t i = 0; i < r.count; i++, index++)
                {
                   const float* rows = reinterpret_cast<const float*>(data + index * 64);
@@ -1624,7 +1971,7 @@ namespace RTAO
                   }
                   float transform[3][4];
                   std::memcpy(transform, rows, sizeof(transform));
-                  tlas.AddInstance(key, r.mesh_key, transform, r.mask);
+                  tlas.AddInstance(key, r.mesh_key, transform, r.mask, cutout_record);
                   frame_instances++;
                   frame_cutouts += (r.mask & kInstanceMaskCutout) != 0;
                }
@@ -1674,7 +2021,7 @@ namespace RTAO
                remaining -= len;
                src = (src + len) % kRingSlots;
             }
-            readback_records[slot].push_back({ record.mesh_key, record.count, record.mask });
+            readback_records[slot].push_back({ record.mesh_key, record.count, record.mask, record.material, record.geometry });
          }
          flush();
          Transition(list, ring12, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_COMMON);
@@ -1771,6 +2118,10 @@ namespace RTAO
             frame_blases.EndFrame(ctx); // Evicts the BLASes of draws that went away
          }
       }
+
+      // 6) Texture exact cutouts: new masks into the atlas, the record table (after this frame's records were resolved above)
+      if (!cutouts.Record(list, info, retirer, vertex_arena12, cutout_bindings, error))
+         return false;
 
       const std::lock_guard lock(mutex);
       stats.frame_draws = frame_draws;

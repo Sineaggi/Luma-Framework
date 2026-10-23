@@ -36,8 +36,12 @@
 //    without the skinning: the buffer is only valid for this frame, so instead of the one-time arena copy, the bytes
 //    from the draw's vertex 0 to the buffer end are copied at every draw into a D3D11 only ring (kDynamicRingBytes),
 //    which skin_vertices_cs reads with no bones. Their index buffers (DEFAULT) still go through the arena.
+//  - Alpha tested draws (cutouts) with a replayable alpha test also get a material (texture exact cutouts, see
+//    rtao_alpha.h): the mask is rendered at the first draw of a material, the mesh's TEXCOORD0 stream goes into the arena,
+//    and capture_instances_cs writes the draw's uv scale/bias and alpha reference next to each instance's matrix.
 
 #include "rtao_accel.h"
+#include "rtao_alpha.h"
 #include "rtao_interop.h"
 
 #include <d3d11_1.h>
@@ -99,6 +103,16 @@ namespace RTAO
    {
       bool discard = false; // The bytecode has a discard instruction
       bool alpha_tested = false; // A discard depends on a read of a diffuse/opacity/alpha texture (not dithering, not dissolve)
+      // Texture exact cutouts (alpha_tested only, see rtao_alpha.h). The game's alpha test is
+      // "discard if tex[alpha_slot].a at (TEXCOORD0 * scalebias.xy + scalebias.zw) < reference".
+      bool texture_exact = false; // The alpha read's coordinate is one of the two forms above: the mask can be replayed
+      uint32_t alpha_slot = kNoOffset; // SRV slot of the texture whose read the discard depends on
+      uint32_t alpha_channel = 3; // Its channel the test reads (3: alpha)
+      uint32_t material_cb_slot = kNoOffset; // The cbuffer holding the two below (PerInstanceCB)
+      uint32_t alpha_ref_cb = kNoOffset; // cb_defaultalphatest / cb_hairalphatest, bytes. kNoOffset: "alpha_ref" below
+      float alpha_ref = 0.5f; // Hardcoded reference ("add r, alpha, l(-0.5)" in the vegetation shaders), 0.5 if not found
+      bool alpha_ref_exact = false; // The reference is a cbuffer value or a recognized hardcoded one (diagnostics)
+      uint32_t uv_scalebias_cb = kNoOffset; // cb_layer0_scalebias, bytes. kNoOffset: TEXCOORD0 as is
    };
    // True if the DXBC (SHEX/SHDR chunk) contains a discard instruction. No D3DReflect needed.
    bool DxbcHasDiscard(const void* code, size_t code_size);
@@ -122,6 +136,7 @@ namespace RTAO
       };
       Element skin_indices[2]; // VERTEX_SKININDICES0/1
       Element skin_weights[2]; // VERTEX_SKINWEIGHTS0/1
+      Element texcoord0; // VERTEX_TEXCOORD0 (texture exact cutouts)
    };
    // Resolves D3D11_APPEND_ALIGNED_ELEMENT offsets
    InputLayoutInfo ParseInputLayout(const D3D11_INPUT_ELEMENT_DESC* elements, uint32_t count);
@@ -139,10 +154,12 @@ namespace RTAO
       uint32_t row_cb[3];
       uint32_t depth_hack_cb;
       uint32_t record_row0;
-      uint32_t pad[2];
+      uint32_t alpha_ref_cb; // Cutouts: in the material cbuffer (b3), kNoOffset: alpha_ref_const
+      uint32_t uv_scalebias_cb; // Cutouts: in the material cbuffer (b3), kNoOffset: none
       uint32_t mvp_cb[4];
       uint32_t view_proj_cb;
-      uint32_t pad2[3];
+      float alpha_ref_const;
+      uint32_t pad2[2];
       // skin_vertices_cs only
       uint32_t skin_vertex_count; // Threads: vertices written
       uint32_t skin_dst_vertex; // First vertex in the skinned ring
@@ -200,6 +217,15 @@ namespace RTAO
       Stream skin_indices[2];
       Stream skin_weights[2];
       ID3D11ShaderResourceView* bones = nullptr; // The bound ro_matrices
+      // Cutouts, texture exact (ps->texture_exact): the pixel shader's alpha texture and material cbuffer, the TEXCOORD0 stream
+      const PixelShaderInfo* ps = nullptr;
+      ID3D11ShaderResourceView* alpha_srv = nullptr; // PS SRV at ps->alpha_slot
+      ID3D11Buffer* material_cb = nullptr; // PS cbuffer at ps->material_cb_slot
+      uint32_t material_cb_first_constant = 0, material_cb_num_constants = 0;
+      Stream uv;
+      // Changes whenever the game rewrote (Map DISCARD, on the recording thread) a buffer behind the draw's per instance
+      // bindings, so a draw only counts as a duplicate of an earlier one if its data can't have changed in between
+      uint64_t binding_version = 0;
    };
 
    struct CaptureStats
@@ -227,6 +253,9 @@ namespace RTAO
       uint64_t tlas_instances = 0;
       // Foliage: captured draws/instances of wind (vertex animated) and alpha tested (cutout) draws, cutouts read back last frame
       uint64_t wind_draws = 0, wind_instances = 0, cutout_draws = 0, cutout_instances = 0, frame_cutout_instances = 0;
+      // Skipped as duplicates of a draw captured earlier in the frame (same mesh and per instance bindings, e.g. the depth
+      // prepass and the G-buffer pass drawing the same objects): static draws, per frame (skinned/dynamic) meshes
+      uint64_t dedup_draws = 0, dedup_frame_meshes = 0;
    };
    enum CaptureSkip
    {
@@ -246,8 +275,17 @@ namespace RTAO
       // Skinned draws / draws with a DYNAMIC vertex buffer are captured only while these are set
       std::atomic<bool> skinning_enabled = true;
       std::atomic<bool> dynamic_enabled = true;
+      // Draws with the same identity as one captured earlier in the frame are skipped (see CaptureStats::dedup_draws)
+      std::atomic<bool> dedup_enabled = true;
       bool IsInitialized() const { return ring11 != nullptr; }
       void Shutdown();
+      // Texture exact cutouts (after Init). strip_cs: Luma_RTAO.hlsl "alpha_strip_cs". Without it cutouts stay stochastic.
+      bool InitCutouts(ID3D11Device* device11, Interop& interop, ID3D11ComputeShader* strip_cs, std::string& error);
+      bool IsCutoutsAvailable() { return cutouts.IsInitialized(); }
+      std::atomic<bool> cutouts_exact = true; // Cutout draws get materials only while set (UI)
+      // The trace's cutout resources for the frame (valid after Record, until the next one)
+      const CutoutBindings& GetCutoutBindings() const { return cutout_bindings; }
+      CutoutStats GetCutoutStats() { return cutouts.GetStats(); }
 
       // At a game draw, on the context recording it (any thread). Records the copies and the matrix dispatch.
       bool CaptureDraw(ID3D11DeviceContext* context, const DrawInfo& draw);
@@ -265,6 +303,7 @@ namespace RTAO
       void MarkAOPassDone();
       void OnPresent();
       void OnDestroyBuffer(ID3D11Buffer* buffer);
+      void OnDestroyTexture(ID3D11Resource* texture) { cutouts.OnDestroyTexture(texture); }
 
       // D3D12 side, inside an Interop recorder. Consumes the executed records: reads back 3 frames old matrices into
       // "tlas", builds the BLASes whose data has been copied (up to blas_budget), queues this frame's readback.
@@ -313,21 +352,24 @@ namespace RTAO
       };
       struct Rec
       {
-         enum Type : uint8_t { Instances, BufferCopy, FrameMesh } type;
+         enum Type : uint8_t { Instances, BufferCopy, FrameMesh, AlphaStrip } type;
          uint8_t mask; // Instances: TLAS instance mask (kInstanceMaskOpaque / kInstanceMaskCutout)
-         uint64_t mesh_key; // Instances, FrameMesh
-         uint32_t first_slot; // Instances: capture ring slot. FrameMesh: first vertex in the skinned ring.
+         uint64_t mesh_key; // Instances, FrameMesh. AlphaStrip: the material.
+         uint32_t first_slot; // Instances: capture ring slot. FrameMesh: first vertex in the skinned ring. AlphaStrip: the strip tile.
          uint32_t count; // Instances: instances. FrameMesh: vertices.
          ID3D11Buffer* buffer; // BufferCopy
          // FrameMesh, indexed (not soup) only: the game's indices in the arena
          uint64_t index_arena_offset;
          uint32_t index_count;
          DXGI_FORMAT index_format; // DXGI_FORMAT_UNKNOWN: soup
+         // Instances of a texture exact cutout draw: its material (0: none) and where its triangles/uvs are in the arena
+         uint64_t material;
+         CutoutGeometry geometry;
       };
 
       bool EnsureBufferCopy(ID3D11DeviceContext* context, ID3D11Buffer* buffer, bool vertex, std::vector<Rec>& records);
       // Skinned or dynamic vertex buffer draws: world space vertices for this frame (see the header comment)
-      bool CaptureFrameDraw(ID3D11DeviceContext* context, const DrawInfo& draw, uint64_t key, uint64_t index_start, uint32_t index_size, bool dynamic_vertices);
+      bool CaptureFrameDraw(ID3D11DeviceContext* context, const DrawInfo& draw, uint64_t key, uint64_t identity, uint64_t index_start, uint32_t index_size, bool dynamic_vertices);
       void CommitLocked(std::vector<Rec>& records);
       void QueueLocked(ID3D11DeviceContext* context, std::vector<Rec>& local);
 
@@ -364,6 +406,7 @@ namespace RTAO
       std::unordered_map<uint64_t, MeshEntry> meshes;
       std::vector<uint64_t> evictions;
       std::unordered_map<ID3D11DeviceContext*, std::vector<Rec>> context_records;
+      std::unordered_set<uint64_t> frame_identities; // Draws captured this frame (dedup), cleared at OnPresent
       struct ListRecords
       {
          std::vector<Rec> records;
@@ -380,9 +423,13 @@ namespace RTAO
          uint64_t mesh_key;
          uint32_t count;
          uint8_t mask;
+         uint64_t material; // Cutouts: see Rec
+         CutoutGeometry geometry;
       };
       std::vector<ReadbackRecord> readback_records[kFrameSlots];
       CaptureStats stats;
+      CutoutMaterials cutouts; // Own lock, taken after "mutex" when nested
+      CutoutBindings cutout_bindings;
    };
 
    struct GeometryCapture::PendingRecords

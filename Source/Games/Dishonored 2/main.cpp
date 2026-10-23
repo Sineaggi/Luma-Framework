@@ -190,8 +190,48 @@ namespace
    bool g_rtao_wind_meshes = true; // Capture wind meshes (config "RTAOWindMeshes")
    bool g_rtao_cutouts = true; // Capture alpha tested draws, as cutouts (config "RTAOCutouts")
    float g_rtao_cutout_opacity = 0.5f; // Chance a ray crossing a cutout triangle stops there (config "RTAOCutoutOpacity")
-   std::unordered_set<uint64_t> g_rtao_alpha_tested_ps; // Alpha tested pixel shaders, by native object pointer (under g_rtao_shader_mutex)
-   std::atomic<uint64_t> g_rtao_ps_reflected = 0, g_rtao_ps_discard = 0, g_rtao_ps_alpha_tested = 0;
+   bool g_rtao_cutouts_exact = true; // Texture exact cutouts: the material's alpha mask decides each hit (config "RTAOCutoutsExact")
+   std::unordered_map<uint64_t, RTAO::PixelShaderInfo> g_rtao_alpha_tested_ps; // Alpha tested pixel shaders, by native object pointer (under g_rtao_shader_mutex)
+   std::atomic<uint64_t> g_rtao_ps_reflected = 0, g_rtao_ps_discard = 0, g_rtao_ps_alpha_tested = 0, g_rtao_ps_texture_exact = 0;
+   // Trace cost (config "RTAOQuality"): Low = half resolution trace (a quarter of the rays, upsampled by the denoiser),
+   // Medium = full resolution with half of "RTAO Rays", High = full resolution with all of them
+   enum RTAOQuality : int
+   {
+      RTAO_QUALITY_LOW = 0,
+      RTAO_QUALITY_MEDIUM = 1,
+      RTAO_QUALITY_HIGH = 2,
+      RTAO_QUALITY_COUNT
+   };
+   int g_rtao_quality = RTAO_QUALITY_LOW;
+   // Cutouts decided once per ray (solid or absent) instead of per crossed triangle: no candidate loop (config "RTAOFastCutouts")
+   bool g_rtao_fast_cutouts = false;
+   // Skip draws that repeat one captured earlier in the frame (depth prepass + G-buffer pass) (config "RTAODedup")
+   bool g_rtao_dedup = true;
+   // Map(WRITE_DISCARD) of game buffers, per recording thread: buffer -> unique id of its last discard. Part of a draw's
+   // identity for the dedup, so a per instance buffer rewritten between two draws never makes them look the same.
+   std::atomic<uint64_t> g_rtao_discard_counter = 0;
+   thread_local std::unordered_map<ID3D11Resource*, uint64_t> t_rtao_discards;
+   void RTAONoteDiscard(ID3D11Resource* resource)
+   {
+      if (t_rtao_discards.size() > 8192)
+         t_rtao_discards.clear(); // Forgetting only makes later draws look different (no dedup), never the same
+      t_rtao_discards[resource] = ++g_rtao_discard_counter;
+   }
+   uint64_t RTAODiscardVersion(ID3D11Resource* resource)
+   {
+      if (!resource)
+         return 0;
+      auto it = t_rtao_discards.find(resource);
+      return it != t_rtao_discards.end() ? it->second : 0;
+   }
+   uint64_t RTAODiscardVersion(ID3D11ShaderResourceView* view)
+   {
+      if (!view)
+         return 0;
+      com_ptr<ID3D11Resource> resource;
+      view->GetResource(&resource);
+      return RTAODiscardVersion(resource.get());
+   }
    std::atomic<uint64_t> g_rtao_draws_alpha_tested = 0; // Main view draws with an alpha tested pixel shader
 
    // RT sun shadows (RTAO_NOTES.md "RT sun shadows"): the directional light's visibility, traced in the RTAO D3D12
@@ -346,6 +386,9 @@ struct GameDeviceDataDishonored2 final : public GameDeviceData
    // Snapshots for the UI (written by the recorder)
    std::atomic<uint64_t> rtao_blas_count = 0, rtao_blas_bytes = 0;
    std::atomic<uint32_t> rtao_tlas_instances = 0, rtao_gpu_us = 0;
+   // GPU time split (us): capture (readback, BLAS builds, per frame meshes), TLAS build, trace, denoise
+   std::atomic<uint32_t> rtao_gpu_capture_us = 0, rtao_gpu_tlas_us = 0, rtao_gpu_trace_us = 0, rtao_gpu_filter_us = 0;
+   int rtao_last_quality = -1;
    std::atomic<uint32_t> rtao_tlas_cutouts = 0;
 
    // RT sun shadows (after the RTAO objects, so they are destroyed first)
@@ -358,6 +401,7 @@ struct GameDeviceDataDishonored2 final : public GameDeviceData
    std::atomic<uint32_t> rtsun_gpu_us = 0, rtsun_record_failures = 0, rtsun_bound_draws = 0, rtsun_stale_draws = 0;
    std::atomic<bool> rtsun_logged_error = false;
    float rtsun_logged_dir[3] = {};
+   std::atomic<uint64_t> rtao_cutout_tests = 0, rtao_cutout_hits = 0, rtao_cutout_fallback_tests = 0; // Trace candidates last frame (read back late)
 };
 
 //TODOFT: Building shaders menu (apply gamma?)
@@ -409,6 +453,7 @@ public:
       native_shaders_definitions.emplace(CompileTimeStringHash("DS2 AO View PS"), ShaderDefinition{ "Luma_RTAO", reshade::api::pipeline_subobject_type::pixel_shader, nullptr, "ao_view_ps" });
       native_shaders_definitions.emplace(CompileTimeStringHash("DS2 RTAO Capture CS"), ShaderDefinition{ "Luma_RTAO", reshade::api::pipeline_subobject_type::compute_shader, nullptr, "capture_instances_cs" });
       native_shaders_definitions.emplace(CompileTimeStringHash("DS2 RTAO Skin CS"), ShaderDefinition{ "Luma_RTAO", reshade::api::pipeline_subobject_type::compute_shader, nullptr, "skin_vertices_cs" });
+      native_shaders_definitions.emplace(CompileTimeStringHash("DS2 RTAO Alpha Strip CS"), ShaderDefinition{ "Luma_RTAO", reshade::api::pipeline_subobject_type::compute_shader, nullptr, "alpha_strip_cs" });
       native_shaders_definitions.emplace(CompileTimeStringHash("DS2 RTAO Composite PS"), ShaderDefinition{ "Luma_RTAO", reshade::api::pipeline_subobject_type::pixel_shader, nullptr, "composite_ps" });
       native_shaders_definitions.emplace(CompileTimeStringHash("DS2 Pre DLSS CS"), ShaderDefinition{ "Luma_PreDLSS_CS", reshade::api::pipeline_subobject_type::compute_shader });
       native_shaders_definitions.emplace(CompileTimeStringHash("DS2 Post DLSS CS"), ShaderDefinition{ "Luma_PostDLSS_CS", reshade::api::pipeline_subobject_type::compute_shader });
@@ -494,12 +539,15 @@ public:
       g_rtao_capture_active = ray_traced;
       game_device_data.rtao_capture.skinning_enabled = g_rtao_skinned;
       game_device_data.rtao_capture.dynamic_enabled = g_rtao_dynamic;
+      game_device_data.rtao_capture.cutouts_exact = g_rtao_cutouts_exact;
+      game_device_data.rtao_capture.dedup_enabled = g_rtao_dedup;
       game_device_data.rtao_last_draw_frame = game_device_data.rtao_frame;
       g_rtao_main_depth_width = depth_desc.Width;
       g_rtao_main_depth_height = depth_desc.Height;
       RTAO::PassSettings settings = MakeRTAOSettings(output);
-      settings.reset_history = output != game_device_data.rtao_last_output;
+      settings.reset_history = output != game_device_data.rtao_last_output || g_rtao_quality != game_device_data.rtao_last_quality;
       game_device_data.rtao_last_output = output;
+      game_device_data.rtao_last_quality = g_rtao_quality;
 
       const bool immediate = native_device_context->GetType() == D3D11_DEVICE_CONTEXT_IMMEDIATE;
       if (!game_device_data.rtao_logged_context_type.exchange(true))
@@ -743,6 +791,13 @@ public:
          return false;
       }
       game_device_data.rtao_rt_ready = true;
+      // Texture exact cutouts: optional (without them cutouts stay stochastic)
+      const auto strip_cs = device_data.native_compute_shaders.find(CompileTimeStringHash("DS2 RTAO Alpha Strip CS"));
+      std::string cutout_error;
+      if (strip_cs == device_data.native_compute_shaders.end() || !strip_cs->second)
+         SetRTAOStatus("texture exact cutouts unavailable (alpha strip shader not compiled), cutouts stay stochastic", true);
+      else if (!game_device_data.rtao_capture.InitCutouts(native_device, rtao, strip_cs->second.get(), cutout_error))
+         SetRTAOStatus("texture exact cutouts unavailable (" + cutout_error + "), cutouts stay stochastic", true);
       if (game_device_data.rtao_capture.IsSkinningAvailable())
          SetRTAOStatus("ray tracing ready (geometry capture incl. skinned and dynamic meshes, BLAS/TLAS, RayQuery AO + denoiser)", false);
       else
@@ -763,11 +818,16 @@ public:
       std::memcpy(settings.cam_fwd, &cb_per_view_global.cb_wscamforwarddir, sizeof(settings.cam_fwd));
       settings.reversed_z = true; // Dishonored 2 renders with inverted depth (see the DLSS settings)
       settings.radius = (std::max)(g_rtao_radius, 0.01f);
-      settings.ray_count = uint32_t(std::clamp(g_rtao_rays, 1, 64));
+      const int rays = std::clamp(g_rtao_rays, 1, 64);
+      settings.ray_count = uint32_t(g_rtao_quality == RTAO_QUALITY_MEDIUM ? (std::max)(1, (rays + 1) / 2) : rays);
       settings.filter_mode = (output == RTAO_OUTPUT_AO) ? RTAO::FilterMode::Temporal : RTAO::FilterMode::Off;
+      // Half resolution needs the denoiser's upsample: the debug outputs stay at full resolution
+      settings.half_res = g_rtao_quality == RTAO_QUALITY_LOW && output == RTAO_OUTPUT_AO;
       settings.debug_mode = output == RTAO_OUTPUT_COVERAGE ? 3 : 0;
       settings.strength = g_rtao_strength;
       settings.cutout_opacity = std::clamp(g_rtao_cutout_opacity, 0.f, 1.f);
+      settings.cutout_mode = g_rtao_fast_cutouts ? 2 : 0;
+      settings.cutout_exact = g_rtao_cutouts_exact;
       return settings;
    }
 
@@ -782,12 +842,14 @@ public:
          g.rtao_timer.Begin(list, info.frame_slot);
          if (!g.rtao_capture.Record(list, info, g.rtao_blases, g.rtao_tlas, g.rtao_retirer, 64, error))
             return false;
+         g.rtao_timer.Mark(list, info.frame_slot);
          const RTAO::BuildContext ctx = { info.device, list, &g.rtao_retirer, info.submit_fence_value };
          D3D12_GPU_VIRTUAL_ADDRESS top = 0;
          uint32_t instances = 0;
          if (!g.rtao_tlas.Build(ctx, g.rtao_blases, info.frame_slot, top, instances, error))
             return false;
-         if (!g.rtao_pass.Record(list, info, top, settings, g.rtao_retirer, error))
+         g.rtao_timer.Mark(list, info.frame_slot);
+         if (!g.rtao_pass.Record(list, info, top, settings, g.rtao_retirer, error, &g.rtao_timer, &g.rtao_capture.GetCutoutBindings())) // Marks the end of the trace
             return false;
          g.rtao_timer.End(list, info.frame_slot);
          g.rtao_blas_count = g.rtao_blases.Count();
@@ -795,6 +857,14 @@ public:
          g.rtao_tlas_instances = instances;
          g.rtao_tlas_cutouts = g.rtao_tlas.LastCutoutCount();
          g.rtao_gpu_us = uint32_t(g.rtao_timer.LastMs() * 1000.0);
+         g.rtao_gpu_capture_us = uint32_t(g.rtao_timer.LastSpanMs(0) * 1000.0);
+         g.rtao_gpu_tlas_us = uint32_t(g.rtao_timer.LastSpanMs(1) * 1000.0);
+         g.rtao_gpu_trace_us = uint32_t(g.rtao_timer.LastSpanMs(2) * 1000.0);
+         g.rtao_gpu_filter_us = uint32_t(g.rtao_timer.LastSpanMs(3) * 1000.0);
+         const RTAO::AOPass::CutoutCounters counters = g.rtao_pass.GetCutoutCounters();
+         g.rtao_cutout_tests = counters.exact_tests;
+         g.rtao_cutout_hits = counters.exact_hits;
+         g.rtao_cutout_fallback_tests = counters.fallback_tests;
          if (has_sun)
             RecordRTSun(g, list, info, top, sun_settings); // Its own timer; a failure never fails the AO
          return true;
@@ -834,6 +904,8 @@ public:
       out.reversed_z = ao_settings.reversed_z;
       out.bias = ao_settings.bias;
       out.cutout_opacity = ao_settings.cutout_opacity;
+      out.cutout_mode = ao_settings.cutout_mode; // Fast cutouts
+      out.cutout_exact = ao_settings.cutout_exact; // Texture exact masks (the sun always traces at full resolution, whatever RTAO Quality)
       out.angular_diameter_deg = std::clamp(g_rtsun_angle, 0.f, 10.f);
       out.ray_count = uint32_t(std::clamp(g_rtsun_rays, 1, 16));
       const int output = std::clamp(g_rtsun_output, 0, int(RTSun::Output::Count) - 1);
@@ -866,7 +938,7 @@ public:
    static void RecordRTSun(GameDeviceDataDishonored2& g, ID3D12GraphicsCommandList4* list, const RTAO::RecordInfo& info, D3D12_GPU_VIRTUAL_ADDRESS top, const RTSun::SunSettings& sun_settings)
    {
       std::string error;
-      if (g.rtsun_pass.Record(list, info, top, sun_settings, g.rtao_retirer, error))
+      if (g.rtsun_pass.Record(list, info, top, sun_settings, g.rtao_retirer, error, &g.rtao_capture.GetCutoutBindings()))
       {
          g.rtsun_gpu_us = uint32_t(g.rtsun_pass.LastGpuMs() * 1000.0);
          if (g.rtsun_pass.TraceCount() == 1)
@@ -1320,11 +1392,25 @@ public:
                ", capture skips: format " + std::to_string(stats.skipped[RTAO::kSkipFormat]) + ", dynamic buffer " + std::to_string(stats.skipped[RTAO::kSkipBuffer]) + ", binding " + std::to_string(stats.skipped[RTAO::kSkipBinding]) +
                ", other " + std::to_string(stats.skipped[RTAO::kSkipOther]) + ", drawn after the AO pass " + std::to_string(stats.after_ao_records);
             reshade::log::message(reshade::log::level::info, reasons.c_str());
-            char foliage[384];
+            char foliage[768];
             snprintf(foliage, sizeof(foliage), "RTAO: foliage: wind draws captured %llu (%llu instances), alpha tested draws %llu (captured %llu, %llu instances), cutouts in the TLAS %u, pixel shaders alpha tested %llu of %llu with discard (%llu reflected)",
                (unsigned long long)stats.wind_draws, (unsigned long long)stats.wind_instances, (unsigned long long)g_rtao_draws_alpha_tested.load(), (unsigned long long)stats.cutout_draws,
                (unsigned long long)stats.cutout_instances, game_device_data.rtao_tlas_cutouts.load(), (unsigned long long)g_rtao_ps_alpha_tested.load(), (unsigned long long)g_rtao_ps_discard.load(),
                (unsigned long long)g_rtao_ps_reflected.load());
+            reshade::log::message(reshade::log::level::info, foliage);
+            static const char* quality_names[RTAO_QUALITY_COUNT] = { "low", "medium", "high" };
+            snprintf(buffer, sizeof(buffer), "RTAO: GPU last frame %.2f ms: capture %.2f, TLAS %.2f, trace %.2f, denoise %.2f (quality %s, %d rays, fast cutouts %d); per frame duplicates skipped: %llu draws, %llu per frame meshes",
+               game_device_data.rtao_gpu_us.load() / 1000.0, game_device_data.rtao_gpu_capture_us.load() / 1000.0, game_device_data.rtao_gpu_tlas_us.load() / 1000.0,
+               game_device_data.rtao_gpu_trace_us.load() / 1000.0, game_device_data.rtao_gpu_filter_us.load() / 1000.0, quality_names[std::clamp(g_rtao_quality, 0, int(RTAO_QUALITY_COUNT) - 1)], g_rtao_rays,
+               int(g_rtao_fast_cutouts), (unsigned long long)stats.dedup_draws, (unsigned long long)stats.dedup_frame_meshes);
+            reshade::log::message(reshade::log::level::info, buffer);
+            const RTAO::CutoutStats cutout = game_device_data.rtao_capture.GetCutoutStats();
+            snprintf(foliage, sizeof(foliage), "RTAO: texture exact cutouts %s: draws with a mask %llu / stochastic %llu, materials %llu (masked %llu, pending %llu), atlas slices %llu/%u (overflow %llu), records %llu (overflow %llu), strips %llu rendered %llu copied %llu deferred %llu abandoned, last frame candidates %llu masked (%llu solid) %llu stochastic, pixel shaders replayable %llu",
+               g_rtao_cutouts_exact ? (game_device_data.rtao_capture.IsCutoutsAvailable() ? "on" : "unavailable") : "off", (unsigned long long)cutout.draws_exact, (unsigned long long)cutout.draws_no_material,
+               (unsigned long long)cutout.materials, (unsigned long long)cutout.materials_ready, (unsigned long long)cutout.materials_pending, (unsigned long long)cutout.atlas_slices_used, RTAO::CutoutMaterials::kAtlasSlices,
+               (unsigned long long)cutout.atlas_overflow, (unsigned long long)cutout.records, (unsigned long long)cutout.record_overflow, (unsigned long long)cutout.strips_rendered, (unsigned long long)cutout.strips_copied,
+               (unsigned long long)cutout.strips_deferred, (unsigned long long)cutout.strips_abandoned, (unsigned long long)game_device_data.rtao_cutout_tests.load(), (unsigned long long)game_device_data.rtao_cutout_hits.load(),
+               (unsigned long long)game_device_data.rtao_cutout_fallback_tests.load(), (unsigned long long)g_rtao_ps_texture_exact.load());
             reshade::log::message(reshade::log::level::info, foliage);
          }
       }
@@ -1854,10 +1940,11 @@ public:
             g_rtao_ps_reflected++;
             g_rtao_ps_discard += info.discard;
             g_rtao_ps_alpha_tested += info.alpha_tested;
+            g_rtao_ps_texture_exact += info.texture_exact;
             if (info.alpha_tested)
             {
                const std::unique_lock lock(g_rtao_shader_mutex);
-               g_rtao_alpha_tested_ps.insert(pipeline.handle);
+               g_rtao_alpha_tested_ps[pipeline.handle] = info;
             }
          }
          else if (subobject.type == reshade::api::pipeline_subobject_type::input_layout && subobject.data)
@@ -1976,6 +2063,7 @@ public:
       context->PSGetShader(&ps, nullptr, nullptr);
       RTAO::VertexShaderInfo vs_info;
       RTAO::InputLayoutInfo layout_info;
+      RTAO::PixelShaderInfo ps_info;
       bool alpha_tested = false;
       {
          const std::shared_lock lock(g_rtao_shader_mutex);
@@ -1989,7 +2077,15 @@ public:
          auto layout_it = g_rtao_input_layouts.find(uint64_t(uintptr_t(layout.get())));
          if (layout_it != g_rtao_input_layouts.end())
             layout_info = layout_it->second;
-         alpha_tested = ps && g_rtao_alpha_tested_ps.count(uint64_t(uintptr_t(ps.get()))) != 0;
+         if (ps)
+         {
+            auto ps_it = g_rtao_alpha_tested_ps.find(uint64_t(uintptr_t(ps.get())));
+            if (ps_it != g_rtao_alpha_tested_ps.end())
+            {
+               alpha_tested = true;
+               ps_info = ps_it->second;
+            }
+         }
       }
       g_rtao_draws_alpha_tested += alpha_tested;
       // Foliage family toggles (UI): left out of the scene when off
@@ -2108,6 +2204,48 @@ public:
       draw.instance_index = instance_index.get();
       draw.per_view_cb = per_view_cb.get();
       draw.cutout = alpha_tested;
+      // Texture exact cutouts: the pixel shader's alpha texture and material cbuffer, and the TEXCOORD0 stream
+      com_ptr<ID3D11ShaderResourceView> alpha_srv;
+      com_ptr<ID3D11Buffer> material_cb, uv_buffer;
+      if (alpha_tested && g_rtao_cutouts_exact && ps_info.texture_exact && ps_info.alpha_slot != RTAO::kNoOffset && layout_info.texcoord0.present && !layout_info.texcoord0.per_instance)
+      {
+         context->PSGetShaderResources(ps_info.alpha_slot, 1, &alpha_srv);
+         if (ps_info.material_cb_slot != RTAO::kNoOffset)
+         {
+            com_ptr<ID3D11DeviceContext1> context1;
+            UINT first_constant = 0, num_constants = 0;
+            if (SUCCEEDED(context->QueryInterface(&context1)))
+               context1->PSGetConstantBuffers1(ps_info.material_cb_slot, 1, &material_cb, &first_constant, &num_constants);
+            else
+               context->PSGetConstantBuffers(ps_info.material_cb_slot, 1, &material_cb);
+            draw.material_cb_first_constant = first_constant;
+            draw.material_cb_num_constants = num_constants;
+         }
+         UINT uv_stride = 0, uv_offset = 0;
+         context->IAGetVertexBuffers(layout_info.texcoord0.slot, 1, &uv_buffer, &uv_stride, &uv_offset);
+         // A reference or scale/bias the shader reads from a cbuffer that isn't bound: no material
+         if (material_cb || (ps_info.alpha_ref_cb == RTAO::kNoOffset && ps_info.uv_scalebias_cb == RTAO::kNoOffset))
+         {
+            draw.ps = &ps_info;
+            draw.alpha_srv = alpha_srv.get();
+            draw.material_cb = material_cb.get();
+            draw.uv.buffer = uv_buffer.get();
+            draw.uv.stride = uv_stride;
+            draw.uv.offset = uv_offset;
+            draw.uv.element_offset = layout_info.texcoord0.offset;
+            draw.uv.format = layout_info.texcoord0.format;
+         }
+      }
+      if (g_rtao_dedup)
+      {
+         uint64_t version = RTAODiscardVersion(vertex_buffer.get()); // DYNAMIC vertex buffers (per frame meshes)
+         version = version * 0x9E3779B97F4A7C15ull + RTAODiscardVersion(instance_cb.get());
+         version = version * 0x9E3779B97F4A7C15ull + RTAODiscardVersion(instance_buffer.get());
+         version = version * 0x9E3779B97F4A7C15ull + RTAODiscardVersion(instance_index.get());
+         version = version * 0x9E3779B97F4A7C15ull + RTAODiscardVersion(bones.get());
+         version = version * 0x9E3779B97F4A7C15ull + RTAODiscardVersion(per_view_cb.get());
+         draw.binding_version = version;
+      }
 
       auto& device_data = *device->get_private_data<DeviceData>();
       if (device_data.game && !GetGameDeviceData(device_data).rtao_capture.CaptureDraw(context, draw))
@@ -2143,14 +2281,18 @@ public:
       auto* native = reinterpret_cast<ID3D11Resource*>(resource.handle);
       D3D11_RESOURCE_DIMENSION dimension = D3D11_RESOURCE_DIMENSION_UNKNOWN;
       native->GetType(&dimension);
-      if (dimension != D3D11_RESOURCE_DIMENSION_BUFFER)
+      if (dimension != D3D11_RESOURCE_DIMENSION_BUFFER && dimension != D3D11_RESOURCE_DIMENSION_TEXTURE2D)
          return;
       auto* device_data = device->get_private_data<DeviceData>();
       if (device_data && device_data->game)
       {
          auto& game_device_data = GetGameDeviceData(*device_data);
-         if (game_device_data.rtao_capture.IsInitialized())
+         if (!game_device_data.rtao_capture.IsInitialized())
+            return;
+         if (dimension == D3D11_RESOURCE_DIMENSION_BUFFER)
             game_device_data.rtao_capture.OnDestroyBuffer(static_cast<ID3D11Buffer*>(native));
+         else
+            game_device_data.rtao_capture.OnDestroyTexture(native); // Its cutout mask (if any) goes, the pointer may come back
       }
    }
 
@@ -2159,6 +2301,8 @@ public:
       if (device->get_api() != reshade::api::device_api::d3d11) // e.g. RTAO's D3D12 device
          return;
       ID3D11Buffer* buffer = reinterpret_cast<ID3D11Buffer*>(resource.handle);
+      if (access == reshade::api::map_access::write_discard && g_rtao_dedup && g_rtao_capture_active.load(std::memory_order_relaxed))
+         RTAONoteDiscard(buffer);
       // No need to convert to native DX11 flags
       if (access == reshade::api::map_access::write_only || access == reshade::api::map_access::write_discard || access == reshade::api::map_access::read_write)
       {
@@ -2454,6 +2598,11 @@ public:
       g_rtsun_rays = std::clamp(g_rtsun_rays, 1, 16);
       g_rtsun_output = std::clamp(g_rtsun_output, 0, int(RTSun::Output::Count) - 1);
       cb_luma_global_settings.GameSettings.RTSunMode = uint32_t(g_rtsun_mode);
+      reshade::get_config_value(runtime, NAME, "RTAOQuality", g_rtao_quality);
+      g_rtao_quality = std::clamp(g_rtao_quality, 0, int(RTAO_QUALITY_COUNT) - 1);
+      reshade::get_config_value(runtime, NAME, "RTAOFastCutouts", g_rtao_fast_cutouts);
+      reshade::get_config_value(runtime, NAME, "RTAODedup", g_rtao_dedup);
+      reshade::get_config_value(runtime, NAME, "RTAOCutoutsExact", g_rtao_cutouts_exact);
 
       auto& game_settings = cb_luma_global_settings.GameSettings;
       reshade::get_config_value(runtime, NAME, "BloomStrength", game_settings.BloomStrength);
@@ -2551,6 +2700,12 @@ public:
             g_rtao_radius = std::clamp(g_rtao_radius, 0.05f, 50.f);
          if (ImGui::IsItemDeactivatedAfterEdit())
             reshade::set_config_value(runtime, NAME, "RTAORadius", g_rtao_radius);
+         static const char* rtao_quality_names[RTAO_QUALITY_COUNT] = { "Low (half resolution trace)", "Medium (half the rays)", "High" };
+         if (ImGui::Combo("RTAO Quality", &g_rtao_quality, rtao_quality_names, RTAO_QUALITY_COUNT))
+            reshade::set_config_value(runtime, NAME, "RTAOQuality", g_rtao_quality);
+         if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("Ray tracing cost of RTAO (the scene is the same in all of them).\nLow: \"RTAO Rays\" at one pixel of each 2x2 block (cycling over 4 frames), upsampled by the denoiser: about a quarter of the trace cost.\nMedium: every pixel, half of \"RTAO Rays\".\nHigh: every pixel, all of \"RTAO Rays\".");
+         DrawResetButton(g_rtao_quality, int(RTAO_QUALITY_LOW), "RTAOQuality");
          if (ImGui::SliderInt("RTAO Rays", &g_rtao_rays, 1, 16))
             g_rtao_rays = std::clamp(g_rtao_rays, 1, 64);
          if (ImGui::IsItemDeactivatedAfterEdit())
@@ -2585,18 +2740,32 @@ public:
             ImGui::SetTooltip("Alpha tested geometry (leaves, grates, fences, hair cards) in the ray tracing scene, as partially occluding cutouts (see the opacity below).\nChanges apply to newly captured geometry; what is already in the scene ages out within a few seconds.");
          if (ImGui::SliderFloat("RTAO Cutout Opacity", &g_rtao_cutout_opacity, 0.f, 1.f, "%.2f"))
             g_rtao_cutout_opacity = std::clamp(g_rtao_cutout_opacity, 0.f, 1.f);
-         if (ImGui::IsItemDeactivatedAfterEdit())
+   if (ImGui::IsItemDeactivatedAfterEdit())
             reshade::set_config_value(runtime, NAME, "RTAOCutoutOpacity", g_rtao_cutout_opacity);
          if (ImGui::IsItemHovered())
-            ImGui::SetTooltip("How much alpha tested surfaces occlude: the chance that a ray crossing one stops there (their texture's holes are not traced).\n0 = left out, 1 = as solid as the rest (cheapest).");
+            ImGui::SetTooltip("How much alpha tested surfaces occlude: the chance that a ray crossing one stops there.\nWith \"texture exact\" on, only for the cutouts that have no alpha mask (yet).\n0 = left out, 1 = as solid as the rest (cheapest).");
          DrawResetButton(g_rtao_cutout_opacity, 0.5f, "RTAOCutoutOpacity");
+         if (ImGui::Checkbox("RTAO: fast cutouts", &g_rtao_fast_cutouts))
+            reshade::set_config_value(runtime, NAME, "RTAOFastCutouts", g_rtao_fast_cutouts);
+         if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("Decides once per ray whether cutouts are solid or absent (instead of at every crossed leaf), which skips the per triangle\ncandidate handling: cheaper in foliage (about a quarter of the trace there), slightly different AO under dense vegetation.\nWith \"texture exact\" on, the masks take precedence: the per ray coin only decides cutouts without a mask, so it saves nothing.");
+         if (ImGui::Checkbox("RTAO: skip repeated draws", &g_rtao_dedup))
+            reshade::set_config_value(runtime, NAME, "RTAODedup", g_rtao_dedup);
+         if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("Captures an object once per frame even if several passes draw it (depth prepass, G-buffer): saves the per draw\ncapture work on the game's render threads and duplicate per frame BLASes of characters. Turn off if geometry goes missing.");
+         if (ImGui::Checkbox("RTAO cutouts: texture exact", &g_rtao_cutouts_exact))
+            reshade::set_config_value(runtime, NAME, "RTAOCutoutsExact", g_rtao_cutouts_exact);
+         if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("Alpha tested surfaces occlude exactly where their texture is solid (leaf shaped AO), like the game's alpha test:\neach material's alpha is rendered once into a mask the rays test per hit.\nOff: every cutout uses the opacity above.");
 
          auto& game_device_data = GetGameDeviceData(device_data);
          if (game_device_data.rtao_capture.IsInitialized() && ImGui::TreeNode("RTAO stats"))
          {
             const RTAO::CaptureStats stats = game_device_data.rtao_capture.GetStats();
-            ImGui::Text("GPU time (capture readback, BLAS/TLAS builds, trace, denoise): %.2f ms", game_device_data.rtao_gpu_us.load() / 1000.0);
-            ImGui::Text("Draws seen %llu, captured %llu (%llu instances)", (unsigned long long)stats.draws_seen, (unsigned long long)stats.draws_captured, (unsigned long long)stats.instances_captured);
+            ImGui::Text("GPU time %.2f ms: capture (readback, BLAS builds, per frame meshes) %.2f, TLAS build %.2f, trace %.2f, denoise %.2f", game_device_data.rtao_gpu_us.load() / 1000.0,
+               game_device_data.rtao_gpu_capture_us.load() / 1000.0, game_device_data.rtao_gpu_tlas_us.load() / 1000.0, game_device_data.rtao_gpu_trace_us.load() / 1000.0, game_device_data.rtao_gpu_filter_us.load() / 1000.0);
+            ImGui::Text("Draws seen %llu, captured %llu (%llu instances), repeated in the frame (skipped) %llu + %llu per frame meshes", (unsigned long long)stats.draws_seen, (unsigned long long)stats.draws_captured,
+               (unsigned long long)stats.instances_captured, (unsigned long long)stats.dedup_draws, (unsigned long long)stats.dedup_frame_meshes);
             ImGui::Text("Main view draws by matrix source: none %llu, direct %llu, indexed %llu, cbuffer %llu, MVP %llu",
                (unsigned long long)g_rtao_draws_by_source[0].load(), (unsigned long long)g_rtao_draws_by_source[1].load(), (unsigned long long)g_rtao_draws_by_source[2].load(), (unsigned long long)g_rtao_draws_by_source[3].load(), (unsigned long long)g_rtao_draws_by_source[4].load());
             ImGui::Text("Unknown vertex shader %llu, unusable input layout %llu, GPU culled (indirect, not captured) %llu",
@@ -2612,7 +2781,18 @@ public:
             ImGui::Text("Foliage: wind draws captured %llu (%llu instances), alpha tested draws %llu (captured %llu, %llu instances), cutouts read back last frame %llu, in the TLAS %u",
                (unsigned long long)stats.wind_draws, (unsigned long long)stats.wind_instances, (unsigned long long)g_rtao_draws_alpha_tested.load(), (unsigned long long)stats.cutout_draws,
                (unsigned long long)stats.cutout_instances, (unsigned long long)stats.frame_cutout_instances, game_device_data.rtao_tlas_cutouts.load());
-            ImGui::Text("Pixel shaders reflected %llu: with discard %llu, alpha tested %llu", (unsigned long long)g_rtao_ps_reflected.load(), (unsigned long long)g_rtao_ps_discard.load(), (unsigned long long)g_rtao_ps_alpha_tested.load());
+            ImGui::Text("Pixel shaders reflected %llu: with discard %llu, alpha tested %llu (texture exact replayable %llu)", (unsigned long long)g_rtao_ps_reflected.load(), (unsigned long long)g_rtao_ps_discard.load(),
+               (unsigned long long)g_rtao_ps_alpha_tested.load(), (unsigned long long)g_rtao_ps_texture_exact.load());
+            {
+               const RTAO::CutoutStats cutout = game_device_data.rtao_capture.GetCutoutStats();
+               ImGui::Text("Texture exact cutouts (%s): draws with a mask %llu, stochastic %llu; materials %llu (masked %llu, pending %llu)", game_device_data.rtao_capture.IsCutoutsAvailable() ? "available" : "unavailable",
+                  (unsigned long long)cutout.draws_exact, (unsigned long long)cutout.draws_no_material, (unsigned long long)cutout.materials, (unsigned long long)cutout.materials_ready, (unsigned long long)cutout.materials_pending);
+               ImGui::Text("Alpha atlas slices %llu/%u (overflow %llu), records %llu (overflow %llu), strips rendered %llu, copied %llu, deferred %llu, abandoned %llu", (unsigned long long)cutout.atlas_slices_used,
+                  RTAO::CutoutMaterials::kAtlasSlices, (unsigned long long)cutout.atlas_overflow, (unsigned long long)cutout.records, (unsigned long long)cutout.record_overflow, (unsigned long long)cutout.strips_rendered,
+                  (unsigned long long)cutout.strips_copied, (unsigned long long)cutout.strips_deferred, (unsigned long long)cutout.strips_abandoned);
+               ImGui::Text("Cutout candidates last frame: masked %llu (%llu solid), stochastic %llu", (unsigned long long)game_device_data.rtao_cutout_tests.load(), (unsigned long long)game_device_data.rtao_cutout_hits.load(),
+                  (unsigned long long)game_device_data.rtao_cutout_fallback_tests.load());
+            }
             ImGui::Text("Skinned draws: main view %llu, captured %llu, skipped: instanced %llu, copy pending %llu", (unsigned long long)g_rtao_draws_skinned.load(), (unsigned long long)stats.skinned_captured,
                (unsigned long long)stats.skinned_instanced, (unsigned long long)stats.skinned_waiting);
             ImGui::Text("Dynamic meshes: captured %llu, skipped: instanced %llu, copy pending %llu, too large %llu", (unsigned long long)stats.dynamic_captured, (unsigned long long)stats.dynamic_instanced,
@@ -2695,6 +2875,9 @@ public:
          ImGui::Text("GPU time (trace + denoise + copy): %.2f ms", game_device_data.rtsun_gpu_us.load() / 1000.0);
          ImGui::Text("Traces %u, failed %u; screen shadows draws using it %u, using the game's (no fresh trace) %u", game_device_data.rtsun_pass.TraceCount(),
             game_device_data.rtsun_record_failures.load(), game_device_data.rtsun_bound_draws.load(), game_device_data.rtsun_stale_draws.load());
+         const RTAO::AOPass::CutoutCounters counters = game_device_data.rtsun_pass.GetCutoutCounters();
+         ImGui::Text("Cutout candidates last frame: with a mask %llu (%llu solid), stochastic fallback %llu", (unsigned long long)counters.exact_tests,
+            (unsigned long long)counters.exact_hits, (unsigned long long)counters.fallback_tests);
          ImGui::TreePop();
       }
    }

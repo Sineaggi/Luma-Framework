@@ -58,8 +58,7 @@ private:
    std::vector<std::pair<const void*, std::wstring>> files;
 };
 
-static V3 Add(V3 a, V3 b) { return { a.x + b.x, a.y + b.y, a.z + b.z }; }
-static V3 Scale(V3 a, float s) { return { a.x * s, a.y * s, a.z * s }; }
+// Add() and Scale() come from rtao_interop_test.cpp
 
 // Analytic visibility of the light at p (ground or box top, normal +y): the fraction of "samples" directions inside
 // the light's disc (half angle "radius", radians) that no box blocks

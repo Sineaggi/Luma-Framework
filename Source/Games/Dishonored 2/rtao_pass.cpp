@@ -48,6 +48,49 @@ namespace RTAO
          return SUCCEEDED(hr) ? resource : nullptr;
       }
 
+      ID3D12Resource* CreateBuffer(ID3D12Device* device, uint64_t size, D3D12_HEAP_TYPE type, D3D12_RESOURCE_STATES state, D3D12_RESOURCE_FLAGS flags, HRESULT& hr)
+      {
+         D3D12_RESOURCE_DESC desc = {};
+         desc.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+         desc.Width = size;
+         desc.Height = 1;
+         desc.DepthOrArraySize = 1;
+         desc.MipLevels = 1;
+         desc.SampleDesc.Count = 1;
+         desc.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+         desc.Flags = flags;
+         D3D12_HEAP_PROPERTIES heap = {};
+         heap.Type = type;
+         ID3D12Resource* resource = nullptr;
+         hr = device->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &desc, state, nullptr, IID_PPV_ARGS(&resource));
+         return SUCCEEDED(hr) ? resource : nullptr;
+      }
+
+      void TransitionBarrier(ID3D12GraphicsCommandList4* list, ID3D12Resource* resource, D3D12_RESOURCE_STATES before, D3D12_RESOURCE_STATES after)
+      {
+         D3D12_RESOURCE_BARRIER barrier = {};
+         barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+         barrier.Transition.pResource = resource;
+         barrier.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+         barrier.Transition.StateBefore = before;
+         barrier.Transition.StateAfter = after;
+         list->ResourceBarrier(1, &barrier);
+      }
+
+      // Descriptor 10 of the pass heap: the cutout atlas (a null Texture2DArray view without one)
+      void WriteAtlasDescriptor(ID3D12Device* device, ID3D12DescriptorHeap* heap, uint32_t descriptor_size, ID3D12Resource* atlas)
+      {
+         D3D12_CPU_DESCRIPTOR_HANDLE handle = heap->GetCPUDescriptorHandleForHeapStart();
+         handle.ptr += SIZE_T(10) * descriptor_size;
+         D3D12_SHADER_RESOURCE_VIEW_DESC srv = {};
+         srv.Format = DXGI_FORMAT_R8_UNORM;
+         srv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2DARRAY;
+         srv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+         srv.Texture2DArray.MipLevels = 1;
+         srv.Texture2DArray.ArraySize = atlas ? atlas->GetDesc().DepthOrArraySize : 1;
+         device->CreateShaderResourceView(atlas, &srv, handle);
+      }
+
       void UavBarrier(ID3D12GraphicsCommandList4* list, ID3D12Resource* const* resources, uint32_t count)
       {
          D3D12_RESOURCE_BARRIER barriers[4] = {};
@@ -112,14 +155,19 @@ namespace RTAO
       }
 
       // [0] CBV b0, [1] SRV t0 (TLAS), [2] table { SRV t1 }, [3] table { UAV u0..u3 }
-      D3D12_DESCRIPTOR_RANGE ranges[2] = {};
+      // Texture exact cutouts (rtao_cutout.hlsli): [4] SRV t2 (records), [5] SRV t3 (geometry arena), [6] table { SRV t4 }
+      // (atlas), [7] UAV u4 (counters), static sampler s0 (linear, wrap)
+      D3D12_DESCRIPTOR_RANGE ranges[3] = {};
       ranges[0].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
       ranges[0].NumDescriptors = 1;
       ranges[0].BaseShaderRegister = 1;
       ranges[1].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_UAV;
       ranges[1].NumDescriptors = 4;
       ranges[1].BaseShaderRegister = 0;
-      D3D12_ROOT_PARAMETER parameters[4] = {};
+      ranges[2].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
+      ranges[2].NumDescriptors = 1;
+      ranges[2].BaseShaderRegister = 4;
+      D3D12_ROOT_PARAMETER parameters[8] = {};
       parameters[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_CBV;
       parameters[0].Descriptor.ShaderRegister = 0;
       parameters[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_SRV;
@@ -130,11 +178,29 @@ namespace RTAO
       parameters[3].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
       parameters[3].DescriptorTable.NumDescriptorRanges = 1;
       parameters[3].DescriptorTable.pDescriptorRanges = &ranges[1];
+      parameters[4].ParameterType = D3D12_ROOT_PARAMETER_TYPE_SRV;
+      parameters[4].Descriptor.ShaderRegister = 2;
+      parameters[5].ParameterType = D3D12_ROOT_PARAMETER_TYPE_SRV;
+      parameters[5].Descriptor.ShaderRegister = 3;
+      parameters[6].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+      parameters[6].DescriptorTable.NumDescriptorRanges = 1;
+      parameters[6].DescriptorTable.pDescriptorRanges = &ranges[2];
+      parameters[7].ParameterType = D3D12_ROOT_PARAMETER_TYPE_UAV;
+      parameters[7].Descriptor.ShaderRegister = 4;
       for (auto& parameter : parameters)
          parameter.ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+      D3D12_STATIC_SAMPLER_DESC sampler = {};
+      sampler.Filter = D3D12_FILTER_MIN_MAG_MIP_LINEAR;
+      sampler.AddressU = sampler.AddressV = sampler.AddressW = D3D12_TEXTURE_ADDRESS_MODE_WRAP;
+      sampler.MaxLOD = D3D12_FLOAT32_MAX;
+      sampler.ComparisonFunc = D3D12_COMPARISON_FUNC_NEVER;
+      sampler.ShaderRegister = 0;
+      sampler.ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
       D3D12_ROOT_SIGNATURE_DESC root_desc = {};
-      root_desc.NumParameters = 4;
+      root_desc.NumParameters = 8;
       root_desc.pParameters = parameters;
+      root_desc.NumStaticSamplers = 1;
+      root_desc.pStaticSamplers = &sampler;
       ID3DBlob* blob = nullptr;
       ID3DBlob* blob_error = nullptr;
       HRESULT hr = serialize_root_signature(&root_desc, D3D_ROOT_SIGNATURE_VERSION_1, &blob, &blob_error);
@@ -200,6 +266,18 @@ namespace RTAO
          return false;
       }
       descriptor_size = device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+
+      dummy_buffer = CreateBuffer(device, 256, D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_FLAG_NONE, hr);
+      if (dummy_buffer)
+         counters = CreateBuffer(device, 256, D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS, hr);
+      if (counters)
+         counters_readback = CreateBuffer(device, kSlots * 16, D3D12_HEAP_TYPE_READBACK, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_FLAG_NONE, hr);
+      if (!counters_readback)
+      {
+         error = HResultString("RTAO cutout buffers", hr);
+         Shutdown(nullptr, 0);
+         return false;
+      }
       return true;
    }
 
@@ -228,7 +306,7 @@ namespace RTAO
       }
       D3D12_DESCRIPTOR_HEAP_DESC heap_desc = {};
       heap_desc.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
-      heap_desc.NumDescriptors = 10;
+      heap_desc.NumDescriptors = 11;
       heap_desc.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
       hr = device->CreateDescriptorHeap(&heap_desc, IID_PPV_ARGS(&heap));
       if (FAILED(hr))
@@ -259,6 +337,7 @@ namespace RTAO
             handle.ptr += descriptor_size;
          }
       }
+      WriteAtlasDescriptor(device, heap, descriptor_size, bound_atlas);
       width = info.ao_width;
       height = info.ao_height;
       generation = info.targets_generation;
@@ -266,7 +345,7 @@ namespace RTAO
       return true;
    }
 
-   bool AOPass::Record(ID3D12GraphicsCommandList4* list, const RecordInfo& info, D3D12_GPU_VIRTUAL_ADDRESS tlas, const PassSettings& settings, Retirer& retirer, std::string& error)
+   bool AOPass::Record(ID3D12GraphicsCommandList4* list, const RecordInfo& info, D3D12_GPU_VIRTUAL_ADDRESS tlas, const PassSettings& settings, Retirer& retirer, std::string& error, GpuTimer* timer, const CutoutBindings* cutouts)
    {
       if (!trace_pso || !tlas)
       {
@@ -277,6 +356,37 @@ namespace RTAO
          return false;
       if (settings.reset_history)
          has_history = false;
+      const uint32_t slot = info.frame_slot % kSlots;
+
+      // Texture exact cutouts: the atlas descriptor follows the bound atlas (it only changes when the capture restarts)
+      const bool exact = settings.cutout_exact && cutouts && cutouts->exact && cutouts->records && cutouts->arena && cutouts->atlas;
+      if (exact && cutouts->atlas != bound_atlas)
+      {
+         bound_atlas = cutouts->atlas;
+         WriteAtlasDescriptor(device, heap, descriptor_size, bound_atlas);
+      }
+      // Candidate counters written by the trace this slot's last use (monotonic: the difference is one frame's)
+      if (counters_pending[slot])
+      {
+         counters_pending[slot] = false;
+         const D3D12_RANGE range = { slot * 16, slot * 16 + 12 };
+         uint8_t* data = nullptr;
+         if (SUCCEEDED(counters_readback->Map(0, &range, reinterpret_cast<void**>(&data))) && data)
+         {
+            uint32_t values[3];
+            std::memcpy(values, data + slot * 16, sizeof(values));
+            if (counters_have_last)
+            {
+               cutout_counters.exact_tests = values[0] - counters_last[0];
+               cutout_counters.exact_hits = values[1] - counters_last[1];
+               cutout_counters.fallback_tests = values[2] - counters_last[2];
+            }
+            std::memcpy(counters_last, values, sizeof(values));
+            counters_have_last = true;
+            const D3D12_RANGE written = { 0, 0 };
+            counters_readback->Unmap(0, &written);
+         }
+      }
 
       PassConstants constants = {};
       std::memcpy(constants.inv_view_proj, settings.inv_view_proj, sizeof(constants.inv_view_proj));
@@ -302,7 +412,9 @@ namespace RTAO
       constants.debug_mode = settings.debug_mode;
       constants.strength = settings.strength;
       constants.cutout_opacity = settings.cutout_opacity;
-      const uint32_t slot = info.frame_slot % kSlots;
+      constants.trace_half_res = settings.half_res ? 1 : 0;
+      constants.cutout_mode = settings.cutout_mode;
+      constants.cutout_exact = exact ? 1 : 0;
       std::memcpy(constants_mapped + slot * kConstantsStride, &constants, sizeof(constants));
 
       D3D12_GPU_DESCRIPTOR_HANDLE table = heap->GetGPUDescriptorHandleForHeapStart();
@@ -316,11 +428,29 @@ namespace RTAO
       list->SetComputeRootShaderResourceView(1, tlas);
       list->SetComputeRootDescriptorTable(2, table);
       list->SetComputeRootDescriptorTable(3, uav_table);
+      D3D12_GPU_DESCRIPTOR_HANDLE atlas_table = heap->GetGPUDescriptorHandleForHeapStart();
+      atlas_table.ptr += UINT64(10) * descriptor_size;
+      list->SetComputeRootShaderResourceView(4, exact ? cutouts->records : dummy_buffer->GetGPUVirtualAddress());
+      list->SetComputeRootShaderResourceView(5, exact ? cutouts->arena->GetGPUVirtualAddress() : dummy_buffer->GetGPUVirtualAddress());
+      list->SetComputeRootDescriptorTable(6, atlas_table);
+      list->SetComputeRootUnorderedAccessView(7, counters->GetGPUVirtualAddress());
+      if (exact)
+         TransitionBarrier(list, cutouts->arena, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+      TransitionBarrier(list, counters, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
 
       const uint32_t groups_x = (info.ao_width + 7) / 8, groups_y = (info.ao_height + 7) / 8;
+      const uint32_t trace_w = settings.half_res ? (info.ao_width + 1) / 2 : info.ao_width, trace_h = settings.half_res ? (info.ao_height + 1) / 2 : info.ao_height;
       list->SetPipelineState(trace_pso);
-      list->Dispatch(groups_x, groups_y, 1);
+      list->Dispatch((trace_w + 7) / 8, (trace_h + 7) / 8, 1);
       UavBarrier(list, &raw, 1);
+      if (exact)
+         TransitionBarrier(list, cutouts->arena, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COMMON);
+      TransitionBarrier(list, counters, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE);
+      list->CopyBufferRegion(counters_readback, slot * 16, counters, 0, 16);
+      TransitionBarrier(list, counters, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_COMMON);
+      counters_pending[slot] = true;
+      if (timer)
+         timer->Mark(list, info.frame_slot);
       list->SetPipelineState(filter_pso);
       list->Dispatch(groups_x, groups_y, 1);
       ID3D12Resource* written[2] = { info.ao, history[1 - parity] };
@@ -343,6 +473,13 @@ namespace RTAO
          constants_mapped = nullptr;
       }
       Release(constants_upload, retirer, fence_value);
+      Release(dummy_buffer, retirer, fence_value);
+      Release(counters, retirer, fence_value);
+      Release(counters_readback, retirer, fence_value);
+      for (auto& pending : counters_pending)
+         pending = false;
+      counters_have_last = false;
+      bound_atlas = nullptr;
       Release(heap, retirer, fence_value);
       Release(raw, retirer, fence_value);
       Release(history[0], retirer, fence_value);
@@ -364,7 +501,7 @@ namespace RTAO
       frequency = timestamp_frequency;
       D3D12_QUERY_HEAP_DESC desc = {};
       desc.Type = D3D12_QUERY_HEAP_TYPE_TIMESTAMP;
-      desc.Count = kSlots * 2;
+      desc.Count = kSlots * kStamps;
       HRESULT hr = device->CreateQueryHeap(&desc, IID_PPV_ARGS(&heap));
       if (FAILED(hr))
       {
@@ -373,7 +510,7 @@ namespace RTAO
       }
       D3D12_RESOURCE_DESC buffer = {};
       buffer.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
-      buffer.Width = kSlots * 2 * sizeof(uint64_t);
+      buffer.Width = kSlots * kStamps * sizeof(uint64_t);
       buffer.Height = 1;
       buffer.DepthOrArraySize = 1;
       buffer.MipLevels = 1;
@@ -397,14 +534,21 @@ namespace RTAO
       if (!heap || !pending[frame_slot] || frequency == 0)
          return;
       pending[frame_slot] = false;
-      D3D12_RANGE range = { frame_slot * 16, frame_slot * 16 + 16 };
+      const uint32_t count = stamps[frame_slot];
+      if (count < 2)
+         return;
+      const SIZE_T base = SIZE_T(frame_slot) * kStamps * sizeof(uint64_t);
+      D3D12_RANGE range = { base, base + count * sizeof(uint64_t) };
       uint8_t* data = nullptr;
       if (SUCCEEDED(readback->Map(0, &range, reinterpret_cast<void**>(&data))) && data)
       {
-         uint64_t t[2];
-         std::memcpy(t, data + frame_slot * 16, sizeof(t));
-         if (t[1] >= t[0])
-            last_ms = double(t[1] - t[0]) * 1000.0 / double(frequency);
+         uint64_t t[kStamps];
+         std::memcpy(t, data + base, count * sizeof(uint64_t));
+         if (t[count - 1] >= t[0])
+            last_ms = double(t[count - 1] - t[0]) * 1000.0 / double(frequency);
+         last_spans = count - 1;
+         for (uint32_t i = 0; i + 1 < count; i++)
+            last_span_ms[i] = t[i + 1] >= t[i] ? double(t[i + 1] - t[i]) * 1000.0 / double(frequency) : 0.0;
          D3D12_RANGE written = { 0, 0 };
          readback->Unmap(0, &written);
       }
@@ -412,8 +556,21 @@ namespace RTAO
 
    void GpuTimer::Begin(ID3D12GraphicsCommandList* list, uint32_t frame_slot)
    {
-      if (heap)
-         list->EndQuery(heap, D3D12_QUERY_TYPE_TIMESTAMP, (frame_slot % kSlots) * 2);
+      if (!heap)
+         return;
+      frame_slot %= kSlots;
+      list->EndQuery(heap, D3D12_QUERY_TYPE_TIMESTAMP, frame_slot * kStamps);
+      stamps[frame_slot] = 1;
+   }
+
+   void GpuTimer::Mark(ID3D12GraphicsCommandList* list, uint32_t frame_slot)
+   {
+      if (!heap)
+         return;
+      frame_slot %= kSlots;
+      if (stamps[frame_slot] == 0 || stamps[frame_slot] >= kStamps - 1)
+         return; // No Begin, or out of marks (End keeps the last one)
+      list->EndQuery(heap, D3D12_QUERY_TYPE_TIMESTAMP, frame_slot * kStamps + stamps[frame_slot]++);
    }
 
    void GpuTimer::End(ID3D12GraphicsCommandList* list, uint32_t frame_slot)
@@ -421,8 +578,10 @@ namespace RTAO
       if (!heap)
          return;
       frame_slot %= kSlots;
-      list->EndQuery(heap, D3D12_QUERY_TYPE_TIMESTAMP, frame_slot * 2 + 1);
-      list->ResolveQueryData(heap, D3D12_QUERY_TYPE_TIMESTAMP, frame_slot * 2, 2, readback, frame_slot * 16);
+      if (stamps[frame_slot] == 0)
+         return;
+      list->EndQuery(heap, D3D12_QUERY_TYPE_TIMESTAMP, frame_slot * kStamps + stamps[frame_slot]++);
+      list->ResolveQueryData(heap, D3D12_QUERY_TYPE_TIMESTAMP, frame_slot * kStamps, stamps[frame_slot], readback, UINT64(frame_slot) * kStamps * sizeof(uint64_t));
       pending[frame_slot] = true;
    }
 

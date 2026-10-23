@@ -1,4 +1,44 @@
-# RTAO notes: geometry capture in Dishonored 2 (Void Engine)
+# RTAO: ray traced ambient occlusion for Dishonored 2
+
+## Summary
+
+Luma's "Ambient Occlusion" setting picks one of: Off, HBAO+ (the game's own, through its r_hbao cvar), XeGTAO, or
+RTAO. RTAO replaces the game's SSAO pass with AO ray traced on a side D3D12 device (DXR 1.1 RayQuery, same GPU,
+shared textures + a shared fence), against geometry captured from the game's own draws:
+
+- **Scene:** static meshes (all matrix families, including MVP-only props), skinned characters and bone-animated
+  props, and meshes with CPU-written (DYNAMIC) vertex buffers, both rebuilt and refit every frame. Wind vegetation
+  is in its rest pose. Alpha-tested cutouts are partly transparent. Off-screen static geometry is retained for 180
+  frames once seen in 4. Geometry drawn after the AO pass, the UI, particles, water and the first-person view model
+  are left out.
+- **Pass:** cosine-distributed rays from the depth-reconstructed position, then a cross-bilateral + temporal
+  denoiser (ported from the user's Fallout 4 RtShadows), then a power curve (Strength).
+- **Cost (RTX 4090, 3440x1440):** about 0.8 ms indoors and 2.3 ms on the Karnaca docks before the performance work.
+  The quality modes / dedup aim at about 1 ms there (not yet measured in game).
+
+Panel (Luma settings, "Ambient Occlusion" section) and config keys (ReShade.ini, `[Luma]`):
+
+| UI | Key | Default | Notes |
+| --- | --- | --- | --- |
+| Ambient Occlusion | AOMode | 1 (XeGTAO) | 0 Off, 1 XeGTAO, 2 RTAO, 3 HBAO+; the old XeGTAOEnable is migrated |
+| View AO only (debug) | (not saved) | Off | Final AO (after the game's blur, any mode), or RTAO output |
+| RTAO Output | RTAOTestOutput | 0 | Ray traced AO, test pattern, depth test, BLAS coverage, no denoiser |
+| RTAO Strength | RTAOStrength | 2 | Power curve (>1 darker) |
+| RTAO Radius / Rays | RTAORadius / RTAORays | 1.5 / 4 | World units / rays per traced pixel |
+| RTAO Quality | RTAOQuality | 0 Low | Low: 1 of 4 pixels traced per frame + upsample; Medium: 2 rays; High |
+| RTAO Capture | RTAOCapturePass | 1 | Depth-only draws, or all depth-writing draws |
+| RTAO: skinned characters / dynamic meshes | RTAOSkinned / RTAODynamic | on | Per-frame BLAS |
+| RTAO: wind meshes / alpha tested cutouts | RTAOWindMeshes / RTAOCutouts | on | |
+| RTAO Cutout Opacity / fast cutouts | RTAOCutoutOpacity / RTAOFastCutouts | 0.5 / off | |
+| RTAO: skip repeated draws | RTAODedup | on | One capture per object per frame |
+
+Known limits: instanced skinned draws (crowds) and GPU-culled indirect draws are not captured (0 seen so far).
+Wind sway isn't replayed. Cutouts are statistically, not texture, exact (work in progress). A moving object only
+occludes from the frames it is drawn in (no off-screen retention). Needs a DXR 1.1 GPU; it falls back to XeGTAO
+otherwise. Tested on an RTX 4090 only. The standalone GPU test (`Tests/rtao_interop_test.cpp`) covers the interop,
+capture, BLAS/TLAS, trace and denoiser offline.
+
+# Geometry capture in Dishonored 2 (Void Engine)
 
 Offline analysis, 2026-10-23. Source: the 6185 vertex shaders and 48 compute shaders Luma dumped while the game
 ran (`<game>\Luma\Dishonored 2\Dump\0x*.vs_5_0.cso`). That is the set the game really created, so the game's
@@ -173,6 +213,95 @@ the ray noise. Opacity 1 traces with `RAY_FLAG_FORCE_OPAQUE` (no candidates: the
 cutouts out. Standalone test (320x180, RTX 4090): ground AO next to a cutout box 0.987 / 0.801 / 0.667 at opacity
 0 / 0.5 / 1, RT pass 0.144 / 0.152 / 0.144 ms; opaque geometry never produces candidates, so its cost is unchanged.
 
+## Texture exact cutouts
+
+Implemented (rtao-alpha, `rtao_alpha.{h,cpp}`, `Shaders/rtao_cutout.hlsli`, UI "RTAO cutouts: texture exact", default
+on): a cutout candidate is committed only where the material's alpha passes the game's test, so leaves cast leaf shaped
+AO. The stochastic opacity stays as the fallback for cutouts without a mask.
+
+What the game tests, from the dump (`ReflectPixelShader`, all 1414 non FX alpha tested pixel shaders checked with a scan
+of their disassembly): `discard if tex.a < reference` with
+- the coordinate either an interpolator as is (414 shaders) or `interpolator * cb_layer0_scalebias.xy + .zw` (992); the
+  bytecode pass finds the alpha read and the instruction producing its coordinate (`mov r, v#` / `mad r, v#, cb2[k],
+  cb2[k]`) instead of trusting "scalebias is used": 128 shaders use it for other maps but read the alpha at the raw
+  uv (e.g. hair 0x00C4313E). 8 shaders form the coordinate otherwise (parallax, panning): they stay stochastic;
+- the channel: alpha in 1410, red in 4 (single channel opacity maps), found by the same data flow per channel;
+- the reference: `cb_defaultalphatest` / `cb_hairalphatest` in PerInstanceCB (cb2) in 1099, an immediate in 151 (the
+  `add r, a, l(-0.5)` of the vegetation shaders), 164 compare against something else (a dither pattern, a dissolve noise,
+  `alpha * vertex color`): 0.5 there, which approximates the coverage. The vertex color factor some shaders apply
+  (`lerp(1, color.a, cb_layer0_colorconstant.w)`, e.g. 0x048591C8) is ignored.
+- the uv is VERTEX_TEXCOORD0 (the vertex shaders pass it through, e.g. 0x65471A10 `mov o0, v3.xyxy`): assumed for all.
+
+Pipeline (details in rtao_alpha.h):
+- material = (alpha texture resource, channel). At its first cutout draw, `alpha_strip_cs` (Luma_RTAO.hlsl) samples the
+  bound SRV, mip aware (trilinear at the mip nearest 256, supersampled past the view's last mip), into a private 256x256
+  R8 UAV texture, copied into a tile of a shared R8 strip (D3D12 created render target: the only kind D3D11 opens). Ring
+  of 64 tiles, 16 new masks per D3D12 pass at most (the rest come at later draws). The recorder copies executed tiles into
+  a private Texture2DArray (1024 slices of 256x256 R8, 64 MB, first come first served; freed when the texture is
+  destroyed; overflow counted). Rendered once more 240 frames later (streamed mips).
+- per instance: `capture_instances_cs` reads the draw's uv scale/bias and reference from the pixel shader's material
+  cbuffer (bound at b3) and writes them (halves + float) in the spare 12 bytes of the instance's ring entry. The readback
+  turns (material, mesh arena offsets, TEXCOORD0 stream, scale/bias, reference) into a 48 byte record (65536 max, ids
+  recycled once unused longer than the TLAS keeps an instance), whose id goes in the low 23 bits of the cutout's
+  InstanceID. The TEXCOORD0 buffer is copied into the arena like the positions (often the same buffer).
+- trace: per candidate, 3 indices + 3 uvs from the arena (root SRV over the whole arena), barycentric interpolation,
+  scale/bias, one bilinear (wrap) sample of the slice at mip 0, `alpha >= reference`. Counters per frame (masked tests,
+  solid, stochastic tests) are read back for the UI/log.
+
+Measured (standalone test, RTX 4090, while the game ran on the same GPU): a wall with a BC3 2x2 alpha checker, ground AO
+in front of the solid / hole quadrant 0.687 / 0.992 (stochastic 0.5: 0.837 / 0.845); a uv bias of 0.5 in the material
+cbuffer swaps them (0.991 / 0.683). Cost, 1920x1080, 4 rays, 16 stacked cutout layers (1.2M cutout candidates per frame,
+`RTAO_PERF=1`): AO pass 0.208 ms texture exact, 0.205 ms stochastic, 0.174 ms all opaque. The candidates dominate, the
+mask test itself is close to free; candidate count (the BVH traversal) is what the perf track should look at.
+
+Not covered: skinned/dynamic (per frame) cutouts (hair on characters) are still added as opaque instances; GPU culled
+(indirect) foliage isn't captured at all; alpha tested geometry in the shadow/other views doesn't matter here.
+
+With the perf track's options: texture exact works in every "RTAO Quality" (the half resolution trace of Low runs the
+same candidate loop) and the masks take precedence over "Fast cutouts": with texture exact on, the per ray coin only
+decides the cutouts that have no mask (instead of the per crossing coin), and no ray wide shortcut (forcing all cutouts
+opaque, or masking them out) is taken, so fast cutouts saves nothing there; turn texture exact off to get its traversal
+savings back. Bench (`bench`: 3440x1440 street, round leaf masks covering ~half of each card on the 652 foliage
+instances, medians, error against a 128 ray reference of the same cutout model): High 4 rays 1.180 ms texture exact vs
+1.144 ms stochastic (trace 0.878 / 0.843), Medium 0.762 / 0.733, Low 0.546 / 0.534 (trace 0.233 / 0.222), Low with fast
+cutouts 0.546 exact / 0.481 stochastic; errors unchanged (High 0.0199 / 0.0203 static, Low 0.0202 / 0.0205).
+
+## Performance (rtao-perf)
+
+In game (Karnaca docks, 3440x1440, RTX 4090) the RT pass took 2.29 ms (indoors ~0.8). The standalone benchmark
+(`Tests/rtao_interop_test.exe bench`: a street of 2821 instances, 652 of them foliage cutouts of 250 to 1200 overlapping
+leaf cards, 1M triangles, depth rasterized by D3D11, medians over 60 frames) splits the old pass (High, 4 rays) into
+TLAS build 0.17 ms, trace 0.86 ms (0.69 with cutouts forced opaque, 0.50 with them masked out: the per crossing
+candidate loop costs ~0.2 to 0.4 ms there), denoise 0.18 ms.
+- TLAS build: ~0.03 ms fixed + ~0.05 ms per 1000 instances; neither FAST_TRACE nor a default heap copy of the instance
+  descs helps. Not touched (distance culling would need instance bounds the CPU doesn't have).
+- Denoise: the 3x3 neighbourhood (raw value + world position from depth) is loaded once per 8x8 group into groupshared
+  memory instead of 9 times per pixel: 0.18 -> 0.14 ms, same output.
+- "RTAO Quality" (config `RTAOQuality`, default Low): Low traces "RTAO Rays" at one pixel per 2x2 block (position
+  cycling over 4 frames, `kTraceJitter`), and the denoiser's bilateral (plus a 1.5 px gaussian) upsamples it; Medium
+  traces every pixel with half the rays; High is the old pass. Bench totals: High 1.22 ms, Medium 0.73, Low 0.53. Mean
+  abs error of the denoised AO against a 128 ray reference: High 0.0203 static / 0.0251 after a camera move, Medium
+  0.0224 / 0.0272, Low 0.0205 / 0.0250 (and the least frame to frame flicker): the denoiser hides the lower ray count,
+  Low only looks a bit softer on fine detail. Debug outputs (raw, coverage) always trace at full resolution.
+- "Fast cutouts" (config `RTAOFastCutouts`, default off): one coin per ray instead of one per crossed cutout triangle
+  (the ray treats all cutouts as solid with probability 1 - (1 - opacity)^2, else masks them out), so traversal never
+  returns candidates: trace 0.86 -> 0.64 ms at High, 0.22 -> 0.17 at Low. Error 0.0203 -> 0.0250: thin single layers
+  occlude a bit more, dense canopies a bit less than per crossing.
+- GPU time split: GpuTimer::Mark; the UI ("RTAO stats") and the periodic log show capture / TLAS / trace / denoise.
+
+### Duplicate draws (dedup, config `RTAODedup`, default on)
+
+With "All depth writing draws", an object drawn by the depth prepass and again by a depth writing G-buffer pass was
+captured twice: two matrix dispatches on the game's thread, two readback entries (merged by the TLAS key anyway) and,
+for skinned/dynamic meshes, two skinning dispatches and two per frame BLASes at the same place. A draw is now skipped if
+one with the same identity was captured earlier in the frame: mesh key + bound PerInstanceCB (object, first/num
+constants) + instance buffer and index SRVs + PerViewCB (MVP family) + bone palette SRV + instance count + cutout flag +
+a binding version. The version guards against a buffer the game rewrites between draws (a small per draw cbuffer
+updated with Map DISCARD would otherwise make every draw of the mesh look the same): main.cpp's map hook gives each
+Map(WRITE_DISCARD) a unique id, kept per recording thread, and the draw mixes in the ids of its vertex buffer, cbuffers
+and the resources behind its SRVs. Not covered: buffers rewritten with UpdateSubresource/copies, or by another thread
+between the two draws (a ring wrapping mid frame); the worst case is an object missing for that frame (retention hides
+it for static objects). Counted in "RTAO stats" and the log ("per frame duplicates skipped").
 Texture exact path (not implemented): the coverage the game really uses is `diffuse.a` (times
 `lerp(1, VERTEX_COLOR.a, cb)` in some shaders) at `uv * cb_layer0_scalebias.xy + .zw`, against the reference.
 - Masks: per alpha tested material (key: the bound diffuse texture), a D3D11 pass renders its alpha (with the
@@ -274,8 +403,17 @@ the trace uses the direction from a few frames ago, which is fine for a light th
 - Trace (`rtsun_trace.hlsl`): per pixel of the AO target, from the depth reconstructed world position, offset along
   the depth normal like the AO (`bias + 0.002 * view depth`), `RayCount` RayQuery rays toward the light, jittered
   uniformly over the light's disc (F4 RtShadows' ConeSampleDisk, `tan(angular diameter / 2)`), TMax 2000. A
-  geometric normal facing away from the light (N.L < -0.05) is shadowed without rays. Cutouts as in the AO trace
-  (stochastic with the RTAO cutout opacity). Denoiser (`rtsun_filter.hlsl`): the RTAO one, own history.
+  geometric normal facing away from the light (N.L < -0.05) is shadowed without rays. Cutouts exactly as the AO
+  trace: it includes `rtao_cutout.hlsli` and binds the same resources (root parameters 4..7, static sampler s0,
+  heap descriptor 10 = atlas, from `GeometryCapture::GetCutoutBindings`), so a cutout candidate is tested against its
+  material's alpha mask (texture exact, "RTAO: texture exact cutouts"), and falls back to the RTAO cutout opacity
+  (per crossing, or per ray with fast cutouts) when it has no mask. Own candidate counters (RT sun stats).
+  Denoiser (`rtsun_filter.hlsl`): the RTAO one, own history.
+- Resolution: always the full AO target resolution, whatever "RTAO Quality" says. Low's half resolution
+  checkerboard + depth aware upsample suits AO (low frequency), but a sun shadow is a hard, high contrast edge
+  (contact shadows, thin casters, leaf masks): at half resolution it would blur and crawl along every edge, and the
+  traced mask then also goes through the game's own bilateral blur. The sun's cost is controlled by its own ray count
+  instead (default 1 per pixel, about one AO ray's cost); Medium's "half the rays" has nothing to halve at 1.
 - The pass owns its D3D12 output (R16_UNORM UAV) and a texture shared with D3D11 (same rules as Interop's), copied
   at the end of its recording: Interop::Run is unchanged, the sun just records after the AO in the same recorder.
   Its targets are re-created on the D3D11 side at the SSAO draw (AO size); old D3D12 objects are retired by the next
@@ -288,7 +426,9 @@ the trace uses the direction from a few frames ago, which is fine for a light th
   (Luma's dump) in mode Off and RT x game on random inputs, RT = clouds x rt; a hard light matches the analytic CPU
   shadow on all 32719 receiver pixels away from edges; the traced penumbra matches the analytic disc integral
   (0.53 deg: 59 px vs 68, 6 deg: 716 px vs 729, denoised mean abs error < 0.004); 0.10 ms at 320x180 with 4 rays.
-  The light direction comes back from a DYNAMIC cbuffer bound with an offset (PSSetConstantBuffers1).
+  The light direction comes back from a DYNAMIC cbuffer bound with an offset (PSSetConstantBuffers1). Through the
+  texture exact cutout test wall (light 45 degrees up behind it): ground in front of the solid quadrant 0.000, of
+  the hole 1.000 (also with fast cutouts), 0.49 / 0.49 with the stochastic fallback at opacity 0.5.
 
 To check in game: the frame order (RT sun stats: "draws using it" grows, "using the game's" stays ~0); that the
 captured direction matches the shadows (log line "RT sun: light direction ..."; with "RT x game", traced and shadow

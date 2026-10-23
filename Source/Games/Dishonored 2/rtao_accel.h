@@ -29,6 +29,9 @@ namespace RTAO
    constexpr uint8_t kInstanceMaskOpaque = 0x01;
    constexpr uint8_t kInstanceMaskCutout = 0x02;
    constexpr uint32_t kInstanceIdCutoutBit = 1u << 23;
+   // The low 23 bits of a cutout's InstanceID: its texture exact cutout record (rtao_alpha.h), or this (none: the trace
+   // falls back to the stochastic opacity)
+   constexpr uint32_t kNoCutoutRecord = kInstanceIdCutoutBit - 1;
 
    class Retirer
    {
@@ -172,7 +175,8 @@ namespace RTAO
       void BeginFrame();
       // Thread safe. "object_to_world" is a row major 3x4 (the D3D12 instance transform layout).
       // "mask": kInstanceMaskOpaque, or kInstanceMaskCutout for alpha tested geometry (non opaque in the TLAS).
-      void AddInstance(uint64_t instance_key, uint64_t blas_key, const float object_to_world[3][4], uint8_t mask = kInstanceMaskOpaque);
+      // "cutout_record": cutouts only, see kNoCutoutRecord.
+      void AddInstance(uint64_t instance_key, uint64_t blas_key, const float object_to_world[3][4], uint8_t mask = kInstanceMaskOpaque, uint32_t cutout_record = kNoCutoutRecord);
       void RemoveInstance(uint64_t instance_key);
       size_t RetainedCount();
       // An instance for the current frame only (dropped at the next BeginFrame), with its BLAS given directly (e.g. from
@@ -197,6 +201,7 @@ namespace RTAO
          uint64_t blas_key;
          uint32_t last_frame;
          uint32_t seen_frames;
+         uint32_t cutout_record;
          uint8_t mask;
       };
       std::mutex mutex;

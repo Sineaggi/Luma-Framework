@@ -17,6 +17,7 @@ cbuffer SunConstants : register(b0)
     uint2 Size;         uint2 DepthSize;
     uint DepthPacked;   uint ReversedZ;  uint FilterMode;  float AlphaMin;
     float ClampK;       float Bias;      uint DebugMode;   float CutoutOpacity;
+    uint CutoutMode;    uint CutoutExact; uint2 SunPad;  // As RTAO's (rtao_common.hlsli): fast cutouts, texture exact masks
 };
 
 // Must match rtao_accel.h

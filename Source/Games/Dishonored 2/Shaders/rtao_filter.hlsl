@@ -30,13 +30,39 @@ void UnpackHist(uint2 h, out float ao, out float view_z, out uint age)
     age = h.y & 0xFFu;
 }
 
+// The 3x3 raw texels around each pixel of the 8x8 group, with the world position of the pixel each was traced at:
+// loaded once per group (10x10 texels at full resolution, 6x6 at half) instead of 9 times per pixel.
+// w: 0 usable, 1 sky, 2 outside the image.
+static const uint kTileMax = 10;
+groupshared float4 g_pos[kTileMax * kTileMax];
+groupshared float g_raw[kTileMax * kTileMax];
+
 [numthreads(8, 8, 1)]
-void main(uint3 id : SV_DispatchThreadID)
+void main(uint3 id : SV_DispatchThreadID, uint3 group : SV_GroupID, uint gi : SV_GroupIndex)
 {
+    const bool half_res = TraceHalfRes != 0;
+    const uint2 trace_size = TraceSize();
+    const uint tile_w = half_res ? 6 : 10;
+    const int2 tile_origin = int2(group.xy * (half_res ? 4 : 8)) - 1;
+    for (uint t = gi; t < tile_w * tile_w; t += 64)
+    {
+        const int2 ci = tile_origin + int2(t % tile_w, t / tile_w);
+        const bool inside = all(ci >= 0) && all(ci < int2(trace_size));
+        // Outside texels take the clamped one's position (the normal below relies on that at the image border)
+        const uint2 c = uint2(clamp(ci, int2(0, 0), int2(trace_size) - 1));
+        const uint2 q = TracedPixel(c);
+        const float dq = LoadDepth(q);
+        g_pos[t] = float4(WorldPosAt(q, dq), inside ? (IsSky(dq) ? 1.0 : 0.0) : 2.0);
+        g_raw[t] = AoRaw[c];
+    }
+    GroupMemoryBarrierWithGroupSync();
+
     uint2 px = id.xy;
     if (any(px >= Size))
         return;
-    float raw = AoRaw[px];
+    const uint2 own_cell = half_res ? px / 2 : px;
+    const int2 local = int2(own_cell) - tile_origin; // 1..8 (1..4 at half resolution)
+    float raw = g_raw[local.y * tile_w + local.x];
     float d = LoadDepth(px);
     if (IsSky(d) || FilterMode == kFilterOff)
     {
@@ -44,32 +70,45 @@ void main(uint3 id : SV_DispatchThreadID)
         HistCur[px] = PackHist(raw, 0.0, 0);
         return;
     }
-    float3 p0 = WorldPosAt(px, d);
+    float3 p0, n;
+    if (half_res)
+    {
+        p0 = WorldPosAt(px, d);
+        uint2 pxR = uint2(min(px.x + 1, Size.x - 1), px.y);
+        uint2 pxD = uint2(px.x, min(px.y + 1, Size.y - 1));
+        n = cross(WorldPos(pxD) - p0, WorldPos(pxR) - p0);
+    }
+    else
+    {
+        p0 = g_pos[local.y * tile_w + local.x].xyz;
+        n = cross(g_pos[(local.y + 1) * tile_w + local.x].xyz - p0, g_pos[local.y * tile_w + local.x + 1].xyz - p0);
+    }
     float z0 = ViewZ(p0);
-    uint2 pxR = uint2(min(px.x + 1, Size.x - 1), px.y);
-    uint2 pxD = uint2(px.x, min(px.y + 1, Size.y - 1));
-    float3 n = cross(WorldPos(pxD) - p0, WorldPos(pxR) - p0);
     float nl = length(n);
     n = nl > 1e-12 ? n / nl : float3(0, 0, 1);
 
-    // 3x3 cross-bilateral, plus the min/max box for the neighbourhood clamp
+    // 3x3 cross-bilateral over the raw texels, plus the min/max box for the neighbourhood clamp. At half resolution
+    // the texels are 2x2 blocks, each traced at one pixel (TracedPixel): the same weights on that pixel's position,
+    // times a spatial falloff, make it a depth aware upsample too.
     float sum = 0.0, wsum = 0.0;
     float mn = 1.0, mx = 0.0;
     [unroll] for (int dy = -1; dy <= 1; ++dy)
     [unroll] for (int dx = -1; dx <= 1; ++dx)
     {
-        int2 qi = int2(px) + int2(dx, dy);
-        if (qi.x < 0 || qi.y < 0 || qi.x >= int(Size.x) || qi.y >= int(Size.y))
+        const uint t = uint(local.y + dy) * tile_w + uint(local.x + dx);
+        const float4 e = g_pos[t];
+        if (e.w != 0.0)
             continue;
-        uint2 q = uint2(qi);
-        float dq = LoadDepth(q);
-        if (IsSky(dq))
-            continue;
-        float3 pq = WorldPosAt(q, dq);
+        float3 pq = e.xyz;
         float dz = abs(ViewZ(pq) - z0) / max(abs(z0), 1e-3);
         float dp = abs(dot(pq - p0, n)) / max(abs(z0) * kPlaneTolRel, 1e-4);
         float w = exp(-dz / kRelDepthTol) * exp(-dp);
-        float v = AoRaw[q];
+        if (half_res)
+        {
+            float2 o = float2(TracedPixel(uint2(int2(own_cell) + int2(dx, dy)))) - float2(px);
+            w *= exp(-dot(o, o) * (1.0 / 4.5)); // sigma 1.5 px
+        }
+        float v = g_raw[t];
         sum += w * v;
         wsum += w;
         if (w > 0.0)
@@ -78,7 +117,10 @@ void main(uint3 id : SV_DispatchThreadID)
             mx = max(mx, v);
         }
     }
-    float mean = wsum > 0.0 ? sum / wsum : raw;
+    float mean = wsum > 1e-6 ? sum / wsum : raw;
+    // At half resolution only one pixel of the block has its own sample this frame: the others take the upsample
+    if (half_res && any(TracedPixel(own_cell) != px))
+        raw = mean;
 
     bool rejected = true;
     float prev_ao = 0.0;

@@ -59,8 +59,30 @@ namespace RTAO
       FilterMode filter_mode = FilterMode::Temporal;
       float alpha_min = 1.f / 32.f;
       float clamp_k = 1.f / 16.f;
-      uint32_t debug_mode = 0; // 1 reconstructed normal Y (raw), 2 history rejection (filtered)
+      uint32_t debug_mode = 0; // 1 reconstructed normal Y (raw), 2 history rejection (filtered), 3 BLAS coverage (raw)
       bool reset_history = false;
+   };
+
+   // GPU time of a span of a command list, read back when the frame slot comes around again (no stall)
+   class GpuTimer
+   {
+   public:
+      ~GpuTimer() { Shutdown(); }
+      bool Init(ID3D12Device* device, uint64_t timestamp_frequency, std::string& error);
+      // Call Collect, then Begin ... End, once per frame slot use
+      void Collect(uint32_t frame_slot);
+      void Begin(ID3D12GraphicsCommandList* list, uint32_t frame_slot);
+      void End(ID3D12GraphicsCommandList* list, uint32_t frame_slot);
+      double LastMs() const { return last_ms; }
+      void Shutdown();
+
+   private:
+      static constexpr uint32_t kSlots = 3;
+      ID3D12QueryHeap* heap = nullptr;
+      ID3D12Resource* readback = nullptr;
+      uint64_t frequency = 0;
+      bool pending[kSlots] = {};
+      double last_ms = 0.0;
    };
 
    class AOPass

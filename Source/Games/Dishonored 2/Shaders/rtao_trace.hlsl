@@ -60,6 +60,33 @@ void main(uint3 id : SV_DispatchThreadID)
         return;
     }
     float3 p0 = WorldPosAt(px, d);
+
+    if (DebugMode == 3)
+    {
+        // BLAS coverage: a camera ray through the pixel should hit the captured geometry where the depth says.
+        // 1 = hit within 2 % of the depth distance, 0.5 = no hit (geometry missing from the TLAS),
+        // 0 = hit clearly in front (geometry in the TLAS that the depth doesn't have: misplaced or extra).
+        float3 to_p = p0 - CamPos;
+        float dist = length(to_p);
+        RayDesc primary;
+        primary.Origin = CamPos;
+        primary.Direction = to_p / max(dist, 1e-6);
+        primary.TMin = 0.0;
+        primary.TMax = dist * 1.5 + 1.0;
+        RayQuery<RAY_FLAG_SKIP_PROCEDURAL_PRIMITIVES | RAY_FLAG_FORCE_OPAQUE> pq;
+        pq.TraceRayInline(Scene, RAY_FLAG_NONE, 0xFF, primary);
+        pq.Proceed();
+        float coverage = 0.5;
+        if (pq.CommittedStatus() == COMMITTED_TRIANGLE_HIT)
+        {
+            float t = pq.CommittedRayT();
+            float tolerance = dist * 0.02 + 0.02;
+            coverage = abs(t - dist) <= tolerance ? 1.0 : (t < dist ? 0.0 : 0.5);
+        }
+        AoRaw[px] = coverage;
+        return;
+    }
+
     float3 n = DepthNormal(px, p0);
     float view_z = max(ViewZ(p0), 0.0);
     // Offset grows with distance to stay above the depth reconstruction error

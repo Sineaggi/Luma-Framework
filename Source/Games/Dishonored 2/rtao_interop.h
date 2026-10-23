@@ -101,6 +101,9 @@ namespace RTAO
       ID3D12Device5* GetDevice() const { return device12; }
       static constexpr uint32_t GetFramesInFlight() { return frames_in_flight; }
 
+      // Ticks per second of the direct queue's timestamps (0 if unavailable)
+      uint64_t GetTimestampFrequency();
+
       // Blocks until the D3D12 queue has finished everything submitted so far.
       bool WaitForIdle(uint32_t timeout_ms);
 

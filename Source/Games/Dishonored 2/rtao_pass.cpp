@@ -315,4 +315,91 @@ namespace RTAO
       has_history = false;
       width = height = 0;
    }
+
+   // ---- GpuTimer
+
+   bool GpuTimer::Init(ID3D12Device* device, uint64_t timestamp_frequency, std::string& error)
+   {
+      if (heap)
+         return true;
+      frequency = timestamp_frequency;
+      D3D12_QUERY_HEAP_DESC desc = {};
+      desc.Type = D3D12_QUERY_HEAP_TYPE_TIMESTAMP;
+      desc.Count = kSlots * 2;
+      HRESULT hr = device->CreateQueryHeap(&desc, IID_PPV_ARGS(&heap));
+      if (FAILED(hr))
+      {
+         error = HResultString("CreateQueryHeap", hr);
+         return false;
+      }
+      D3D12_RESOURCE_DESC buffer = {};
+      buffer.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+      buffer.Width = kSlots * 2 * sizeof(uint64_t);
+      buffer.Height = 1;
+      buffer.DepthOrArraySize = 1;
+      buffer.MipLevels = 1;
+      buffer.SampleDesc.Count = 1;
+      buffer.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+      D3D12_HEAP_PROPERTIES heap_properties = {};
+      heap_properties.Type = D3D12_HEAP_TYPE_READBACK;
+      hr = device->CreateCommittedResource(&heap_properties, D3D12_HEAP_FLAG_NONE, &buffer, D3D12_RESOURCE_STATE_COPY_DEST, nullptr, IID_PPV_ARGS(&readback));
+      if (FAILED(hr))
+      {
+         error = HResultString("CreateCommittedResource (timer readback)", hr);
+         Shutdown();
+         return false;
+      }
+      return true;
+   }
+
+   void GpuTimer::Collect(uint32_t frame_slot)
+   {
+      frame_slot %= kSlots;
+      if (!heap || !pending[frame_slot] || frequency == 0)
+         return;
+      pending[frame_slot] = false;
+      D3D12_RANGE range = { frame_slot * 16, frame_slot * 16 + 16 };
+      uint8_t* data = nullptr;
+      if (SUCCEEDED(readback->Map(0, &range, reinterpret_cast<void**>(&data))) && data)
+      {
+         uint64_t t[2];
+         std::memcpy(t, data + frame_slot * 16, sizeof(t));
+         if (t[1] >= t[0])
+            last_ms = double(t[1] - t[0]) * 1000.0 / double(frequency);
+         D3D12_RANGE written = { 0, 0 };
+         readback->Unmap(0, &written);
+      }
+   }
+
+   void GpuTimer::Begin(ID3D12GraphicsCommandList* list, uint32_t frame_slot)
+   {
+      if (heap)
+         list->EndQuery(heap, D3D12_QUERY_TYPE_TIMESTAMP, (frame_slot % kSlots) * 2);
+   }
+
+   void GpuTimer::End(ID3D12GraphicsCommandList* list, uint32_t frame_slot)
+   {
+      if (!heap)
+         return;
+      frame_slot %= kSlots;
+      list->EndQuery(heap, D3D12_QUERY_TYPE_TIMESTAMP, frame_slot * 2 + 1);
+      list->ResolveQueryData(heap, D3D12_QUERY_TYPE_TIMESTAMP, frame_slot * 2, 2, readback, frame_slot * 16);
+      pending[frame_slot] = true;
+   }
+
+   void GpuTimer::Shutdown()
+   {
+      if (readback)
+      {
+         readback->Release();
+         readback = nullptr;
+      }
+      if (heap)
+      {
+         heap->Release();
+         heap = nullptr;
+      }
+      for (auto& p : pending)
+         p = false;
+   }
 }

@@ -770,6 +770,15 @@ void main(uint3 id : SV_DispatchThreadID)
       return true;
    }
 
+   uint64_t Interop::GetTimestampFrequency()
+   {
+      const std::lock_guard lock(mutex);
+      UINT64 frequency = 0;
+      if (!queue || FAILED(queue->GetTimestampFrequency(&frequency)))
+         return 0;
+      return frequency;
+   }
+
    bool Interop::WaitForIdle(uint32_t timeout_ms)
    {
       const std::lock_guard lock(mutex);

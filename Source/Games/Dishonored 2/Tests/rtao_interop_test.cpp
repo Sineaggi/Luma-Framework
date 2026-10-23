@@ -5,7 +5,7 @@
 // ray traced AO (RayQuery) and the denoiser, checked against a CPU ray cast of the same scene.
 //
 // Build (x64 Native Tools prompt, from this folder):
-//   cl /nologo /std:c++20 /EHsc /O2 /I.. rtao_interop_test.cpp ..\rtao_interop.cpp ..\rtao_accel.cpp ..\rtao_pass.cpp d3d11.lib d3dcompiler.lib
+//   cl /nologo /std:c++20 /EHsc /O2 /I.. rtao_interop_test.cpp ..\rtao_interop.cpp ..\rtao_accel.cpp ..\rtao_pass.cpp ..\rtao_capture.cpp d3d11.lib d3dcompiler.lib
 // Run from this folder (it reads the shaders by relative path): rtao_interop_test.exe
 
 #ifndef NOMINMAX
@@ -13,6 +13,7 @@
 #endif
 #include "rtao_interop.h"
 #include "rtao_accel.h"
+#include "rtao_capture.h"
 #include "rtao_pass.h"
 
 #include <d3dcompiler.h>
@@ -524,6 +525,388 @@ static void TestRayTracedScene(ID3D11Device* device, ID3D11DeviceContext* contex
    depth_texture->Release();
 }
 
+// ---- M1: geometry capture (game draws -> BLAS + instance matrices), with game-like buffers for all 3 families
+
+// Reflects some of the game's own vertex shaders, if Luma's dump of them is on this machine
+static void TestReflection()
+{
+   const char* dump = "C:\\Program Files (x86)\\Steam\\steamapps\\common\\Dishonored2\\Luma\\Dishonored 2\\Dump\\";
+   struct Case
+   {
+      const char* file;
+      RTAO::MatrixSource source;
+      const char* skip;
+   };
+   const Case cases[] = {
+      { "0x004D8839.vs_5_0.cso", RTAO::MatrixSource::DirectInstanceBuffer, nullptr }, // G-buffer, direct instance buffer
+      { "0x00603116.vs_5_0.cso", RTAO::MatrixSource::DirectInstanceBuffer, nullptr }, // depth only, direct instance buffer
+      { "0x000209DB.vs_5_0.cso", RTAO::MatrixSource::IndexedInstanceBuffer, nullptr },
+      { "0x0008106B.vs_5_0.cso", RTAO::MatrixSource::ConstantBuffer, nullptr },
+      { "0x0236F519.vs_5_0.cso", RTAO::MatrixSource::None, "skinned" },
+   };
+   int tested = 0;
+   for (const Case& c : cases)
+   {
+      const std::string path = std::string(dump) + c.file;
+      FILE* f = fopen(path.c_str(), "rb");
+      if (!f)
+         continue;
+      std::vector<uint8_t> code;
+      fseek(f, 0, SEEK_END);
+      code.resize(size_t(ftell(f)));
+      fseek(f, 0, SEEK_SET);
+      fread(code.data(), 1, code.size(), f);
+      fclose(f);
+      RTAO::VertexShaderInfo info;
+      RTAO::ReflectVertexShader(code.data(), code.size(), info);
+      printf("reflect %s: source %u, skip %s, PerInstanceCB b%d, instance offset @%d, rows @%d/%d/%d, depth hack @%d, instance t%d (stride %u), index t%d\n", c.file, unsigned(info.source), info.skip_reason ? info.skip_reason : "-",
+         int(info.instance_cb_slot), int(info.instance_offset_cb), int(info.row_cb[0]), int(info.row_cb[1]), int(info.row_cb[2]), int(info.depth_hack_cb), int(info.instance_buffer_slot), info.instance_buffer_stride, int(info.instance_index_slot));
+      CHECK(info.source == c.source, "%s: wrong matrix source", c.file);
+      CHECK(!c.skip || (info.skip_reason && strcmp(info.skip_reason, c.skip) == 0), "%s: wrong skip reason", c.file);
+      tested++;
+   }
+   if (tested == 0)
+      printf("reflect: game shader dump not found, skipped\n");
+}
+
+static ID3D11Buffer* MakeBuffer(ID3D11Device* device, UINT bind, const void* data, UINT size, D3D11_USAGE usage = D3D11_USAGE_IMMUTABLE, UINT misc = 0, UINT stride = 0)
+{
+   D3D11_BUFFER_DESC desc = { size, usage, bind, 0, misc, stride };
+   D3D11_SUBRESOURCE_DATA init = { data, 0, 0 };
+   ID3D11Buffer* buffer = nullptr;
+   HRESULT hr = device->CreateBuffer(&desc, &init, &buffer);
+   CHECK(SUCCEEDED(hr), "CreateBuffer 0x%08lX", (unsigned long)hr);
+   return buffer;
+}
+
+static void BoxTransform(const Box& box, float out[12])
+{
+   const float t[12] = { box.max.x - box.min.x, 0, 0, box.min.x, 0, box.max.y - box.min.y, 0, box.min.y, 0, 0, box.max.z - box.min.z, box.min.z };
+   std::memcpy(out, t, sizeof(t));
+}
+
+static void TestGeometryCapture(ID3D11Device* device, ID3D11DeviceContext* context, RTAO::Interop& interop, ID3D11VertexShader* copy_vs, ID3D11PixelShader* depth_ps)
+{
+   std::string error;
+   const UINT W = 320, H = 180;
+   CHECK(interop.EnsureTargets(device, W, H, W, H, error), "EnsureTargets: %s", error.c_str());
+
+   // Same camera and CPU reference as TestRayTracedScene
+   const V3 eye = { 0, 4, -9 }, target = { 0, 0.5f, 0 }, up = { 0, 1, 0 };
+   const V3 f = Normalize(Sub(target, eye)), r = Normalize(Cross(up, f)), u = Cross(f, r);
+   Mat4 view;
+   view(0, 0) = r.x; view(0, 1) = u.x; view(0, 2) = f.x;
+   view(1, 0) = r.y; view(1, 1) = u.y; view(1, 2) = f.y;
+   view(2, 0) = r.z; view(2, 1) = u.z; view(2, 2) = f.z;
+   view(3, 0) = -Dot(r, eye); view(3, 1) = -Dot(u, eye); view(3, 2) = -Dot(f, eye); view(3, 3) = 1;
+   const float n = 0.1f, fr = 1000.f, sy = 1.f / std::tan(3.14159265f / 6.f), sx = sy / (float(W) / float(H));
+   Mat4 proj;
+   proj(0, 0) = sx;
+   proj(1, 1) = sy;
+   proj(2, 2) = -n / (fr - n);
+   proj(2, 3) = 1;
+   proj(3, 2) = n * fr / (fr - n);
+   const Mat4 view_proj = Mul(view, proj), inv_view_proj = Inverse(view_proj);
+   std::vector<float> depth(W * H, 0.f);
+   std::vector<int> hit_id(W * H, -1);
+   std::vector<V3> hit_pos(W * H);
+   for (UINT y = 0; y < H; y++)
+      for (UINT x = 0; x < W; x++)
+      {
+         float v[4] = { (x + 0.5f) / W * 2.f - 1.f, 1.f - (y + 0.5f) / H * 2.f, 0.5f, 1.f }, w[4] = {};
+         for (int c = 0; c < 4; c++)
+            for (int k = 0; k < 4; k++)
+               w[c] += v[k] * inv_view_proj(k, c);
+         const V3 dir = Normalize(Sub({ w[0] / w[3], w[1] / w[3], w[2] / w[3] }, eye));
+         float best = 1e30f;
+         for (int b = 0; b < kBoxCount; b++)
+         {
+            float t;
+            if (RayBox(eye, dir, kBoxes[b], t) && t < best)
+            {
+               best = t;
+               hit_id[y * W + x] = b;
+            }
+         }
+         if (hit_id[y * W + x] < 0)
+            continue;
+         const V3 p = { eye.x + dir.x * best, eye.y + dir.y * best, eye.z + dir.z * best };
+         hit_pos[y * W + x] = p;
+         float clip[4] = {};
+         const float pv[4] = { p.x, p.y, p.z, 1.f };
+         for (int c = 0; c < 4; c++)
+            for (int k = 0; k < 4; k++)
+               clip[c] += pv[k] * view_proj(k, c);
+         depth[y * W + x] = clip[2] / clip[3];
+      }
+   D3D11_TEXTURE2D_DESC depth_desc = { W, H, 1, 1, DXGI_FORMAT_R32_FLOAT, { 1, 0 }, D3D11_USAGE_DEFAULT, D3D11_BIND_SHADER_RESOURCE, 0, 0 };
+   D3D11_SUBRESOURCE_DATA depth_data = { depth.data(), W * 4, 0 };
+   ID3D11Texture2D* depth_texture = nullptr;
+   device->CreateTexture2D(&depth_desc, &depth_data, &depth_texture);
+   ID3D11ShaderResourceView* depth_srv = nullptr;
+   device->CreateShaderResourceView(depth_texture, nullptr, &depth_srv);
+
+   // Game-like mesh: stride 20 (uv, then position at offset 8), 4 unrelated vertices and 6 indices in front of it
+   struct Vertex
+   {
+      float uv[2];
+      float pos[3];
+   };
+   std::vector<Vertex> vertices(4 + 8, Vertex{ { 9, 9 }, { 99, 99, 99 } });
+   for (int i = 0; i < 8; i++)
+      std::memcpy(vertices[4 + i].pos, &kCubeVertices[i * 3], 12);
+   std::vector<uint16_t> indices(6 + 36, 3);
+   for (int i = 0; i < 36; i++)
+      indices[6 + i] = uint16_t(kCubeIndices[i]);
+   ID3D11Buffer* vb = MakeBuffer(device, D3D11_BIND_VERTEX_BUFFER, vertices.data(), UINT(vertices.size() * sizeof(Vertex)));
+   ID3D11Buffer* ib = MakeBuffer(device, D3D11_BIND_INDEX_BUFFER, indices.data(), UINT(indices.size() * 2));
+
+   // Family 1: direct instance buffer (stride 96, rows at 48), index = SV_InstanceID + cb_instancebufferoffset (@560 = 1)
+   std::vector<float> direct(3 * 24, 7.f);
+   BoxTransform(kBoxes[0], &direct[1 * 24 + 12]);
+   BoxTransform(kBoxes[1], &direct[2 * 24 + 12]);
+   ID3D11Buffer* direct_buffer = MakeBuffer(device, D3D11_BIND_SHADER_RESOURCE, direct.data(), UINT(direct.size() * 4), D3D11_USAGE_IMMUTABLE, D3D11_RESOURCE_MISC_BUFFER_STRUCTURED, 96);
+   ID3D11ShaderResourceView* direct_srv = nullptr;
+   device->CreateShaderResourceView(direct_buffer, nullptr, &direct_srv);
+   std::vector<uint32_t> direct_cb(640 / 4, 0);
+   direct_cb[560 / 4] = 1;
+   reinterpret_cast<float*>(direct_cb.data())[556 / 4] = 1.f;
+   ID3D11Buffer* direct_cb_buffer = MakeBuffer(device, D3D11_BIND_CONSTANT_BUFFER, direct_cb.data(), 640);
+
+   // Family 2: indexed instance buffer (stride 48), index buffer entry 1 = 0xAB000005 -> record 5 (low 24 bits)
+   std::vector<float> indexed(8 * 12, 5.f);
+   BoxTransform(kBoxes[2], &indexed[5 * 12]);
+   ID3D11Buffer* indexed_buffer = MakeBuffer(device, D3D11_BIND_SHADER_RESOURCE, indexed.data(), UINT(indexed.size() * 4), D3D11_USAGE_IMMUTABLE, D3D11_RESOURCE_MISC_BUFFER_STRUCTURED, 48);
+   ID3D11ShaderResourceView* indexed_srv = nullptr;
+   device->CreateShaderResourceView(indexed_buffer, nullptr, &indexed_srv);
+   const uint32_t index_values[4] = { 7, 0xAB000005u, 0, 0 };
+   ID3D11Buffer* index_buffer = MakeBuffer(device, D3D11_BIND_SHADER_RESOURCE, index_values, sizeof(index_values));
+   D3D11_SHADER_RESOURCE_VIEW_DESC index_srv_desc = {};
+   index_srv_desc.Format = DXGI_FORMAT_R32_UINT;
+   index_srv_desc.ViewDimension = D3D11_SRV_DIMENSION_BUFFER;
+   index_srv_desc.Buffer.NumElements = 4;
+   ID3D11ShaderResourceView* index_srv = nullptr;
+   device->CreateShaderResourceView(index_buffer, &index_srv_desc, &index_srv);
+   std::vector<uint32_t> indexed_cb(64 / 4, 0);
+   indexed_cb[16 / 4] = 1;
+   ID3D11Buffer* indexed_cb_buffer = MakeBuffer(device, D3D11_BIND_CONSTANT_BUFFER, indexed_cb.data(), 64);
+
+   // Family 3: PerInstanceCB rows (z @160, y @176, x @192, as in the game), depth hack @464. Plus a "view model":
+   // a huge box around the camera, depth hack 0.25, which must be left out (it would occlude everything).
+   auto make_cb_family = [&](const Box& box, float depth_hack) {
+      std::vector<float> cb(480 / 4, 0.f);
+      float t[12];
+      BoxTransform(box, t);
+      std::memcpy(&cb[192 / 4], &t[0], 16);
+      std::memcpy(&cb[176 / 4], &t[4], 16);
+      std::memcpy(&cb[160 / 4], &t[8], 16);
+      cb[464 / 4] = depth_hack;
+      return MakeBuffer(device, D3D11_BIND_CONSTANT_BUFFER, cb.data(), 480);
+   };
+   ID3D11Buffer* model_cb = make_cb_family(kBoxes[3], 1.f);
+   ID3D11Buffer* view_model_cb = make_cb_family({ { -50, -50, -50 }, { 50, 50, 50 } }, 0.25f);
+
+   RTAO::VertexShaderInfo direct_vs, indexed_vs, cb_vs;
+   direct_vs.source = RTAO::MatrixSource::DirectInstanceBuffer;
+   direct_vs.skip_reason = nullptr;
+   direct_vs.instance_cb_slot = 2;
+   direct_vs.instance_offset_cb = 560;
+   direct_vs.depth_hack_cb = 556;
+   direct_vs.instance_buffer_slot = 3;
+   direct_vs.instance_buffer_stride = 96;
+   direct_vs.record_row0 = 48;
+   indexed_vs.source = RTAO::MatrixSource::IndexedInstanceBuffer;
+   indexed_vs.skip_reason = nullptr;
+   indexed_vs.instance_cb_slot = 2;
+   indexed_vs.instance_offset_cb = 16;
+   indexed_vs.instance_buffer_slot = 1;
+   indexed_vs.instance_buffer_stride = 48;
+   indexed_vs.instance_index_slot = 0;
+   cb_vs.source = RTAO::MatrixSource::ConstantBuffer;
+   cb_vs.skip_reason = nullptr;
+   cb_vs.instance_cb_slot = 2;
+   cb_vs.row_cb[0] = 192;
+   cb_vs.row_cb[1] = 176;
+   cb_vs.row_cb[2] = 160;
+   cb_vs.depth_hack_cb = 464;
+
+   auto base_draw = [&]() {
+      RTAO::DrawInfo d;
+      d.vertex_buffer = vb;
+      d.vertex_stride = sizeof(Vertex);
+      d.position_format = DXGI_FORMAT_R32G32B32_FLOAT;
+      d.position_offset = 8;
+      d.index_buffer = ib;
+      d.index_format = DXGI_FORMAT_R16_UINT;
+      d.index_count = 36;
+      d.first_index = 6;
+      d.base_vertex = 4;
+      return d;
+   };
+   RTAO::DrawInfo draw_direct = base_draw();
+   draw_direct.vs = &direct_vs;
+   draw_direct.instance_count = 2;
+   draw_direct.instance_cb = direct_cb_buffer;
+   draw_direct.instance_buffer = direct_srv;
+   RTAO::DrawInfo draw_indexed = base_draw();
+   draw_indexed.vs = &indexed_vs;
+   draw_indexed.instance_cb = indexed_cb_buffer;
+   draw_indexed.instance_buffer = indexed_srv;
+   draw_indexed.instance_index = index_srv;
+   RTAO::DrawInfo draw_cb = base_draw();
+   draw_cb.vs = &cb_vs;
+   draw_cb.instance_cb = model_cb;
+   RTAO::DrawInfo draw_view_model = draw_cb;
+   draw_view_model.instance_cb = view_model_cb;
+
+   ID3DBlob* cs_code = Compile(L"..\\..\\..\\..\\Shaders\\Dishonored 2\\Luma_RTAO.hlsl", "capture_instances_cs", "cs_5_0");
+   ID3D11ComputeShader* capture_cs = nullptr;
+   device->CreateComputeShader(cs_code->GetBufferPointer(), cs_code->GetBufferSize(), nullptr, &capture_cs);
+   cs_code->Release();
+
+   RTAO::GeometryCapture capture;
+   CHECK(capture.Init(device, interop, capture_cs, error), "GeometryCapture::Init: %s", error.c_str());
+   capture_cs->Release();
+   ID3D11DeviceContext* deferred = nullptr;
+   device->CreateDeferredContext(0, &deferred);
+
+   RTAO::Retirer retirer;
+   RTAO::BlasCache blases;
+   RTAO::TlasBuilder tlas;
+   RTAO::AOPass pass;
+   CHECK(pass.Init(interop.GetDevice(), error), "AOPass::Init: %s", error.c_str());
+   RTAO::GpuTimer timer;
+   CHECK(timer.Init(interop.GetDevice(), interop.GetTimestampFrequency(), error), "GpuTimer::Init: %s", error.c_str());
+   RTAO::PassSettings settings;
+   std::memcpy(settings.view_proj, view_proj.m, sizeof(settings.view_proj));
+   std::memcpy(settings.inv_view_proj, inv_view_proj.m, sizeof(settings.inv_view_proj));
+   settings.cam_pos[0] = eye.x; settings.cam_pos[1] = eye.y; settings.cam_pos[2] = eye.z;
+   settings.cam_fwd[0] = f.x; settings.cam_fwd[1] = f.y; settings.cam_fwd[2] = f.z;
+
+   auto run_frame = [&](RTAO::FilterMode filter_mode, uint32_t debug_mode) {
+      // The "game" draws: two families on the immediate context, the third (and the view model) on a deferred one
+      CHECK(capture.CaptureDraw(context, draw_direct), "capture (direct)");
+      CHECK(capture.CaptureDraw(context, draw_indexed), "capture (indexed)");
+      CHECK(capture.CaptureDraw(deferred, draw_cb), "capture (cbuffer)");
+      CHECK(capture.CaptureDraw(deferred, draw_view_model), "capture (view model)");
+      ID3D11CommandList* command_list = nullptr;
+      deferred->FinishCommandList(FALSE, &command_list);
+      capture.OnFinishCommandList(deferred, command_list);
+      capture.OnExecuteCommandList(command_list);
+      context->ExecuteCommandList(command_list, TRUE);
+      command_list->Release();
+
+      ID3D11RenderTargetView* rtv = interop.GetDepthRTV();
+      D3D11_VIEWPORT viewport = { 0, 0, (float)W, (float)H, 0, 1 };
+      context->RSSetViewports(1, &viewport);
+      context->OMSetRenderTargets(1, &rtv, nullptr);
+      context->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP);
+      context->VSSetShader(copy_vs, nullptr, 0);
+      context->PSSetShader(depth_ps, nullptr, 0);
+      context->PSSetShaderResources(0, 1, &depth_srv);
+      context->Draw(4, 0);
+      ID3D11RenderTargetView* null_rtv = nullptr;
+      context->OMSetRenderTargets(1, &null_rtv, nullptr);
+      rtv->Release();
+
+      settings.filter_mode = filter_mode;
+      settings.debug_mode = debug_mode;
+      CHECK(interop.Run(context, [&](ID3D12GraphicsCommandList4* list, const RTAO::RecordInfo& info, std::string& err) {
+         retirer.Collect(info.completed_fence_value);
+         timer.Collect(info.frame_slot);
+         timer.Begin(list, info.frame_slot);
+         if (!capture.Record(list, info, blases, tlas, retirer, 64, err))
+            return false;
+         const RTAO::BuildContext ctx = { info.device, list, &retirer, info.submit_fence_value };
+         D3D12_GPU_VIRTUAL_ADDRESS top = 0;
+         uint32_t count = 0;
+         if (!tlas.Build(ctx, blases, info.frame_slot, top, count, err))
+            return false;
+         if (!pass.Record(list, info, top, settings, retirer, err))
+            return false;
+         timer.End(list, info.frame_slot);
+         return true;
+      }, error), "Run (capture): %s", error.c_str());
+      capture.OnPresent();
+      ID3D11ShaderResourceView* ao_srv = interop.GetAOSRV();
+      UINT w = 0, h = 0;
+      std::vector<float> ao = ReadAO(device, context, ao_srv, w, h);
+      ao_srv->Release();
+      return ao;
+   };
+
+   std::vector<float> raw;
+   for (int i = 0; i < 6; i++) // Matrices are read back 3 frames late
+      raw = run_frame(RTAO::FilterMode::Off, 0);
+   const RTAO::CaptureStats stats = capture.GetStats();
+   printf("capture: draws %llu seen / %llu captured, instances %llu, meshes %llu (ready %llu), buffers copied %llu (%llu KB arena), BLAS built %llu, TLAS instances %llu, view model instances %llu\n",
+      (unsigned long long)stats.draws_seen, (unsigned long long)stats.draws_captured, (unsigned long long)stats.instances_captured, (unsigned long long)stats.meshes, (unsigned long long)stats.meshes_ready,
+      (unsigned long long)stats.buffers_copied, (unsigned long long)(stats.arena_vertex_bytes / 1024), (unsigned long long)stats.blas_built, (unsigned long long)stats.tlas_instances, (unsigned long long)stats.view_model_instances);
+   CHECK(stats.meshes == 1 && stats.blas_built == 1, "all families draw the same mesh: one BLAS");
+   CHECK(stats.buffers_copied == 2, "the vertex and index buffers are copied once");
+   CHECK(stats.tlas_instances == 4, "4 boxes in the TLAS (the view model left out), got %llu", (unsigned long long)stats.tlas_instances);
+   CHECK(stats.view_model_instances == 1, "the view model draw must be flagged");
+
+   auto average = [&](const std::vector<float>& ao, auto predicate, int& count) {
+      double sum = 0;
+      count = 0;
+      for (UINT i = 0; i < W * H; i++)
+         if (predicate(i))
+         {
+            sum += ao[i];
+            count++;
+         }
+      return count ? float(sum / count) : -1.f;
+   };
+   auto is_sky = [&](UINT i) { return hit_id[i] < 0; };
+   auto is_open_ground = [&](UINT i) {
+      if (hit_id[i] != 0)
+         return false;
+      for (int b = 1; b < kBoxCount; b++)
+         if (BoxDistance(hit_pos[i], kBoxes[b]) < 2.f)
+            return false;
+      return true;
+   };
+   auto is_corner = [&](UINT i) { return hit_id[i] == 0 && BoxDistance(hit_pos[i], kBoxes[1]) < 0.15f; };
+   auto is_near_b = [&](UINT i) { return hit_id[i] == 0 && BoxDistance(hit_pos[i], kBoxes[2]) < 0.15f; };
+   auto is_under_floating = [&](UINT i) {
+      const V3 p = hit_pos[i];
+      return hit_id[i] == 0 && p.x > -4.4f && p.x < -3.6f && p.z > -0.9f && p.z < -0.1f;
+   };
+   int c[5];
+   const float sky = average(raw, is_sky, c[0]), open = average(raw, is_open_ground, c[1]), corner = average(raw, is_corner, c[2]);
+   const float near_b = average(raw, is_near_b, c[3]), under = average(raw, is_under_floating, c[4]);
+   printf("captured scene AO (raw): sky %.3f, open ground %.3f, wall corner (direct family) %.3f, next to box B (indexed family) %.3f, under the floating box (cbuffer family, deferred) %.3f\n", sky, open, corner, near_b, under);
+   CHECK(sky > 0.999f, "sky must be unoccluded");
+   CHECK(open > 0.97f, "open ground must be unoccluded (the view model must not be in the TLAS)");
+   CHECK(c[2] > 10 && corner < 0.8f, "direct family box occludes");
+   CHECK(c[3] > 5 && near_b < 0.8f, "indexed family box occludes");
+   CHECK(c[4] > 10 && under < 0.9f, "cbuffer family box occludes");
+
+   // BLAS coverage debug: the captured geometry must line up with the depth
+   std::vector<float> coverage = run_frame(RTAO::FilterMode::Off, 3);
+   int hits = 0, matched = 0;
+   for (UINT i = 0; i < W * H; i++)
+      if (hit_id[i] >= 0)
+      {
+         hits++;
+         matched += coverage[i] > 0.99f;
+      }
+   printf("BLAS coverage: %d of %d geometry pixels match the depth (%.1f%%), RT pass GPU time %.3f ms\n", matched, hits, 100.0 * matched / std::max(hits, 1), timer.LastMs());
+   CHECK(matched > hits * 0.98, "captured geometry must line up with the depth");
+
+   CHECK(interop.WaitForIdle(5000), "WaitForIdle");
+   retirer.ReleaseAll();
+   timer.Shutdown();
+   pass.Shutdown(nullptr, 0);
+   tlas.Clear(nullptr, 0);
+   blases.Clear(nullptr, 0);
+   capture.Shutdown();
+   deferred->Release();
+   for (IUnknown* p : std::initializer_list<IUnknown*>{ vb, ib, direct_buffer, direct_srv, direct_cb_buffer, indexed_buffer, indexed_srv, index_buffer, index_srv, indexed_cb_buffer, model_cb, view_model_cb, depth_srv, depth_texture })
+      p->Release();
+}
+
 int main()
 {
    setvbuf(stdout, nullptr, _IONBF, 0);
@@ -633,6 +1016,8 @@ int main()
    TestTlasRetention();
    TestSharedBuffer(device, context, interop);
    TestRayTracedScene(device, context, interop, vs, ps);
+   TestReflection();
+   TestGeometryCapture(device, context, interop, vs, ps);
 
    // With RTAO_D3D12_DEBUG set: any D3D12 validation error fails the test
    ID3D12InfoQueue* info_queue = nullptr;

@@ -78,12 +78,65 @@ namespace
    // XeGTAO and RTAO both replace the game's SSAO draw, so they are mutually exclusive by construction.
    enum AOMode : int
    {
-      AO_MODE_OFF = 0, // Game behaviour (vanilla SSAO, or HBAO+ if enabled in the game)
+      AO_MODE_OFF = 0, // No AO replacement and the game's HBAO+ off (the game's own SSAO/DWAO draws nothing on PC)
       AO_MODE_XEGTAO = 1,
       AO_MODE_RTAO = 2, // Ray traced AO on a side D3D12 device, from geometry captured off the game's draws
+      AO_MODE_HBAO = 3, // The game's NVIDIA HBAO+ (r_hbao 1), no replacement
       AO_MODE_COUNT
    };
    std::atomic<int> g_ao_mode = AO_MODE_XEGTAO;
+   // Set when g_ao_mode changed and the game's r_hbao has to follow (applied on present, on the render thread)
+   std::atomic<bool> g_ao_mode_apply_pending = true;
+
+   // The game's r_hbao cvar, driven from Luma (Steam 1.77.9.0). The addresses are the ones the user's AO menu ASI
+   // uses (Dishonored2AOMenu.asi); nothing is hooked, the engine's own idCVar::SetBool is called.
+   struct GameAOCvars
+   {
+      bool valid = false;
+      uint8_t* r_hbao = nullptr;
+      uint8_t* r_skip_ssao = nullptr; // With 1 the engine's AO pass only clears/blurs: the SSAO draw Luma replaces never runs
+      using SetBoolFn = void(__fastcall*)(void* cvar, char value, char notify);
+      SetBoolFn set_bool = nullptr;
+      int applied = -1; // The r_hbao value Luma last set (-1: none yet)
+      int applied_skip = -1; // The r_skipSSAO value last seen or set
+      bool boot_applied = false;
+   };
+   GameAOCvars g_game_ao;
+
+   void InitGameAOCvars()
+   {
+      uint8_t* base = reinterpret_cast<uint8_t*>(GetModuleHandleW(nullptr));
+      if (!base)
+         return;
+      const auto* dos = reinterpret_cast<const IMAGE_DOS_HEADER*>(base);
+      const auto* nt = reinterpret_cast<const IMAGE_NT_HEADERS64*>(base + dos->e_lfanew);
+      constexpr uint32_t kHbaoRegistration = 0x136b022; // "lea rdx, [name]; lea rcx, [r_hbao]" in the cvar registration
+      constexpr uint32_t kHbaoCvar = 0x32ef770;
+      constexpr uint32_t kSkipSsaoCvar = 0x397b4d0;
+      constexpr uint32_t kSetBool = 0x102520;
+      static const uint8_t kExpected[] = { 0x48, 0x8d, 0x15, 0x8f, 0x59, 0x7b, 0x00, 0x48, 0x8d, 0x0d, 0x40, 0x47, 0xf8, 0x01 };
+      if (dos->e_magic != IMAGE_DOS_SIGNATURE || nt->Signature != IMAGE_NT_SIGNATURE || nt->OptionalHeader.SizeOfImage <= kSkipSsaoCvar + 0x30 ||
+         std::memcmp(base + kHbaoRegistration, kExpected, sizeof(kExpected)) != 0)
+      {
+         reshade::log::message(reshade::log::level::warning, "AO: unknown Dishonored2.exe version, the HBAO+ option is disabled");
+         return;
+      }
+      g_game_ao.r_hbao = base + kHbaoCvar;
+      g_game_ao.r_skip_ssao = base + kSkipSsaoCvar;
+      g_game_ao.set_bool = reinterpret_cast<GameAOCvars::SetBoolFn>(base + kSetBool);
+      g_game_ao.valid = true;
+      reshade::log::message(reshade::log::level::info, "AO: game r_hbao found, HBAO+ selectable from Luma");
+   }
+
+   int ReadGameHbao()
+   {
+      return *reinterpret_cast<const volatile int*>(g_game_ao.r_hbao + 0x28) != 0 ? 1 : 0;
+   }
+
+   int ReadGameSkipSsao()
+   {
+      return *reinterpret_cast<const volatile int*>(g_game_ao.r_skip_ssao + 0x28) != 0 ? 1 : 0;
+   }
    // Set once if the D3D12/DXR 1.1 interop can't be created; RTAO then runs as XeGTAO
    std::atomic<bool> g_rtao_unavailable = false;
    std::mutex g_rtao_status_mutex;
@@ -128,6 +181,8 @@ namespace
          mode = AO_MODE_XEGTAO;
       if (mode == AO_MODE_RTAO && g_rtao_unavailable)
          mode = AO_MODE_XEGTAO;
+      if (mode == AO_MODE_HBAO && !g_game_ao.valid)
+         mode = AO_MODE_OFF;
       return mode;
    }
 
@@ -266,6 +321,7 @@ public:
          reshade::register_event<reshade::addon_event::map_buffer_region>(Dishonored2::OnMapBufferRegion);
          reshade::register_event<reshade::addon_event::unmap_buffer_region>(Dishonored2::OnUnmapBufferRegion);
          reshade::register_event<reshade::addon_event::execute_secondary_command_list>(Dishonored2::OnExecuteSecondaryCommandList);
+         InitGameAOCvars();
          reshade::register_event<reshade::addon_event::init_pipeline>(Dishonored2::OnRTAOInitPipeline);
          reshade::register_event<reshade::addon_event::destroy_pipeline>(Dishonored2::OnRTAODestroyPipeline);
          reshade::register_event<reshade::addon_event::draw_indexed>(Dishonored2::OnRTAODrawIndexed);
@@ -977,6 +1033,49 @@ public:
          game_device_data.rtao_capture.OnPresent();
       if (g_ao_view_mode != 0)
          DrawAOView(native_device, device_data, game_device_data);
+
+      // The game's HBAO+ follows Luma's AO mode. Applied when the mode changes, and once when the first 3D scene
+      // draws (after the game has set its own cvars from its settings). A change made elsewhere (e.g. the in game
+      // AO menu) is adopted into Luma's mode instead of being fought.
+      if (g_game_ao.valid)
+      {
+         const int observed = ReadGameHbao();
+         const int observed_skip = ReadGameSkipSsao();
+         const int effective_mode = GetEffectiveAOMode();
+         const int desired = effective_mode == AO_MODE_HBAO ? 1 : 0;
+         const bool boot_apply = !g_game_ao.boot_applied && game_device_data.has_drawn_scene_previous;
+         if (g_ao_mode_apply_pending.exchange(false) || boot_apply)
+         {
+            if (observed != desired)
+               g_game_ao.set_bool(g_game_ao.r_hbao, char(desired), 1);
+            // Any AO but Off needs the engine's AO pass to run (Off leaves r_skipSSAO as it is)
+            if (effective_mode != AO_MODE_OFF && observed_skip != 0)
+               g_game_ao.set_bool(g_game_ao.r_skip_ssao, 0, 1);
+            g_game_ao.applied = desired;
+            g_game_ao.applied_skip = effective_mode != AO_MODE_OFF ? 0 : observed_skip;
+            if (game_device_data.has_drawn_scene_previous)
+               g_game_ao.boot_applied = true;
+         }
+         else if (g_game_ao.applied_skip != -1 && observed_skip != g_game_ao.applied_skip)
+         {
+            // The in game AO menu's "Off" sets r_skipSSAO 1 (and picking an AO there sets it back to 0)
+            g_game_ao.applied_skip = observed_skip;
+            if (observed_skip == 1 && g_ao_mode != AO_MODE_OFF)
+            {
+               g_ao_mode = AO_MODE_OFF;
+               reshade::log::message(reshade::log::level::info, "AO: r_skipSSAO turned on in game, Luma AO mode -> Off");
+            }
+         }
+         else if (g_game_ao.applied != -1 && observed != g_game_ao.applied)
+         {
+            g_game_ao.applied = observed;
+            if (observed == 1)
+               g_ao_mode = AO_MODE_HBAO;
+            else if (g_ao_mode == AO_MODE_HBAO)
+               g_ao_mode = AO_MODE_OFF;
+            reshade::log::message(reshade::log::level::info, observed ? "AO: r_hbao turned on in game, Luma AO mode -> HBAO+" : "AO: r_hbao turned off in game, Luma AO mode -> Off");
+         }
+      }
 
       if (game_device_data.rtao_frame - game_device_data.rtao_last_draw_frame > 2)
          g_rtao_capture_active = false; // RTAO not drawing (other AO mode, menus): no capture cost
@@ -1950,6 +2049,7 @@ public:
             ao_mode = xegtao_enable ? AO_MODE_XEGTAO : AO_MODE_OFF;
       }
       g_ao_mode = (ao_mode >= AO_MODE_OFF && ao_mode < AO_MODE_COUNT) ? ao_mode : AO_MODE_XEGTAO;
+      g_ao_mode_apply_pending = true;
       reshade::get_config_value(runtime, NAME, "RTAOTestOutput", g_rtao_debug_mode);
       g_rtao_debug_mode = std::clamp(g_rtao_debug_mode, 0, int(RTAO_OUTPUT_COUNT) - 1);
       reshade::get_config_value(runtime, NAME, "RTAORadius", g_rtao_radius);
@@ -2011,18 +2111,28 @@ public:
 
       ImGui::SeparatorText("Ambient Occlusion");
 
-      static const char* ao_mode_names[AO_MODE_COUNT] = { "Off (game)", "XeGTAO", "RTAO (experimental)" };
+      // Listed in this order; the stored mode values stay 0 off, 1 XeGTAO, 2 RTAO, 3 HBAO+
+      static const int ao_mode_order[AO_MODE_COUNT] = { AO_MODE_OFF, AO_MODE_HBAO, AO_MODE_XEGTAO, AO_MODE_RTAO };
+      const char* ao_mode_names[AO_MODE_COUNT] = { "Off", g_game_ao.valid ? "HBAO+ (game)" : "HBAO+ (unavailable: unknown game version)", "XeGTAO", "RTAO (ray traced, experimental)" };
       int ao_mode = g_ao_mode.load();
       if (ao_mode < AO_MODE_OFF || ao_mode >= AO_MODE_COUNT)
          ao_mode = AO_MODE_XEGTAO;
-      if (ImGui::Combo("Ambient Occlusion", &ao_mode, ao_mode_names, AO_MODE_COUNT))
+      int ao_index = 0;
+      for (int i = 0; i < AO_MODE_COUNT; i++)
+         if (ao_mode_order[i] == ao_mode)
+            ao_index = i;
+      if (ImGui::Combo("Ambient Occlusion", &ao_index, ao_mode_names, AO_MODE_COUNT))
       {
+         ao_mode = ao_mode_order[ao_index];
+         if (ao_mode == AO_MODE_HBAO && !g_game_ao.valid)
+            ao_mode = AO_MODE_OFF;
          g_ao_mode = ao_mode;
+         g_ao_mode_apply_pending = true;
          reshade::set_config_value(runtime, NAME, "AOMode", ao_mode);
       }
       if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
       {
-         ImGui::SetTooltip("Replaces the game's SSAO, HBAO+ has to be disabled in game.\nOff: the game's own SSAO.\nXeGTAO: Intel's ground truth AO.\nRTAO: ray traced AO on a side D3D12 device (work in progress: currently an interop test, needs DXR 1.1). Falls back to XeGTAO if unavailable.");
+         ImGui::SetTooltip("Off: no AO (the game's own SSAO/DWAO draws nothing on PC).\nHBAO+: the game's NVIDIA HBAO+ (sets the game's r_hbao; the in game AO menu stays in sync).\nXeGTAO: Intel's ground truth AO, replacing the game's SSAO pass.\nRTAO: ray traced AO on a side D3D12 device (needs DXR 1.1, falls back to XeGTAO if unavailable).");
       }
       static const char* ao_view_names[] = { "Off", "Final AO (after the game's blur)", "RTAO output (before the game's blur)" };
       ImGui::Combo("View AO only (debug)", &g_ao_view_mode, ao_view_names, IM_ARRAYSIZE(ao_view_names));

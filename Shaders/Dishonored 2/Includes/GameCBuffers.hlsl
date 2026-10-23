@@ -13,6 +13,10 @@ struct LumaGameSettings
    float LensDirtStrength; // 1 = vanilla, 0 = disabled.
    float LensFlareStrength;// 1 = vanilla, 0 = disabled.
    float VignetteStrength; // 1 = vanilla, 0 = disabled.
+   // RT sun shadows, read by the screen shadows pass (Includes/ScreenShadows.hlsl): 0 = the game's shadow maps,
+   // 1 = ray traced, 2 = ray traced x the game's. Only applies when Luma binds the traced visibility that frame.
+   uint RTSunMode;
+   float3 RTSunPad;
 };
 
 struct LumaGameData

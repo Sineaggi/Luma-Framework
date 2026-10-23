@@ -3,9 +3,10 @@
 // depth copy shaders from Shaders/Dishonored 2/Luma_RTAO.hlsl, the D3D12 test kernel and the readback on D3D11.
 // M1: TLAS retention, D3D11 -> D3D12 shared buffers, BLAS (CPU and shared-buffer input) + TLAS of a box scene,
 // ray traced AO (RayQuery) and the denoiser, checked against a CPU ray cast of the same scene.
+// RT sun shadows (rtsun_test.inl): the sun pass on the same scene, the light capture, the screen shadows shaders.
 //
 // Build (x64 Native Tools prompt, from this folder):
-//   cl /nologo /std:c++20 /EHsc /O2 /I.. rtao_interop_test.cpp ..\rtao_interop.cpp ..\rtao_accel.cpp ..\rtao_pass.cpp ..\rtao_capture.cpp d3d11.lib d3dcompiler.lib
+//   cl /nologo /std:c++20 /EHsc /O2 /I.. rtao_interop_test.cpp ..\rtao_interop.cpp ..\rtao_accel.cpp ..\rtao_pass.cpp ..\rtao_capture.cpp ..\rtsun_pass.cpp d3d11.lib d3dcompiler.lib
 // Run from this folder (it reads the shaders by relative path): rtao_interop_test.exe
 
 #ifndef NOMINMAX
@@ -1588,6 +1589,8 @@ static void TestFrameMeshes(ID3D11Device* device, ID3D11DeviceContext* context, 
       p->Release();
 }
 
+#include "rtsun_test.inl"
+
 int main()
 {
    setvbuf(stdout, nullptr, _IONBF, 0);
@@ -1700,6 +1703,9 @@ int main()
    TestReflection();
    TestGeometryCapture(device, context, interop, vs, ps);
    TestFrameMeshes(device, context, interop, vs, ps);
+   TestSunShadows(device, context, interop, vs, ps);
+   TestLightCapture(device, context);
+   TestScreenShadowsShader(device, context);
 
    // With RTAO_D3D12_DEBUG set: any D3D12 validation error fails the test
    ID3D12InfoQueue* info_queue = nullptr;

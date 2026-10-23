@@ -15,6 +15,9 @@ echo Using "%DXC%"
 pushd "%~dp0"
 "%DXC%" -nologo -T cs_6_5 -E main -O3 -Fh rtao_trace_cs.h -Vn g_rtao_trace_cs rtao_trace.hlsl || goto :fail
 "%DXC%" -nologo -T cs_6_5 -E main -O3 -Fh rtao_filter_cs.h -Vn g_rtao_filter_cs rtao_filter.hlsl || goto :fail
+rem RT sun shadows (rtsun_pass.cpp)
+"%DXC%" -nologo -T cs_6_5 -E main -O3 -Fh rtsun_trace_cs.h -Vn g_rtsun_trace_cs rtsun_trace.hlsl || goto :fail
+"%DXC%" -nologo -T cs_6_5 -E main -O3 -Fh rtsun_filter_cs.h -Vn g_rtsun_filter_cs rtsun_filter.hlsl || goto :fail
 popd
 echo RTAO shaders compiled
 exit /b 0

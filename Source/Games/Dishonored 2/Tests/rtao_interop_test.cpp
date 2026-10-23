@@ -552,16 +552,27 @@ static void TestReflection()
       const char* file;
       RTAO::MatrixSource source;
       const char* skip;
-      bool wind;
+      bool wind = false;
+      uint32_t skin_sets = 0; // Skinned: 1 or 2
+      uint32_t bones_slot = 0;
+      uint32_t mtx_offset_cb = 0;
    };
    const Case cases[] = {
-      { "0x004D8839.vs_5_0.cso", RTAO::MatrixSource::DirectInstanceBuffer, nullptr, false }, // G-buffer, direct instance buffer
-      { "0x00603116.vs_5_0.cso", RTAO::MatrixSource::DirectInstanceBuffer, nullptr, false }, // depth only, direct instance buffer
-      { "0x000209DB.vs_5_0.cso", RTAO::MatrixSource::IndexedInstanceBuffer, nullptr, false },
-      { "0x0008106B.vs_5_0.cso", RTAO::MatrixSource::ConstantBuffer, nullptr, false },
-      { "0x0236F519.vs_5_0.cso", RTAO::MatrixSource::None, "skinned", false },
-      { "0x0275C69D.vs_5_0.cso", RTAO::MatrixSource::MvpConstantBuffer, nullptr, false }, // MVP only, declares PerViewCB
-      { "0x00E0ECFF.vs_5_0.cso", RTAO::MatrixSource::MvpConstantBuffer, nullptr, false }, // MVP only, PerViewCB assumed at b1
+      { "0x004D8839.vs_5_0.cso", RTAO::MatrixSource::DirectInstanceBuffer, nullptr }, // G-buffer, direct instance buffer
+      { "0x00603116.vs_5_0.cso", RTAO::MatrixSource::DirectInstanceBuffer, nullptr }, // depth only, direct instance buffer
+      { "0x000209DB.vs_5_0.cso", RTAO::MatrixSource::IndexedInstanceBuffer, nullptr },
+      { "0x0008106B.vs_5_0.cso", RTAO::MatrixSource::ConstantBuffer, nullptr },
+      { "0x0236F519.vs_5_0.cso", RTAO::MatrixSource::MvpConstantBuffer, nullptr, false, 1, 0, 0 }, // skinned, MVP only, depth only
+      { "0x00299934.vs_5_0.cso", RTAO::MatrixSource::DirectInstanceBuffer, nullptr, false, 2, 0, 16 }, // skinned (8 bones), direct instance buffer
+      { "0x00C40689.vs_5_0.cso", RTAO::MatrixSource::IndexedInstanceBuffer, nullptr, false, 1, 2, 96 }, // skinned, indexed instance buffer, bones at t2
+      { "0x02973411.vs_5_0.cso", RTAO::MatrixSource::ConstantBuffer, nullptr, false, 2, 0, 16 }, // skinned, cb_modelmatrix rows
+      // Seen with DYNAMIC vertex buffers in game (movable objects: doors, windows)
+      { "0xBDE400DD.vs_5_0.cso", RTAO::MatrixSource::MvpConstantBuffer, nullptr }, // VERTEX_POSITION0/1 (previous), MVP + previous MVP
+      { "0x129571C1.vs_5_0.cso", RTAO::MatrixSource::MvpConstantBuffer, nullptr },
+      { "0x722BBAC1.vs_5_0.cso", RTAO::MatrixSource::MvpConstantBuffer, nullptr },
+      { "0xC81598D1.vs_5_0.cso", RTAO::MatrixSource::ConstantBuffer, nullptr }, // cb_modelmatrix rows + MVP
+      { "0x0275C69D.vs_5_0.cso", RTAO::MatrixSource::MvpConstantBuffer, nullptr }, // MVP only, declares PerViewCB
+      { "0x00E0ECFF.vs_5_0.cso", RTAO::MatrixSource::MvpConstantBuffer, nullptr }, // MVP only, PerViewCB assumed at b1
       { "0x65471A10.vs_5_0.cso", RTAO::MatrixSource::IndexedInstanceBuffer, nullptr, true }, // vegetation bending, ro_windbuffer
       { "0x24159CF5.vs_5_0.cso", RTAO::MatrixSource::IndexedInstanceBuffer, nullptr, true }, // spline wind (ro_splineinfos)
       { "0x09B3E8ED.vs_5_0.cso", RTAO::MatrixSource::IndexedInstanceBuffer, nullptr, true }, // vegetation bending, constant wind
@@ -591,6 +602,9 @@ static void TestReflection()
          int(info.wind), int(info.instance_cb_slot), int(info.instance_offset_cb), int(info.row_cb[0]), int(info.row_cb[1]), int(info.row_cb[2]), int(info.depth_hack_cb), int(info.instance_buffer_slot), info.instance_buffer_stride, int(info.instance_index_slot));
       CHECK(info.source == c.source, "%s: wrong matrix source", c.file);
       CHECK(!c.skip || (info.skip_reason && strcmp(info.skip_reason, c.skip) == 0), "%s: wrong skip reason", c.file);
+      if (c.skin_sets)
+         printf("   skinned: %u sets, ro_matrices t%d, cb_mtxoffset @%d\n", info.skin_sets, int(info.bones_slot), int(info.mtx_offset_cb));
+      CHECK(info.skinned == (c.skin_sets != 0) && (!c.skin_sets || (info.skin_sets == c.skin_sets && info.bones_slot == c.bones_slot && info.mtx_offset_cb == c.mtx_offset_cb)), "%s: wrong skinning reflection", c.file);
       CHECK(info.wind == c.wind, "%s: wind %d expected", c.file, int(c.wind));
       tested++;
    }
@@ -874,7 +888,7 @@ static void TestGeometryCapture(ID3D11Device* device, ID3D11DeviceContext* conte
    cs_code->Release();
 
    RTAO::GeometryCapture capture;
-   CHECK(capture.Init(device, interop, capture_cs, error), "GeometryCapture::Init: %s", error.c_str());
+   CHECK(capture.Init(device, interop, capture_cs, nullptr, error), "GeometryCapture::Init: %s", error.c_str());
    capture_cs->Release();
    ID3D11DeviceContext* deferred = nullptr;
    device->CreateDeferredContext(0, &deferred);
@@ -1058,6 +1072,522 @@ static void TestGeometryCapture(ID3D11Device* device, ID3D11DeviceContext* conte
       p->Release();
 }
 
+// ---- Per frame meshes: skinned draws (bone palette + instance transform replayed by skin_vertices_cs) and a DYNAMIC
+// vertex buffer, through the real D3D11 compute path, built/refit as current-frame-only BLASes
+
+// Bone rows mapping the unit cube to "box" minus "offset" (the instance/model transform adds the offset back)
+static void BoneRows(const Box& box, V3 offset, float out[12])
+{
+   const float rows[12] = { box.max.x - box.min.x, 0, 0, box.min.x - offset.x, 0, box.max.y - box.min.y, 0, box.min.y - offset.y, 0, 0, box.max.z - box.min.z, box.min.z - offset.z };
+   std::memcpy(out, rows, sizeof(rows));
+}
+
+static uint16_t ToHalf(float f)
+{
+   // Exact for the small integers used here
+   uint32_t bits;
+   std::memcpy(&bits, &f, 4);
+   if ((bits & 0x7FFFFFFF) == 0)
+      return uint16_t(bits >> 16);
+   const uint32_t sign = (bits >> 16) & 0x8000;
+   const int32_t exponent = int32_t((bits >> 23) & 0xFF) - 127 + 15;
+   const uint32_t mantissa = (bits >> 13) & 0x3FF;
+   return uint16_t(sign | (uint32_t(exponent) << 10) | mantissa);
+}
+
+static void TestFrameMeshes(ID3D11Device* device, ID3D11DeviceContext* context, RTAO::Interop& interop, ID3D11VertexShader* copy_vs, ID3D11PixelShader* depth_ps)
+{
+   std::string error;
+   const UINT W = 320, H = 180;
+   CHECK(interop.EnsureTargets(device, W, H, W, H, error), "EnsureTargets: %s", error.c_str());
+
+   const V3 eye = { 0, 4, -9 }, target = { 0, 0.5f, 0 }, up = { 0, 1, 0 };
+   const V3 f = Normalize(Sub(target, eye)), r = Normalize(Cross(up, f)), u = Cross(f, r);
+   Mat4 view;
+   view(0, 0) = r.x; view(0, 1) = u.x; view(0, 2) = f.x;
+   view(1, 0) = r.y; view(1, 1) = u.y; view(1, 2) = f.y;
+   view(2, 0) = r.z; view(2, 1) = u.z; view(2, 2) = f.z;
+   view(3, 0) = -Dot(r, eye); view(3, 1) = -Dot(u, eye); view(3, 2) = -Dot(f, eye); view(3, 3) = 1;
+   const float n = 0.1f, fr = 1000.f, sy = 1.f / std::tan(3.14159265f / 6.f), sx = sy / (float(W) / float(H));
+   Mat4 proj;
+   proj(0, 0) = sx;
+   proj(1, 1) = sy;
+   proj(2, 2) = -n / (fr - n);
+   proj(2, 3) = 1;
+   proj(3, 2) = n * fr / (fr - n);
+   const Mat4 view_proj = Mul(view, proj), inv_view_proj = Inverse(view_proj);
+
+   // Scene: 0 ground (static capture), A/B skinned draw 1 (direct instance buffer, 4 bones, game indices),
+   // C/D skinned draw 2 (MVP only, 8 bones, half float positions, triangle soup), E dynamic vertex buffer (cbuffer rows).
+   // Pose 2 moves B (a bone) and E (the dynamic vertices): it must show up in the very frame it is drawn.
+   enum { kGround, kA, kB, kC, kD, kE, kSceneBoxes };
+   Box scene[2][kSceneBoxes] = {};
+   scene[0][kGround] = kBoxes[0];
+   scene[0][kA] = { { -3, 0, -1 }, { -2, 1, 0 } };
+   scene[0][kB] = { { -3, 1.5f, -1 }, { -2, 2, 0 } };
+   scene[0][kC] = { { 2, 0, -1 }, { 3, 1, 0 } };
+   scene[0][kD] = { { 2, 1.5f, -1 }, { 3, 2, 0 } };
+   scene[0][kE] = { { -0.5f, 0, 2 }, { 0.5f, 1, 3 } };
+   std::memcpy(scene[1], scene[0], sizeof(scene[0]));
+   scene[1][kB] = { { -3, 1.5f, 0.5f }, { -2, 2, 1.5f } };
+   scene[1][kE] = { { 0.5f, 0, 2 }, { 1.5f, 1, 3 } };
+
+   struct Reference
+   {
+      std::vector<float> depth;
+      std::vector<int> hit_id;
+      std::vector<V3> hit_pos;
+   };
+   auto make_reference = [&](const Box* boxes) {
+      Reference ref;
+      ref.depth.assign(W * H, 0.f);
+      ref.hit_id.assign(W * H, -1);
+      ref.hit_pos.resize(W * H);
+      for (UINT y = 0; y < H; y++)
+         for (UINT x = 0; x < W; x++)
+         {
+            float v[4] = { (x + 0.5f) / W * 2.f - 1.f, 1.f - (y + 0.5f) / H * 2.f, 0.5f, 1.f }, w[4] = {};
+            for (int c = 0; c < 4; c++)
+               for (int k = 0; k < 4; k++)
+                  w[c] += v[k] * inv_view_proj(k, c);
+            const V3 dir = Normalize(Sub({ w[0] / w[3], w[1] / w[3], w[2] / w[3] }, eye));
+            float best = 1e30f;
+            for (int b = 0; b < kSceneBoxes; b++)
+            {
+               float t;
+               if (RayBox(eye, dir, boxes[b], t) && t < best)
+               {
+                  best = t;
+                  ref.hit_id[y * W + x] = b;
+               }
+            }
+            if (ref.hit_id[y * W + x] < 0)
+               continue;
+            const V3 p = { eye.x + dir.x * best, eye.y + dir.y * best, eye.z + dir.z * best };
+            ref.hit_pos[y * W + x] = p;
+            float clip[4] = {};
+            const float pv[4] = { p.x, p.y, p.z, 1.f };
+            for (int c = 0; c < 4; c++)
+               for (int k = 0; k < 4; k++)
+                  clip[c] += pv[k] * view_proj(k, c);
+            ref.depth[y * W + x] = clip[2] / clip[3];
+         }
+      return ref;
+   };
+   const Reference refs[2] = { make_reference(scene[0]), make_reference(scene[1]) };
+   D3D11_TEXTURE2D_DESC depth_desc = { W, H, 1, 1, DXGI_FORMAT_R32_FLOAT, { 1, 0 }, D3D11_USAGE_DEFAULT, D3D11_BIND_SHADER_RESOURCE, 0, 0 };
+   ID3D11Texture2D* depth_texture = nullptr;
+   device->CreateTexture2D(&depth_desc, nullptr, &depth_texture);
+   ID3D11ShaderResourceView* depth_srv = nullptr;
+   device->CreateShaderResourceView(depth_texture, nullptr, &depth_srv);
+
+   // Mesh of the skinned draws: two unit cubes (16 vertices, 72 indices), the second one on other bones
+   std::vector<uint16_t> two_cubes_indices(72);
+   for (int i = 0; i < 72; i++)
+      two_cubes_indices[i] = uint16_t(kCubeIndices[i % 36] + (i >= 36 ? 8 : 0));
+
+   // Skinned draw 1: stream 0 = uv + float3 position (stride 20), stream 1 = R8G8B8A8_UINT indices + R8G8B8A8_UNORM
+   // weights (stride 8). Cube 0: bones 0 and 1 (identical) blended 128/255 + 127/255; cube 1: bone 2. cb_mtxoffset 2.
+   struct Vertex1
+   {
+      float uv[2];
+      float pos[3];
+   };
+   std::vector<Vertex1> vertices1(16);
+   std::vector<uint8_t> skin1(16 * 8, 0);
+   for (int i = 0; i < 16; i++)
+   {
+      vertices1[i] = { { 0, 0 }, { kCubeVertices[(i % 8) * 3], kCubeVertices[(i % 8) * 3 + 1], kCubeVertices[(i % 8) * 3 + 2] } };
+      uint8_t* s = &skin1[i * 8];
+      if (i < 8)
+      {
+         s[0] = 0; s[1] = 1; s[4] = 128; s[5] = 127;
+      }
+      else
+      {
+         s[0] = 2; s[4] = 255;
+      }
+   }
+   ID3D11Buffer* vb1 = MakeBuffer(device, D3D11_BIND_VERTEX_BUFFER, vertices1.data(), UINT(vertices1.size() * sizeof(Vertex1)));
+   ID3D11Buffer* skin_vb1 = MakeBuffer(device, D3D11_BIND_VERTEX_BUFFER, skin1.data(), UINT(skin1.size()));
+   ID3D11Buffer* ib1 = MakeBuffer(device, D3D11_BIND_INDEX_BUFFER, two_cubes_indices.data(), 72 * 2);
+
+   // Skinned draw 2: one stream, stride 56: half4 position @0, R16G16B16A16_UINT indices0 @8 and indices1 @16, float4
+   // weights0 @24 and weights1 @40. Cube 0: 0.25 + 0.25 on bone 0 and 0.5 on bone 1 (identical), cube 1: bone 2.
+   // 4 unrelated vertices in front (base vertex 4) and 200 after: more vertices than indices, so it goes as a soup.
+   const uint32_t stride2 = 56;
+   std::vector<uint8_t> vertices2((4 + 16 + 200) * stride2, 0x3C);
+   for (int i = 0; i < 16; i++)
+   {
+      uint8_t* v = &vertices2[(4 + i) * stride2];
+      const uint16_t half[4] = { ToHalf(kCubeVertices[(i % 8) * 3]), ToHalf(kCubeVertices[(i % 8) * 3 + 1]), ToHalf(kCubeVertices[(i % 8) * 3 + 2]), ToHalf(1.f) };
+      std::memcpy(v, half, 8);
+      uint16_t idx0[4] = { 0, 0, 0, 0 }, idx1[4] = { 1, 0, 0, 0 };
+      float w0[4] = { 0.25f, 0.25f, 0, 0 }, w1[4] = { 0.5f, 0, 0, 0 };
+      if (i >= 8)
+      {
+         idx0[0] = 2;
+         w0[0] = 1.f;
+         w0[1] = 0.f;
+         w1[0] = 0.f;
+      }
+      std::memcpy(v + 8, idx0, 8);
+      std::memcpy(v + 16, idx1, 8);
+      std::memcpy(v + 24, w0, 16);
+      std::memcpy(v + 40, w1, 16);
+   }
+   ID3D11Buffer* vb2 = MakeBuffer(device, D3D11_BIND_VERTEX_BUFFER, vertices2.data(), UINT(vertices2.size()));
+   std::vector<uint16_t> ib2_data(6 + 72, 1);
+   std::memcpy(&ib2_data[6], two_cubes_indices.data(), 72 * 2);
+   ID3D11Buffer* ib2 = MakeBuffer(device, D3D11_BIND_INDEX_BUFFER, ib2_data.data(), UINT(ib2_data.size() * 2));
+
+   // Bone palette (Buffer<float4>, 3 rows per bone): [0..1] garbage, [2..4] draw 1 (A, A, B) relative to its instance
+   // offset (+0.5, 0, 0), [5..7] the view model (a huge box), [8..10] draw 2 (C, C, D) relative to its model offset
+   // (0, 0, 0.5)
+   const V3 offset1 = { 0.5f, 0, 0 }, offset2 = { 0, 0, 0.5f };
+   auto make_palette = [&](int pose) {
+      std::vector<float> palette(11 * 12, 1000.f);
+      BoneRows(scene[pose][kA], offset1, &palette[2 * 12]);
+      BoneRows(scene[pose][kA], offset1, &palette[3 * 12]);
+      BoneRows(scene[pose][kB], offset1, &palette[4 * 12]);
+      for (int b = 5; b < 8; b++)
+         BoneRows({ { -50, -50, -50 }, { 50, 50, 50 } }, offset1, &palette[b * 12]);
+      BoneRows(scene[pose][kC], offset2, &palette[8 * 12]);
+      BoneRows(scene[pose][kC], offset2, &palette[9 * 12]);
+      BoneRows(scene[pose][kD], offset2, &palette[10 * 12]);
+      return palette;
+   };
+   std::vector<float> palette = make_palette(0);
+   ID3D11Buffer* bones_buffer = MakeBuffer(device, D3D11_BIND_SHADER_RESOURCE, palette.data(), UINT(palette.size() * 4), D3D11_USAGE_DEFAULT);
+   D3D11_SHADER_RESOURCE_VIEW_DESC bones_desc = {};
+   bones_desc.Format = DXGI_FORMAT_R32G32B32A32_FLOAT;
+   bones_desc.ViewDimension = D3D11_SRV_DIMENSION_BUFFER;
+   bones_desc.Buffer.NumElements = UINT(palette.size() / 4);
+   ID3D11ShaderResourceView* bones_srv = nullptr;
+   device->CreateShaderResourceView(bones_buffer, &bones_desc, &bones_srv);
+
+   // Draw 1 instance data: direct instance buffer (stride 96, rows @48), PerInstanceCB: cb_mtxoffset @0,
+   // cb_instancebufferoffset @16, cb_modeldepthhack @20
+   std::vector<float> direct(2 * 24, 0.f);
+   const float instance_rows[12] = { 1, 0, 0, offset1.x, 0, 1, 0, offset1.y, 0, 0, 1, offset1.z };
+   std::memcpy(&direct[24 + 12], instance_rows, sizeof(instance_rows));
+   ID3D11Buffer* direct_buffer = MakeBuffer(device, D3D11_BIND_SHADER_RESOURCE, direct.data(), UINT(direct.size() * 4), D3D11_USAGE_IMMUTABLE, D3D11_RESOURCE_MISC_BUFFER_STRUCTURED, 96);
+   ID3D11ShaderResourceView* direct_srv = nullptr;
+   device->CreateShaderResourceView(direct_buffer, nullptr, &direct_srv);
+   auto make_cb1 = [&](uint32_t mtx_offset, float depth_hack) {
+      uint32_t cb[16] = {};
+      cb[0] = mtx_offset;
+      cb[16 / 4] = 1; // Instance 1 of the buffer
+      std::memcpy(&cb[20 / 4], &depth_hack, 4);
+      return MakeBuffer(device, D3D11_BIND_CONSTANT_BUFFER, cb, sizeof(cb));
+   };
+   ID3D11Buffer* cb1 = make_cb1(2, 1.f);
+   ID3D11Buffer* cb_view_model = make_cb1(5, 0.25f);
+
+   // Draw 2: MVP only (cb_mtxoffset @0, cb_mvpmatrixz @16, y @32, x @48, w @64, depth hack @84), PerViewCB VP @32
+   ID3D11Buffer* cb2 = nullptr;
+   ID3D11Buffer* per_view_cb = nullptr;
+   {
+      Mat4 model;
+      model(0, 0) = model(1, 1) = model(2, 2) = model(3, 3) = 1.f;
+      model(3, 0) = offset2.x;
+      model(3, 1) = offset2.y;
+      model(3, 2) = offset2.z;
+      const Mat4 mvp = Mul(model, view_proj);
+      std::vector<float> cb(96 / 4, 0.f);
+      reinterpret_cast<uint32_t*>(cb.data())[0] = 8;
+      const uint32_t column_offsets[4] = { 48, 32, 16, 64 };
+      for (int c = 0; c < 4; c++)
+         for (int r = 0; r < 4; r++)
+            cb[column_offsets[c] / 4 + r] = mvp(r, c);
+      cb[84 / 4] = 1.f;
+      cb2 = MakeBuffer(device, D3D11_BIND_CONSTANT_BUFFER, cb.data(), 96);
+      std::vector<float> view(112 / 4, 0.f);
+      std::memcpy(&view[32 / 4], view_proj.m, 64);
+      per_view_cb = MakeBuffer(device, D3D11_BIND_CONSTANT_BUFFER, view.data(), 112);
+   }
+
+   // Dynamic mesh E: DYNAMIC float3 vertex buffer rewritten every frame (box corners directly), identity cbuffer rows
+   // (z @160, y @176, x @192, depth hack @464), the static cube index buffer
+   D3D11_BUFFER_DESC dynamic_desc = { 8 * 12, D3D11_USAGE_DYNAMIC, D3D11_BIND_VERTEX_BUFFER, D3D11_CPU_ACCESS_WRITE, 0, 0 };
+   ID3D11Buffer* dynamic_vb = nullptr;
+   device->CreateBuffer(&dynamic_desc, nullptr, &dynamic_vb);
+   ID3D11Buffer* cube_ib = MakeBuffer(device, D3D11_BIND_INDEX_BUFFER, std::vector<uint16_t>(kCubeIndices, kCubeIndices + 36).data(), 72);
+   ID3D11Buffer* identity_cb = nullptr;
+   ID3D11Buffer* ground_cb = nullptr;
+   {
+      std::vector<float> cb(480 / 4, 0.f);
+      cb[192 / 4] = 1.f;
+      cb[176 / 4 + 1] = 1.f;
+      cb[160 / 4 + 2] = 1.f;
+      cb[464 / 4] = 1.f;
+      identity_cb = MakeBuffer(device, D3D11_BIND_CONSTANT_BUFFER, cb.data(), 480);
+      float t[12];
+      BoxTransform(kBoxes[0], t);
+      std::memcpy(&cb[192 / 4], &t[0], 16);
+      std::memcpy(&cb[176 / 4], &t[4], 16);
+      std::memcpy(&cb[160 / 4], &t[8], 16);
+      ground_cb = MakeBuffer(device, D3D11_BIND_CONSTANT_BUFFER, cb.data(), 480);
+   }
+   ID3D11Buffer* cube_vb = MakeBuffer(device, D3D11_BIND_VERTEX_BUFFER, kCubeVertices, sizeof(kCubeVertices));
+
+   // Vertex shader descriptions, as ReflectVertexShader produces them for the game's shaders
+   RTAO::VertexShaderInfo skinned1_vs, skinned2_vs, cb_vs;
+   skinned1_vs.source = RTAO::MatrixSource::DirectInstanceBuffer;
+   skinned1_vs.skip_reason = nullptr;
+   skinned1_vs.instance_cb_slot = 2;
+   skinned1_vs.instance_offset_cb = 16;
+   skinned1_vs.depth_hack_cb = 20;
+   skinned1_vs.instance_buffer_slot = 1;
+   skinned1_vs.instance_buffer_stride = 96;
+   skinned1_vs.record_row0 = 48;
+   skinned1_vs.skinned = true;
+   skinned1_vs.skin_sets = 1;
+   skinned1_vs.bones_slot = 0;
+   skinned1_vs.mtx_offset_cb = 0;
+   skinned2_vs.source = RTAO::MatrixSource::MvpConstantBuffer;
+   skinned2_vs.skip_reason = nullptr;
+   skinned2_vs.instance_cb_slot = 2;
+   skinned2_vs.mvp_cb[0] = 48;
+   skinned2_vs.mvp_cb[1] = 32;
+   skinned2_vs.mvp_cb[2] = 16;
+   skinned2_vs.mvp_cb[3] = 64;
+   skinned2_vs.depth_hack_cb = 84;
+   skinned2_vs.per_view_cb_slot = 1;
+   skinned2_vs.view_proj_cb = 32;
+   skinned2_vs.skinned = true;
+   skinned2_vs.skin_sets = 2;
+   skinned2_vs.bones_slot = 0;
+   skinned2_vs.mtx_offset_cb = 0;
+   cb_vs.source = RTAO::MatrixSource::ConstantBuffer;
+   cb_vs.skip_reason = nullptr;
+   cb_vs.instance_cb_slot = 2;
+   cb_vs.row_cb[0] = 192;
+   cb_vs.row_cb[1] = 176;
+   cb_vs.row_cb[2] = 160;
+   cb_vs.depth_hack_cb = 464;
+
+   RTAO::DrawInfo draw1;
+   draw1.vs = &skinned1_vs;
+   draw1.vertex_buffer = vb1;
+   draw1.vertex_stride = sizeof(Vertex1);
+   draw1.position_format = DXGI_FORMAT_R32G32B32_FLOAT;
+   draw1.position_offset = 8;
+   draw1.index_buffer = ib1;
+   draw1.index_format = DXGI_FORMAT_R16_UINT;
+   draw1.index_count = 72;
+   draw1.instance_cb = cb1;
+   draw1.instance_buffer = direct_srv;
+   draw1.bones = bones_srv;
+   draw1.skin_indices[0] = { skin_vb1, 8, 0, 0, DXGI_FORMAT_R8G8B8A8_UINT };
+   draw1.skin_weights[0] = { skin_vb1, 8, 0, 4, DXGI_FORMAT_R8G8B8A8_UNORM };
+   RTAO::DrawInfo draw_view_model = draw1;
+   draw_view_model.instance_cb = cb_view_model;
+   RTAO::DrawInfo draw_instanced = draw1;
+   draw_instanced.instance_count = 2;
+   RTAO::DrawInfo draw2;
+   draw2.vs = &skinned2_vs;
+   draw2.vertex_buffer = vb2;
+   draw2.vertex_stride = stride2;
+   draw2.position_format = DXGI_FORMAT_R16G16B16A16_FLOAT;
+   draw2.position_offset = 0;
+   draw2.index_buffer = ib2;
+   draw2.index_format = DXGI_FORMAT_R16_UINT;
+   draw2.index_count = 72;
+   draw2.first_index = 6;
+   draw2.base_vertex = 4;
+   draw2.instance_cb = cb2;
+   draw2.per_view_cb = per_view_cb;
+   draw2.bones = bones_srv;
+   draw2.skin_indices[0] = { vb2, stride2, 0, 8, DXGI_FORMAT_R16G16B16A16_UINT };
+   draw2.skin_indices[1] = { vb2, stride2, 0, 16, DXGI_FORMAT_R16G16B16A16_UINT };
+   draw2.skin_weights[0] = { vb2, stride2, 0, 24, DXGI_FORMAT_R32G32B32A32_FLOAT };
+   draw2.skin_weights[1] = { vb2, stride2, 0, 40, DXGI_FORMAT_R32G32B32A32_FLOAT };
+   RTAO::DrawInfo draw_dynamic;
+   draw_dynamic.vs = &cb_vs;
+   draw_dynamic.vertex_buffer = dynamic_vb;
+   draw_dynamic.vertex_stride = 12;
+   draw_dynamic.position_format = DXGI_FORMAT_R32G32B32_FLOAT;
+   draw_dynamic.index_buffer = cube_ib;
+   draw_dynamic.index_format = DXGI_FORMAT_R16_UINT;
+   draw_dynamic.index_count = 36;
+   draw_dynamic.instance_cb = identity_cb;
+   RTAO::DrawInfo draw_ground = draw_dynamic;
+   draw_ground.vertex_buffer = cube_vb;
+   draw_ground.instance_cb = ground_cb;
+
+   ID3DBlob* cs_code = Compile(L"..\\..\\..\\..\\Shaders\\Dishonored 2\\Luma_RTAO.hlsl", "capture_instances_cs", "cs_5_0");
+   ID3D11ComputeShader* capture_cs = nullptr;
+   device->CreateComputeShader(cs_code->GetBufferPointer(), cs_code->GetBufferSize(), nullptr, &capture_cs);
+   cs_code->Release();
+   cs_code = Compile(L"..\\..\\..\\..\\Shaders\\Dishonored 2\\Luma_RTAO.hlsl", "skin_vertices_cs", "cs_5_0");
+   ID3D11ComputeShader* skin_cs = nullptr;
+   device->CreateComputeShader(cs_code->GetBufferPointer(), cs_code->GetBufferSize(), nullptr, &skin_cs);
+   cs_code->Release();
+
+   RTAO::GeometryCapture capture;
+   CHECK(capture.Init(device, interop, capture_cs, skin_cs, error), "GeometryCapture::Init: %s", error.c_str());
+   CHECK(capture.IsSkinningAvailable(), "skinning resources: %s", capture.skinning_error.c_str());
+   capture_cs->Release();
+   skin_cs->Release();
+   ID3D11DeviceContext* deferred = nullptr;
+   device->CreateDeferredContext(0, &deferred);
+
+   RTAO::Retirer retirer;
+   RTAO::BlasCache blases;
+   RTAO::TlasBuilder tlas;
+   RTAO::AOPass pass;
+   CHECK(pass.Init(interop.GetDevice(), error), "AOPass::Init: %s", error.c_str());
+   RTAO::PassSettings settings;
+   std::memcpy(settings.view_proj, view_proj.m, sizeof(settings.view_proj));
+   std::memcpy(settings.inv_view_proj, inv_view_proj.m, sizeof(settings.inv_view_proj));
+   settings.cam_pos[0] = eye.x; settings.cam_pos[1] = eye.y; settings.cam_pos[2] = eye.z;
+   settings.cam_fwd[0] = f.x; settings.cam_fwd[1] = f.y; settings.cam_fwd[2] = f.z;
+
+   uint32_t tlas_count = 0;
+   auto run_frame = [&](int pose, uint32_t debug_mode) {
+      // The pose: bones (DEFAULT buffer) and the dynamic vertices (Map discard), as the game would update them
+      palette = make_palette(pose);
+      context->UpdateSubresource(bones_buffer, 0, nullptr, palette.data(), 0, 0);
+      D3D11_MAPPED_SUBRESOURCE mapped = {};
+      if (SUCCEEDED(context->Map(dynamic_vb, 0, D3D11_MAP_WRITE_DISCARD, 0, &mapped)))
+      {
+         const Box& e = scene[pose][kE];
+         float* v = static_cast<float*>(mapped.pData);
+         for (int i = 0; i < 8; i++)
+         {
+            v[i * 3 + 0] = kCubeVertices[i * 3 + 0] ? e.max.x : e.min.x;
+            v[i * 3 + 1] = kCubeVertices[i * 3 + 1] ? e.max.y : e.min.y;
+            v[i * 3 + 2] = kCubeVertices[i * 3 + 2] ? e.max.z : e.min.z;
+         }
+         context->Unmap(dynamic_vb, 0);
+      }
+      context->UpdateSubresource(depth_texture, 0, nullptr, refs[pose].depth.data(), W * 4, 0);
+
+      CHECK(capture.CaptureDraw(context, draw_ground), "capture (ground)");
+      CHECK(capture.CaptureDraw(context, draw1), "capture (skinned, direct instance buffer)");
+      CHECK(capture.CaptureDraw(context, draw_view_model), "capture (skinned view model: dispatched, writes inactive triangles)");
+      CHECK(!capture.CaptureDraw(context, draw_instanced), "an instanced skinned draw must be skipped");
+      CHECK(capture.CaptureDraw(context, draw_dynamic), "capture (dynamic vertex buffer)");
+      CHECK(capture.CaptureDraw(deferred, draw2), "capture (skinned, MVP only, deferred)");
+      ID3D11CommandList* command_list = nullptr;
+      deferred->FinishCommandList(FALSE, &command_list);
+      capture.OnFinishCommandList(deferred, command_list);
+      capture.OnExecuteCommandList(command_list);
+      context->ExecuteCommandList(command_list, TRUE);
+      command_list->Release();
+
+      ID3D11RenderTargetView* rtv = interop.GetDepthRTV();
+      D3D11_VIEWPORT viewport = { 0, 0, (float)W, (float)H, 0, 1 };
+      context->RSSetViewports(1, &viewport);
+      context->OMSetRenderTargets(1, &rtv, nullptr);
+      context->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP);
+      context->VSSetShader(copy_vs, nullptr, 0);
+      context->PSSetShader(depth_ps, nullptr, 0);
+      context->PSSetShaderResources(0, 1, &depth_srv);
+      context->Draw(4, 0);
+      ID3D11RenderTargetView* null_rtv = nullptr;
+      context->OMSetRenderTargets(1, &null_rtv, nullptr);
+      ID3D11ShaderResourceView* null_srv = nullptr;
+      context->PSSetShaderResources(0, 1, &null_srv);
+      rtv->Release();
+
+      settings.filter_mode = RTAO::FilterMode::Off;
+      settings.debug_mode = debug_mode;
+      CHECK(interop.Run(context, [&](ID3D12GraphicsCommandList4* list, const RTAO::RecordInfo& info, std::string& err) {
+         retirer.Collect(info.completed_fence_value);
+         if (!capture.Record(list, info, blases, tlas, retirer, 64, err))
+            return false;
+         const RTAO::BuildContext ctx = { info.device, list, &retirer, info.submit_fence_value };
+         D3D12_GPU_VIRTUAL_ADDRESS top = 0;
+         if (!tlas.Build(ctx, blases, info.frame_slot, top, tlas_count, err))
+            return false;
+         return pass.Record(list, info, top, settings, retirer, err);
+      }, error), "Run (frame meshes): %s", error.c_str());
+      capture.OnPresent();
+      ID3D11ShaderResourceView* ao_srv = interop.GetAOSRV();
+      UINT w = 0, h = 0;
+      std::vector<float> ao = ReadAO(device, context, ao_srv, w, h);
+      ao_srv->Release();
+      return ao;
+   };
+
+   std::vector<float> raw;
+   for (int i = 0; i < 6; i++) // The ground's matrix is read back 3 frames late
+      raw = run_frame(0, 0);
+   const RTAO::CaptureStats stats = capture.GetStats();
+   printf("frame meshes: skinned %llu captured / %llu instanced skipped, dynamic %llu captured, last frame %llu draws %llu vertices, soup %llu, indexed %llu, BLAS builds %llu refits %llu failed %llu (%llu live), TLAS %u\n",
+      (unsigned long long)stats.skinned_captured, (unsigned long long)stats.skinned_instanced, (unsigned long long)stats.dynamic_captured, (unsigned long long)stats.frame_draws,
+      (unsigned long long)stats.frame_vertices, (unsigned long long)stats.frame_soup, (unsigned long long)stats.frame_indexed, (unsigned long long)stats.frame_blas_builds,
+      (unsigned long long)stats.frame_blas_refits, (unsigned long long)stats.frame_blas_failed, (unsigned long long)stats.frame_blas_count, tlas_count);
+   // Per frame: draw 1, the view model (its triangles are inactive, the CPU can't know it is one), draw 2, the dynamic mesh
+   CHECK(stats.skinned_captured == 18 && stats.skinned_instanced == 6 && stats.dynamic_captured == 6, "per frame: 3 skinned draws captured, 1 instanced skipped, 1 dynamic");
+   CHECK(stats.frame_draws == 4 && stats.frame_vertices == 16 + 16 + 72 + 8, "last frame: 4 per frame meshes (2 x 16 indexed skinned, 72 soup, 8 dynamic)");
+   CHECK(stats.frame_soup == 6 && stats.frame_indexed == 18, "draw 2 is a soup, the others indexed");
+   CHECK(stats.frame_blas_builds == 4 && stats.frame_blas_refits == 20 && stats.frame_blas_failed == 0, "built once, refit after");
+   CHECK(tlas_count == 5, "TLAS: the ground + 4 per frame meshes (got %u)", tlas_count);
+
+   const Reference& ref = refs[0];
+   auto average = [&](const std::vector<float>& ao, auto predicate, int& count) {
+      double sum = 0;
+      count = 0;
+      for (UINT i = 0; i < W * H; i++)
+         if (predicate(i))
+         {
+            sum += ao[i];
+            count++;
+         }
+      return count ? float(sum / count) : -1.f;
+   };
+   auto near_box = [&](int b) { return [&, b](UINT i) { return ref.hit_id[i] == kGround && BoxDistance(ref.hit_pos[i], scene[0][b]) < 0.15f; }; };
+   auto is_open_ground = [&](UINT i) {
+      if (ref.hit_id[i] != kGround)
+         return false;
+      for (int b = 1; b < kSceneBoxes; b++)
+         if (BoxDistance(ref.hit_pos[i], scene[0][b]) < 2.f)
+            return false;
+      return true;
+   };
+   int c[4];
+   const float open = average(raw, is_open_ground, c[0]), near_a = average(raw, near_box(kA), c[1]), near_c = average(raw, near_box(kC), c[2]), near_e = average(raw, near_box(kE), c[3]);
+   printf("frame meshes AO (raw): open ground %.3f, next to A (skinned, direct) %.3f (%d px), next to C (skinned, MVP, soup) %.3f (%d), next to E (dynamic) %.3f (%d)\n", open, near_a, c[1], near_c, c[2], near_e, c[3]);
+   CHECK(c[0] > 50 && open > 0.97f, "open ground unoccluded (the skinned view model must be left out)");
+   CHECK(c[1] > 5 && near_a < 0.8f, "skinned box A occludes");
+   CHECK(c[2] > 5 && near_c < 0.8f, "skinned box C occludes");
+   CHECK(c[3] > 5 && near_e < 0.8f, "dynamic box E occludes");
+
+   // Coverage: the per frame meshes line up with the depth, also in the frame the pose changes
+   for (int pose = 0; pose < 2; pose++)
+   {
+      const std::vector<float> coverage = run_frame(pose, 3);
+      int hits = 0, matched = 0, frame_hits = 0, frame_matched = 0;
+      for (UINT i = 0; i < W * H; i++)
+         if (refs[pose].hit_id[i] >= 0)
+         {
+            const bool ok = coverage[i] > 0.99f;
+            hits++;
+            matched += ok;
+            if (refs[pose].hit_id[i] != kGround)
+            {
+               frame_hits++;
+               frame_matched += ok;
+            }
+         }
+      printf("frame meshes coverage, pose %d: %d of %d geometry pixels match the depth (%.1f%%), per frame meshes %d of %d\n", pose, matched, hits, 100.0 * matched / std::max(hits, 1), frame_matched, frame_hits);
+      CHECK(frame_hits > 500 && matched > hits * 0.98 && frame_matched > frame_hits * 0.98, "per frame meshes must line up with the depth (pose %d)", pose);
+   }
+
+   CHECK(interop.WaitForIdle(5000), "WaitForIdle");
+   retirer.ReleaseAll();
+   pass.Shutdown(nullptr, 0);
+   tlas.Clear(nullptr, 0);
+   blases.Clear(nullptr, 0);
+   capture.Shutdown();
+   deferred->Release();
+   for (IUnknown* p : std::initializer_list<IUnknown*>{ vb1, skin_vb1, ib1, vb2, ib2, bones_buffer, bones_srv, direct_buffer, direct_srv, cb1, cb_view_model, cb2, per_view_cb, dynamic_vb, cube_ib, identity_cb, ground_cb, cube_vb, depth_srv, depth_texture })
+      p->Release();
+}
+
 int main()
 {
    setvbuf(stdout, nullptr, _IONBF, 0);
@@ -1169,6 +1699,7 @@ int main()
    TestRayTracedScene(device, context, interop, vs, ps);
    TestReflection();
    TestGeometryCapture(device, context, interop, vs, ps);
+   TestFrameMeshes(device, context, interop, vs, ps);
 
    // With RTAO_D3D12_DEBUG set: any D3D12 validation error fails the test
    ID3D12InfoQueue* info_queue = nullptr;

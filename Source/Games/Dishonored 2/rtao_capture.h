@@ -20,6 +20,22 @@
 //    copies along its path until they age out.
 //  - Deferred contexts: records are kept per context, handed to the command list at FinishCommandList and only
 //    count as executed when that list runs on the immediate context (ExecuteCommandList), like the RTAO split.
+//  - Skinned meshes (characters): the game skins in the vertex shader (ro_matrices bone palette, see RTAO_NOTES.md),
+//    so the vertices only exist for the draw. A second D3D11 compute dispatch at the draw (Luma_RTAO.hlsl
+//    skin_vertices_cs) replays the skinning AND the instance transform from the arena copy of the vertex buffers and
+//    the draw's own bone palette / PerInstanceCB / instance buffer, and writes WORLD space float3 positions into a
+//    shared ring. World space means the TLAS instance is the identity, so nothing has to come back to the CPU: the
+//    pose is the current frame's (no 3 frame matrix latency, no trail). The D3D12 side builds or refits one BLAS per
+//    skinned draw from that ring in the same frame (DynamicBlasSet) and adds it as a current-frame-only instance.
+//    Vertices: if the draw's vertex range (base vertex to the end of its buffers) is not larger than its index count,
+//    that range is skinned and the BLAS uses the game's indices; otherwise each index gets its own skinned vertex
+//    (a non indexed triangle soup), so the work is bounded by the draw's index count either way.
+//    First person view models and matrices the capture can't resolve write NaN positions (DXR then treats those
+//    triangles as inactive). Only single instance skinned draws are captured.
+//  - Meshes with a DYNAMIC vertex buffer (movable objects: doors, windows, cabinets) take the same per frame path
+//    without the skinning: the buffer is only valid for this frame, so instead of the one-time arena copy, the bytes
+//    from the draw's vertex 0 to the buffer end are copied at every draw into a D3D11 only ring (kDynamicRingBytes),
+//    which skin_vertices_cs reads with no bones. Their index buffers (DEFAULT) still go through the arena.
 
 #include "rtao_accel.h"
 #include "rtao_interop.h"
@@ -67,6 +83,12 @@ namespace RTAO
       // Vertex animated vegetation (ro_windbuffer, ro_splineinfos or cb_vegetanim_*, see RTAO_NOTES.md "Wind"). Its matrix
       // comes from one of the families above like any mesh; the wind displacement is ignored (captured in rest pose).
       bool wind = false;
+      // Skinning (VERTEX_SKININDICES inputs + Buffer<float4> ro_matrices): the skinned position is in model space, then
+      // goes through the matrix source above like any other vertex
+      bool skinned = false;
+      uint32_t skin_sets = 0; // 1: 4 bones (SKININDICES0/WEIGHTS0), 2: 8 bones (...1 too)
+      uint32_t bones_slot = kNoOffset; // ro_matrices SRV slot
+      uint32_t mtx_offset_cb = kNoOffset; // cb_mtxoffset in PerInstanceCB, bytes (.x = first bone row / 3)
    };
    // Uses D3DReflect (D3DCompiler_47.dll, loaded on first use). "input_signature", if given, receives the input
    // semantics (diagnostics).
@@ -90,6 +112,16 @@ namespace RTAO
       uint32_t position_slot = 0;
       uint32_t position_offset = 0;
       bool position_per_instance = false;
+      struct Element
+      {
+         bool present = false;
+         DXGI_FORMAT format = DXGI_FORMAT_UNKNOWN;
+         uint32_t slot = 0;
+         uint32_t offset = 0;
+         bool per_instance = false;
+      };
+      Element skin_indices[2]; // VERTEX_SKININDICES0/1
+      Element skin_weights[2]; // VERTEX_SKINWEIGHTS0/1
    };
    // Resolves D3D11_APPEND_ALIGNED_ELEMENT offsets
    InputLayoutInfo ParseInputLayout(const D3D11_INPUT_ELEMENT_DESC* elements, uint32_t count);
@@ -111,8 +143,27 @@ namespace RTAO
       uint32_t mvp_cb[4];
       uint32_t view_proj_cb;
       uint32_t pad2[3];
+      // skin_vertices_cs only
+      uint32_t skin_vertex_count; // Threads: vertices written
+      uint32_t skin_dst_vertex; // First vertex in the skinned ring
+      uint32_t skin_soup; // 0: vertex i of the draw's range, 1: the vertex of index i (triangle soup)
+      uint32_t skin_sets; // 1 or 2 (4 or 8 bones)
+      uint32_t mtx_offset_cb; // cb_mtxoffset in the game's PerInstanceCB, bytes
+      uint32_t skin_index_start; // Arena SRV byte address of the draw's first index (soup)
+      uint32_t skin_index32; // 1: 32 bit indices
+      uint32_t pad3;
+      // Streams: 0 position, 1 indices0, 2 weights0, 3 indices1, 4 weights1. Vertex v of stream s is at arena SRV byte
+      // address stream_base[s] + v * stream_stride[s] (base: buffer copy + IA offset + base vertex + element offset).
+      uint32_t stream_base[8];
+      uint32_t stream_stride[8];
+      uint32_t stream_format[8]; // VertexFormatCode()
    };
-   static_assert(sizeof(CaptureParams) == 80);
+   static_assert(sizeof(CaptureParams) == 208);
+
+   // Vertex element decoding for skin_vertices_cs: kind | component count << 4 | bits per component << 8, 0 if the
+   // shader can't decode it. Must match DecodeElement() in Luma_RTAO.hlsl.
+   uint32_t VertexFormatCode(DXGI_FORMAT format);
+   constexpr uint32_t kVertexFormatDynamicBuffer = 1u << 16; // Stream flag: read from the dynamic vertex ring, not the arena
 
    // Everything the caller reads from the context at the draw
    struct DrawInfo
@@ -137,10 +188,36 @@ namespace RTAO
       ID3D11Buffer* per_view_cb = nullptr; // The bound PerViewCB (MvpConstantBuffer only)
       uint32_t per_view_cb_first_constant = 0, per_view_cb_num_constants = 0;
       bool cutout = false; // Alpha tested (the bound pixel shader): its instances go into the TLAS as cutouts (kInstanceMaskCutout)
+      // Skinned shaders only (vs->skinned)
+      struct Stream
+      {
+         ID3D11Buffer* buffer = nullptr; // IAGetVertexBuffers of the element's slot
+         uint32_t stride = 0;
+         uint32_t offset = 0; // IA offset, bytes
+         uint32_t element_offset = 0; // Inside a vertex
+         DXGI_FORMAT format = DXGI_FORMAT_UNKNOWN;
+      };
+      Stream skin_indices[2];
+      Stream skin_weights[2];
+      ID3D11ShaderResourceView* bones = nullptr; // The bound ro_matrices
    };
 
    struct CaptureStats
    {
+      // Skinned draws
+      uint64_t skinned_captured = 0; // Dispatched
+      uint64_t skinned_instanced = 0; // Skipped: more than one instance
+      uint64_t skinned_waiting = 0; // Skipped: a buffer copy recorded on another context hasn't executed yet
+      uint64_t skinned_overflow = 0; // Skipped: the frame's skinned vertex budget is used up
+      // Meshes with a CPU written (DYNAMIC) vertex buffer: movable objects, copied and transformed every draw
+      uint64_t dynamic_captured = 0, dynamic_instanced = 0, dynamic_waiting = 0;
+      uint64_t dynamic_too_large = 0; // Skipped: more than kDynamicMaxCopyBytes from the draw's first vertex to the buffer end
+      // Per frame meshes (skinned + dynamic)
+      uint64_t frame_overflow = 0; // Skipped: the frame's vertex budget is used up
+      uint64_t frame_soup = 0, frame_indexed = 0; // Captured as a triangle soup (one vertex per index) / with the game's indices
+      uint64_t frame_draws = 0, frame_vertices = 0; // Built into the last frame's TLAS
+      uint64_t frame_blas_builds = 0, frame_blas_refits = 0, frame_blas_failed = 0;
+      uint64_t frame_blas_count = 0, frame_blas_bytes = 0;
       uint64_t draws_seen = 0, draws_captured = 0, instances_captured = 0;
       uint64_t skipped[8] = {}; // By CaptureSkip
       uint64_t meshes = 0, meshes_ready = 0, buffers_copied = 0, arena_vertex_bytes = 0, arena_index_bytes = 0;
@@ -161,8 +238,14 @@ namespace RTAO
    public:
       ~GeometryCapture() { Shutdown(); }
 
-      // capture_cs: Luma_RTAO.hlsl "capture_instances_cs" compiled for the game device
-      bool Init(ID3D11Device* device11, Interop& interop, ID3D11ComputeShader* capture_cs, std::string& error);
+      // capture_cs: Luma_RTAO.hlsl "capture_instances_cs" compiled for the game device. skin_cs: "skin_vertices_cs",
+      // optional (without it, or if its buffers can't be made, skinned draws are skipped as kSkipShader).
+      bool Init(ID3D11Device* device11, Interop& interop, ID3D11ComputeShader* capture_cs, ID3D11ComputeShader* skin_cs, std::string& error);
+      bool IsSkinningAvailable() const { return skin_cs != nullptr; }
+      std::string skinning_error; // Why skinning isn't available (set by Init)
+      // Skinned draws / draws with a DYNAMIC vertex buffer are captured only while these are set
+      std::atomic<bool> skinning_enabled = true;
+      std::atomic<bool> dynamic_enabled = true;
       bool IsInitialized() const { return ring11 != nullptr; }
       void Shutdown();
 
@@ -192,6 +275,19 @@ namespace RTAO
       static constexpr uint32_t kRingSlots = 1u << 18; // 64 bytes each: 16 MB
       static constexpr uint32_t kReadbackSlots = 1u << 16; // Instances per frame read back: 4 MB per frame slot
       static constexpr uint32_t kFrameSlots = 3;
+      // Skinned vertices (world space float3): ring capacity, and how many may be handed out between two D3D12 passes.
+      // The budget stays well under the capacity so a draw recorded for a later frame can't wrap over vertices a pass
+      // has not consumed yet.
+      static constexpr uint32_t kSkinRingVertices = 1u << 22; // 48 MB
+      static constexpr uint32_t kSkinFrameBudget = 1536u * 1024u;
+      // Raw SRV views of the arena for the skinning shader: a view can't span the whole arena (2^27 elements max), so
+      // views of arena_view_span bytes (the largest the driver accepts, from kArenaViewMaxSpan down) start every
+      // span / 2 bytes, and a draw uses one that holds all its data.
+      static constexpr uint64_t kArenaViewMaxSpan = 512ull << 20;
+      // DYNAMIC vertex buffers: copied at each draw into a D3D11 only ring (read by skin_vertices_cs), same budget rule
+      static constexpr uint64_t kDynamicRingBytes = 48ull << 20;
+      static constexpr uint64_t kDynamicFrameBudget = 16ull << 20;
+      static constexpr uint64_t kDynamicMaxCopyBytes = 4ull << 20;
 
    private:
       struct BufferEntry
@@ -199,6 +295,7 @@ namespace RTAO
          uint64_t arena_offset = 0;
          uint32_t size = 0;
          bool executed = false;
+         ID3D11DeviceContext* recorded_on = nullptr; // The context the copy was recorded on
       };
       struct MeshEntry
       {
@@ -216,16 +313,23 @@ namespace RTAO
       };
       struct Rec
       {
-         enum Type : uint8_t { Instances, BufferCopy } type;
+         enum Type : uint8_t { Instances, BufferCopy, FrameMesh } type;
          uint8_t mask; // Instances: TLAS instance mask (kInstanceMaskOpaque / kInstanceMaskCutout)
-         uint64_t mesh_key; // Instances
-         uint32_t first_slot;
-         uint32_t count;
+         uint64_t mesh_key; // Instances, FrameMesh
+         uint32_t first_slot; // Instances: capture ring slot. FrameMesh: first vertex in the skinned ring.
+         uint32_t count; // Instances: instances. FrameMesh: vertices.
          ID3D11Buffer* buffer; // BufferCopy
+         // FrameMesh, indexed (not soup) only: the game's indices in the arena
+         uint64_t index_arena_offset;
+         uint32_t index_count;
+         DXGI_FORMAT index_format; // DXGI_FORMAT_UNKNOWN: soup
       };
 
       bool EnsureBufferCopy(ID3D11DeviceContext* context, ID3D11Buffer* buffer, bool vertex, std::vector<Rec>& records);
+      // Skinned or dynamic vertex buffer draws: world space vertices for this frame (see the header comment)
+      bool CaptureFrameDraw(ID3D11DeviceContext* context, const DrawInfo& draw, uint64_t key, uint64_t index_start, uint32_t index_size, bool dynamic_vertices);
       void CommitLocked(std::vector<Rec>& records);
+      void QueueLocked(ID3D11DeviceContext* context, std::vector<Rec>& local);
 
       std::mutex mutex;
       ID3D11Device* device11 = nullptr;
@@ -241,6 +345,19 @@ namespace RTAO
       ID3D12Resource* index_arena12 = nullptr;
       uint64_t index_arena_size = 0, index_arena_used = 0;
       ID3D12Resource* readback[kFrameSlots] = {};
+      // Skinning
+      ID3D11ComputeShader* skin_cs = nullptr;
+      ID3D11Buffer* skin_ring11 = nullptr;
+      ID3D11UnorderedAccessView* skin_ring_uav = nullptr;
+      ID3D12Resource* skin_ring12 = nullptr;
+      std::vector<ID3D11ShaderResourceView*> arena_views; // View i starts at i * arena_view_step
+      uint64_t arena_view_span = 0, arena_view_step = 0;
+      uint32_t skin_head = 0; // Next free vertex in the skinned ring
+      uint32_t skin_window = 0; // Vertices handed out since the last D3D12 pass
+      ID3D11Buffer* dynamic_ring = nullptr;
+      ID3D11ShaderResourceView* dynamic_ring_srv = nullptr;
+      uint64_t dynamic_head = 0, dynamic_window = 0;
+      DynamicBlasSet frame_blases;
 
       uint64_t ring_head = 0;
       std::unordered_map<ID3D11Buffer*, BufferEntry> buffers;

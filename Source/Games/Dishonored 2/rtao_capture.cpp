@@ -86,6 +86,99 @@ namespace RTAO
          barrier.Transition.StateAfter = after;
          list->ResourceBarrier(1, &barrier);
       }
+
+      // Records one capture dispatch with the draw's own bindings (b1 PerInstanceCB, b2 PerViewCB, t0..t2 instance data)
+      // plus ours. Only the compute state it touches is saved and restored. Fills the matrix source part of "params".
+      bool DispatchCapture(ID3D11DeviceContext* context, ID3D11Buffer* params_cb, const DrawInfo& draw, CaptureParams& params, ID3D11ComputeShader* shader, ID3D11ShaderResourceView* bones, ID3D11ShaderResourceView* arena,
+         ID3D11ShaderResourceView* dynamic_vertices, ID3D11UnorderedAccessView* uav, UINT uav_slot, UINT groups)
+      {
+         const MatrixSource source = draw.vs->source;
+         params.source = uint32_t(source);
+         params.instance_offset_cb = draw.vs->instance_offset_cb;
+         std::memcpy(params.row_cb, draw.vs->row_cb, sizeof(params.row_cb));
+         params.depth_hack_cb = draw.vs->depth_hack_cb;
+         params.record_row0 = draw.vs->record_row0;
+         std::memcpy(params.mvp_cb, draw.vs->mvp_cb, sizeof(params.mvp_cb));
+         params.view_proj_cb = draw.vs->view_proj_cb;
+
+         constexpr UINT kSrvs = 6, kUavs = 2;
+         ID3D11DeviceContext1* context1 = nullptr;
+         context->QueryInterface(IID_PPV_ARGS(&context1));
+         ID3D11ComputeShader* old_cs = nullptr;
+         context->CSGetShader(&old_cs, nullptr, nullptr);
+         ID3D11Buffer* old_cbs[3] = {};
+         UINT old_cb_first[3] = {}, old_cb_num[3] = {};
+         if (context1)
+            context1->CSGetConstantBuffers1(0, 3, old_cbs, old_cb_first, old_cb_num);
+         else
+            context->CSGetConstantBuffers(0, 3, old_cbs);
+         ID3D11ShaderResourceView* old_srvs[kSrvs] = {};
+         context->CSGetShaderResources(0, kSrvs, old_srvs);
+         ID3D11UnorderedAccessView* old_uavs[kUavs] = {};
+         context->CSGetUnorderedAccessViews(0, kUavs, old_uavs);
+
+         D3D11_MAPPED_SUBRESOURCE mapped = {};
+         bool dispatched = false;
+         if (SUCCEEDED(context->Map(params_cb, 0, D3D11_MAP_WRITE_DISCARD, 0, &mapped)))
+         {
+            std::memcpy(mapped.pData, &params, sizeof(params));
+            context->Unmap(params_cb, 0);
+
+            context->CSSetShader(shader, nullptr, 0);
+            ID3D11Buffer* cbs[3] = { params_cb, draw.instance_cb, source == MatrixSource::MvpConstantBuffer ? draw.per_view_cb : nullptr };
+            if (context1 && (draw.instance_cb_num_constants != 0 || draw.per_view_cb_num_constants != 0))
+            {
+               // A buffer bound whole (num 0) gets its own size, in the multiples of 16 constants D3D11.1 wants
+               auto whole = [](ID3D11Buffer* buffer) -> UINT {
+                  if (!buffer)
+                     return 16;
+                  D3D11_BUFFER_DESC desc = {};
+                  buffer->GetDesc(&desc);
+                  return (std::min)(4096u, ((desc.ByteWidth / 16) + 15) & ~15u);
+               };
+               UINT first[3] = { 0, draw.instance_cb_first_constant, draw.per_view_cb_first_constant };
+               UINT num[3] = { 16, draw.instance_cb_num_constants ? draw.instance_cb_num_constants : whole(cbs[1]), draw.per_view_cb_num_constants ? draw.per_view_cb_num_constants : whole(cbs[2]) };
+               context1->CSSetConstantBuffers1(0, 3, cbs, first, num);
+            }
+            else
+            {
+               context->CSSetConstantBuffers(0, 3, cbs);
+            }
+            ID3D11ShaderResourceView* srvs[kSrvs] = {
+               source == MatrixSource::IndexedInstanceBuffer ? draw.instance_index : nullptr,
+               source == MatrixSource::IndexedInstanceBuffer ? draw.instance_buffer : nullptr,
+               source == MatrixSource::DirectInstanceBuffer ? draw.instance_buffer : nullptr,
+               bones,
+               arena,
+               dynamic_vertices,
+            };
+            context->CSSetShaderResources(0, kSrvs, srvs);
+            ID3D11UnorderedAccessView* uavs[kUavs] = {};
+            uavs[uav_slot] = uav;
+            UINT initial_counts[kUavs] = { UINT(-1), UINT(-1) };
+            context->CSSetUnorderedAccessViews(0, kUavs, uavs, initial_counts);
+            context->Dispatch(groups, 1, 1);
+            dispatched = true;
+         }
+
+         context->CSSetShader(old_cs, nullptr, 0);
+         if (context1)
+            context1->CSSetConstantBuffers1(0, 3, old_cbs, old_cb_first, old_cb_num);
+         else
+            context->CSSetConstantBuffers(0, 3, old_cbs);
+         context->CSSetShaderResources(0, kSrvs, old_srvs);
+         UINT keep_counts[kUavs] = { UINT(-1), UINT(-1) };
+         context->CSSetUnorderedAccessViews(0, kUavs, old_uavs, keep_counts);
+         SafeRelease(old_cs);
+         for (auto*& p : old_cbs)
+            SafeRelease(p);
+         for (auto*& p : old_srvs)
+            SafeRelease(p);
+         for (auto*& p : old_uavs)
+            SafeRelease(p);
+         SafeRelease(context1);
+         return dispatched;
+      }
    }
 
    // ---- Reflection
@@ -117,6 +210,7 @@ namespace RTAO
       }
 
       bool has_position = false;
+      uint32_t skin_index_sets = 0, skin_weight_sets = 0;
       for (UINT i = 0; i < desc.InputParameters; i++)
       {
          D3D11_SIGNATURE_PARAMETER_DESC parameter = {};
@@ -130,12 +224,10 @@ namespace RTAO
             *input_signature += item;
          }
          if (_stricmp(parameter.SemanticName, "VERTEX_SKININDICES") == 0)
-         {
-            out.skip_reason = "skinned";
-            reflection->Release();
-            return false;
-         }
-         if (_stricmp(parameter.SemanticName, "VERTEX_POSITION") == 0 && parameter.SemanticIndex == 0)
+            skin_index_sets = (std::max)(skin_index_sets, uint32_t(parameter.SemanticIndex) + 1);
+         else if (_stricmp(parameter.SemanticName, "VERTEX_SKINWEIGHTS") == 0)
+            skin_weight_sets = (std::max)(skin_weight_sets, uint32_t(parameter.SemanticIndex) + 1);
+         else if (_stricmp(parameter.SemanticName, "VERTEX_POSITION") == 0 && parameter.SemanticIndex == 0)
             has_position = true;
       }
       if (!has_position)
@@ -159,7 +251,12 @@ namespace RTAO
          else if (strstr(bind.Name, "ocean") || strstr(bind.Name, "fftwaves"))
             out.skip_reason = "water";
          else if (strcmp(bind.Name, "ro_matrices") == 0)
-            out.skip_reason = "skinned";
+         {
+            if (bind.Type == D3D_SIT_TEXTURE && bind.Dimension == D3D_SRV_DIMENSION_BUFFER)
+               out.bones_slot = bind.BindPoint;
+            else
+               out.skip_reason = "skinned: unexpected ro_matrices type";
+         }
          else if (strcmp(bind.Name, "ro_directinstancebuffer") == 0)
          {
             direct_slot = bind.BindPoint;
@@ -215,6 +312,8 @@ namespace RTAO
                   out.wind = true; // Vegetation bending with a constant wind (no ro_windbuffer)
                if (strcmp(var.Name, "cb_instancebufferoffset") == 0)
                   out.instance_offset_cb = var.StartOffset;
+               else if (strcmp(var.Name, "cb_mtxoffset") == 0)
+                  out.mtx_offset_cb = var.StartOffset;
                else if (strcmp(var.Name, "cb_modeldepthhack") == 0)
                   out.depth_hack_cb = var.StartOffset;
                else if (strcmp(var.Name, "cb_modelmatrixx") == 0)
@@ -307,6 +406,27 @@ namespace RTAO
             return false;
          }
       }
+      // Skinned: every skinned vertex shader in the game's dump (1930 of them) reads ro_matrices at
+      // (VERTEX_SKININDICESn + cb_mtxoffset.x) * 3 + {0, 1, 2}, weighted by VERTEX_SKINWEIGHTSn (n = 0, or 0 and 1), and
+      // then applies its family's object to world (instance buffer, cb_modelmatrix or MVP) to the skinned position
+      if (skin_index_sets != 0 || out.bones_slot != kNoOffset)
+      {
+         const char* skin_error = nullptr;
+         if (out.bones_slot == kNoOffset || skin_index_sets == 0)
+            skin_error = "skinned: bones or skin inputs missing";
+         else if (skin_index_sets > 2 || skin_weight_sets != skin_index_sets)
+            skin_error = "skinned: unexpected skin inputs";
+         else if (out.instance_cb_slot == kNoOffset || out.mtx_offset_cb == kNoOffset)
+            skin_error = "skinned: no cb_mtxoffset";
+         if (skin_error)
+         {
+            out.skip_reason = skin_error;
+            out.source = MatrixSource::None;
+            return false;
+         }
+         out.skinned = true;
+         out.skin_sets = skin_index_sets;
+      }
       out.skip_reason = nullptr;
       return true;
    }
@@ -322,7 +442,9 @@ namespace RTAO
             continue;
          const uint32_t offset = e.AlignedByteOffset == D3D11_APPEND_ALIGNED_ELEMENT ? running[e.InputSlot] : e.AlignedByteOffset;
          running[e.InputSlot] = offset + FormatSize(e.Format);
-         if (e.SemanticName && _stricmp(e.SemanticName, "VERTEX_POSITION") == 0 && e.SemanticIndex == 0)
+         if (!e.SemanticName)
+            continue;
+         if (_stricmp(e.SemanticName, "VERTEX_POSITION") == 0 && e.SemanticIndex == 0)
          {
             info.has_position = true;
             info.position_format = e.Format;
@@ -330,8 +452,56 @@ namespace RTAO
             info.position_offset = offset;
             info.position_per_instance = e.InputSlotClass == D3D11_INPUT_PER_INSTANCE_DATA;
          }
+         const bool skin_indices = _stricmp(e.SemanticName, "VERTEX_SKININDICES") == 0;
+         if ((skin_indices || _stricmp(e.SemanticName, "VERTEX_SKINWEIGHTS") == 0) && e.SemanticIndex < 2)
+         {
+            InputLayoutInfo::Element& element = skin_indices ? info.skin_indices[e.SemanticIndex] : info.skin_weights[e.SemanticIndex];
+            element.present = true;
+            element.format = e.Format;
+            element.slot = e.InputSlot;
+            element.offset = offset;
+            element.per_instance = e.InputSlotClass == D3D11_INPUT_PER_INSTANCE_DATA;
+         }
       }
       return info;
+   }
+
+   uint32_t VertexFormatCode(DXGI_FORMAT format)
+   {
+      // kind | components << 4 | bits << 8 (kinds: RTAO_KIND_* in Luma_RTAO.hlsl)
+      enum : uint32_t { Float = 1, Unorm, Snorm, Uint, Sint, Half, Rgb10A2Unorm, Rgb10A2Uint, Bgra8Unorm };
+      auto code = [](uint32_t kind, uint32_t count, uint32_t bits) { return kind | (count << 4) | (bits << 8); };
+      switch (format)
+      {
+      case DXGI_FORMAT_R32G32B32A32_FLOAT: return code(Float, 4, 32);
+      case DXGI_FORMAT_R32G32B32_FLOAT: return code(Float, 3, 32);
+      case DXGI_FORMAT_R32G32_FLOAT: return code(Float, 2, 32);
+      case DXGI_FORMAT_R32_FLOAT: return code(Float, 1, 32);
+      case DXGI_FORMAT_R32G32B32A32_UINT: return code(Uint, 4, 32);
+      case DXGI_FORMAT_R32G32B32_UINT: return code(Uint, 3, 32);
+      case DXGI_FORMAT_R32G32_UINT: return code(Uint, 2, 32);
+      case DXGI_FORMAT_R32_UINT: return code(Uint, 1, 32);
+      case DXGI_FORMAT_R32G32B32A32_SINT: return code(Sint, 4, 32);
+      case DXGI_FORMAT_R16G16B16A16_FLOAT: return code(Half, 4, 16);
+      case DXGI_FORMAT_R16G16_FLOAT: return code(Half, 2, 16);
+      case DXGI_FORMAT_R16G16B16A16_UNORM: return code(Unorm, 4, 16);
+      case DXGI_FORMAT_R16G16_UNORM: return code(Unorm, 2, 16);
+      case DXGI_FORMAT_R16G16B16A16_SNORM: return code(Snorm, 4, 16);
+      case DXGI_FORMAT_R16G16_SNORM: return code(Snorm, 2, 16);
+      case DXGI_FORMAT_R16G16B16A16_UINT: return code(Uint, 4, 16);
+      case DXGI_FORMAT_R16G16_UINT: return code(Uint, 2, 16);
+      case DXGI_FORMAT_R16G16B16A16_SINT: return code(Sint, 4, 16);
+      case DXGI_FORMAT_R8G8B8A8_UNORM: return code(Unorm, 4, 8);
+      case DXGI_FORMAT_R8G8_UNORM: return code(Unorm, 2, 8);
+      case DXGI_FORMAT_R8G8B8A8_SNORM: return code(Snorm, 4, 8);
+      case DXGI_FORMAT_R8G8B8A8_UINT: return code(Uint, 4, 8);
+      case DXGI_FORMAT_R8G8_UINT: return code(Uint, 2, 8);
+      case DXGI_FORMAT_R8G8B8A8_SINT: return code(Sint, 4, 8);
+      case DXGI_FORMAT_B8G8R8A8_UNORM: return code(Bgra8Unorm, 4, 8);
+      case DXGI_FORMAT_R10G10B10A2_UNORM: return code(Rgb10A2Unorm, 4, 10);
+      case DXGI_FORMAT_R10G10B10A2_UINT: return code(Rgb10A2Uint, 4, 10);
+      default: return 0;
+      }
    }
 
    DXGI_FORMAT DxrVertexFormat(DXGI_FORMAT format)
@@ -627,7 +797,7 @@ namespace RTAO
 
    // ---- GeometryCapture
 
-   bool GeometryCapture::Init(ID3D11Device* device, Interop& interop, ID3D11ComputeShader* cs, std::string& error)
+   bool GeometryCapture::Init(ID3D11Device* device, Interop& interop, ID3D11ComputeShader* cs, ID3D11ComputeShader* skin_shader, std::string& error)
    {
       const std::lock_guard lock(mutex);
       if (ring11)
@@ -700,6 +870,109 @@ namespace RTAO
             return false;
          }
       }
+
+      // Skinning: optional, a failure here only leaves skinned draws out
+      if (skin_shader)
+      {
+         std::string skin_error;
+         bool ok = interop.CreateSharedBuffer(device, uint64_t(kSkinRingVertices) * 12, skin_ring12, skin_ring11, skin_error);
+         if (!ok)
+            skinning_error = "skinned vertex ring: " + skin_error;
+         if (ok)
+         {
+            D3D11_UNORDERED_ACCESS_VIEW_DESC skin_uav = {};
+            skin_uav.Format = DXGI_FORMAT_R32_TYPELESS;
+            skin_uav.ViewDimension = D3D11_UAV_DIMENSION_BUFFER;
+            skin_uav.Buffer.NumElements = kSkinRingVertices * 3;
+            skin_uav.Buffer.Flags = D3D11_BUFFER_UAV_FLAG_RAW;
+            hr = device->CreateUnorderedAccessView(skin_ring11, &skin_uav, &skin_ring_uav);
+            ok = SUCCEEDED(hr);
+            if (!ok)
+               skinning_error = HResultString("CreateUnorderedAccessView (skinned vertex ring)", hr);
+         }
+         // Raw views of the arena. Measured (RTX 4090, Win11) on a 512 MB+ buffer: only views of exactly 2^27 elements
+         // (512 MB) at multiples of 512 MB are accepted, anything else returns E_INVALIDARG; smaller buffers take any
+         // view. So: the largest span that works at offset 0, then views every span / 2 if those work, else every span.
+         auto make_view = [&](uint64_t first, uint64_t bytes, ID3D11ShaderResourceView** view) {
+            D3D11_SHADER_RESOURCE_VIEW_DESC srv = {};
+            srv.Format = DXGI_FORMAT_R32_TYPELESS;
+            srv.ViewDimension = D3D11_SRV_DIMENSION_BUFFEREX;
+            srv.BufferEx.FirstElement = UINT(first / 4);
+            srv.BufferEx.NumElements = UINT(bytes / 4);
+            srv.BufferEx.Flags = D3D11_BUFFEREX_SRV_FLAG_RAW;
+            return device->CreateShaderResourceView(vertex_arena11, &srv, view);
+         };
+         arena_view_span = 0;
+         for (uint64_t span = (std::min)(kArenaViewMaxSpan, vertex_arena_size); ok && span >= (16ull << 20); span /= 2)
+         {
+            ID3D11ShaderResourceView* view = nullptr;
+            if (SUCCEEDED(make_view(0, span, &view)))
+            {
+               view->Release();
+               arena_view_span = span;
+               break;
+            }
+         }
+         if (ok && arena_view_span == 0)
+         {
+            ok = false;
+            skinning_error = "no raw view of the geometry arena is accepted";
+         }
+         if (ok)
+         {
+            arena_view_step = arena_view_span;
+            ID3D11ShaderResourceView* half_view = nullptr;
+            if (arena_view_span < vertex_arena_size && SUCCEEDED(make_view(arena_view_span / 2, arena_view_span, &half_view)))
+            {
+               half_view->Release();
+               arena_view_step = arena_view_span / 2;
+            }
+         }
+         for (uint64_t first = 0; ok && first < vertex_arena_size; first += arena_view_step)
+         {
+            ID3D11ShaderResourceView* view = nullptr;
+            hr = make_view(first, (std::min)(arena_view_span, vertex_arena_size - first), &view);
+            ok = SUCCEEDED(hr);
+            if (!ok)
+               skinning_error = HResultString("CreateShaderResourceView (arena)", hr);
+            else
+               arena_views.push_back(view);
+            if (first + arena_view_span >= vertex_arena_size)
+               break; // The last view reaches the end
+         }
+         if (ok)
+         {
+            D3D11_BUFFER_DESC dynamic_desc = { UINT(kDynamicRingBytes), D3D11_USAGE_DEFAULT, D3D11_BIND_SHADER_RESOURCE, 0, D3D11_RESOURCE_MISC_BUFFER_ALLOW_RAW_VIEWS, 0 };
+            ok = SUCCEEDED(device->CreateBuffer(&dynamic_desc, nullptr, &dynamic_ring));
+            if (ok)
+            {
+               D3D11_SHADER_RESOURCE_VIEW_DESC srv = {};
+               srv.Format = DXGI_FORMAT_R32_TYPELESS;
+               srv.ViewDimension = D3D11_SRV_DIMENSION_BUFFEREX;
+               srv.BufferEx.NumElements = UINT(kDynamicRingBytes / 4);
+               srv.BufferEx.Flags = D3D11_BUFFEREX_SRV_FLAG_RAW;
+               ok = SUCCEEDED(device->CreateShaderResourceView(dynamic_ring, &srv, &dynamic_ring_srv));
+            }
+            if (!ok)
+               skinning_error = "dynamic vertex ring failed";
+         }
+         if (ok)
+         {
+            skin_cs = skin_shader;
+            skin_cs->AddRef();
+         }
+         else
+         {
+            SafeRelease(dynamic_ring_srv);
+            SafeRelease(dynamic_ring);
+            for (auto*& view : arena_views)
+               SafeRelease(view);
+            arena_views.clear();
+            SafeRelease(skin_ring_uav);
+            SafeRelease(skin_ring12);
+            SafeRelease(skin_ring11);
+         }
+      }
       return true;
    }
 
@@ -718,6 +991,18 @@ namespace RTAO
       SafeRelease(ring11);
       SafeRelease(params_cb);
       SafeRelease(capture_cs);
+      frame_blases.Clear(nullptr, 0);
+      for (auto*& view : arena_views)
+         SafeRelease(view);
+      arena_views.clear();
+      SafeRelease(skin_ring_uav);
+      SafeRelease(skin_ring12);
+      SafeRelease(skin_ring11);
+      SafeRelease(skin_cs);
+      SafeRelease(dynamic_ring_srv);
+      SafeRelease(dynamic_ring);
+      skin_head = skin_window = 0;
+      dynamic_head = dynamic_window = 0;
       buffers.clear();
       meshes.clear();
       context_records.clear();
@@ -744,6 +1029,7 @@ namespace RTAO
       BufferEntry entry;
       entry.arena_offset = offset;
       entry.size = desc.ByteWidth;
+      entry.recorded_on = context;
       buffers.emplace(buffer, entry);
       stats.buffers_copied++;
       stats.arena_vertex_bytes = vertex_arena_used;
@@ -764,11 +1050,22 @@ namespace RTAO
          stats.skipped[reason]++;
          return false;
       };
-      if (!draw.vs || draw.vs->source == MatrixSource::None)
+      if (!draw.vs || draw.vs->source == MatrixSource::None || (draw.vs->skinned && (!skin_cs || !skinning_enabled.load(std::memory_order_relaxed))))
          return skip(kSkipShader);
       if (draw.index_count < 3 || draw.instance_count == 0 || !draw.vertex_buffer || !draw.index_buffer || draw.vertex_stride == 0)
          return skip(kSkipOther);
-      const DXGI_FORMAT vertex_format = DxrVertexFormat(draw.position_format);
+      // A vertex buffer the CPU rewrites (movable objects: doors, windows...) only holds this frame's vertices: it goes
+      // through the per frame path (copied at the draw) like skinned meshes
+      bool dynamic_vertices = false;
+      if (skin_cs && dynamic_enabled.load(std::memory_order_relaxed))
+      {
+         D3D11_BUFFER_DESC vb_desc = {};
+         draw.vertex_buffer->GetDesc(&vb_desc);
+         dynamic_vertices = vb_desc.Usage == D3D11_USAGE_DYNAMIC;
+      }
+      const bool frame_mesh = draw.vs->skinned || dynamic_vertices;
+      // Per frame vertices are decoded by our shader (any VertexFormatCode format), the others go to DXR as they are
+      const DXGI_FORMAT vertex_format = frame_mesh ? (VertexFormatCode(draw.position_format) ? draw.position_format : DXGI_FORMAT_UNKNOWN) : DxrVertexFormat(draw.position_format);
       const uint32_t index_size = draw.index_format == DXGI_FORMAT_R16_UINT ? 2 : (draw.index_format == DXGI_FORMAT_R32_UINT ? 4 : 0);
       if (vertex_format == DXGI_FORMAT_UNKNOWN || index_size == 0)
          return skip(kSkipFormat);
@@ -791,7 +1088,9 @@ namespace RTAO
       key = HashCombine(key, index_start);
       key = HashCombine(key, (uint64_t(draw.index_count) << 32) | uint64_t(draw.index_format));
 
-      const bool immediate = context->GetType() == D3D11_DEVICE_CONTEXT_IMMEDIATE;
+      if (frame_mesh)
+         return CaptureFrameDraw(context, draw, key, index_start, index_size, dynamic_vertices);
+
       std::vector<Rec> local;
       uint32_t dst_slot;
       {
@@ -815,13 +1114,7 @@ namespace RTAO
                const bool dynamic = vb_desc.Usage == D3D11_USAGE_DYNAMIC || ib_desc.Usage == D3D11_USAGE_DYNAMIC;
                stats.skipped[dynamic ? kSkipBuffer : kSkipArenaFull]++;
                // A copy may have been recorded for one of the two: keep its record
-               if (!local.empty())
-               {
-                  if (immediate)
-                     CommitLocked(local);
-                  else
-                     context_records[context].insert(context_records[context].end(), local.begin(), local.end());
-               }
+               QueueLocked(context, local);
                return false;
             }
             MeshEntry mesh = {};
@@ -841,87 +1134,12 @@ namespace RTAO
          ring_head += draw.instance_count;
       }
 
-      // The matrix dispatch, with the draw's own bindings. Only the compute state it touches is saved and restored.
-      ID3D11DeviceContext1* context1 = nullptr;
-      context->QueryInterface(IID_PPV_ARGS(&context1));
-      ID3D11ComputeShader* old_cs = nullptr;
-      context->CSGetShader(&old_cs, nullptr, nullptr);
-      ID3D11Buffer* old_cbs[3] = {};
-      UINT old_cb_first[3] = {}, old_cb_num[3] = {};
-      if (context1)
-         context1->CSGetConstantBuffers1(0, 3, old_cbs, old_cb_first, old_cb_num);
-      else
-         context->CSGetConstantBuffers(0, 3, old_cbs);
-      ID3D11ShaderResourceView* old_srvs[3] = {};
-      context->CSGetShaderResources(0, 3, old_srvs);
-      ID3D11UnorderedAccessView* old_uav = nullptr;
-      context->CSGetUnorderedAccessViews(0, 1, &old_uav);
-
-      D3D11_MAPPED_SUBRESOURCE mapped = {};
-      bool dispatched = false;
-      if (SUCCEEDED(context->Map(params_cb, 0, D3D11_MAP_WRITE_DISCARD, 0, &mapped)))
-      {
-         CaptureParams params = {};
-         params.source = uint32_t(source);
-         params.instance_count = draw.instance_count;
-         params.dst_slot = dst_slot;
-         params.slot_mask = kRingSlots - 1;
-         params.instance_offset_cb = draw.vs->instance_offset_cb;
-         std::memcpy(params.row_cb, draw.vs->row_cb, sizeof(params.row_cb));
-         params.depth_hack_cb = draw.vs->depth_hack_cb;
-         params.record_row0 = draw.vs->record_row0;
-         std::memcpy(params.mvp_cb, draw.vs->mvp_cb, sizeof(params.mvp_cb));
-         params.view_proj_cb = draw.vs->view_proj_cb;
-         std::memcpy(mapped.pData, &params, sizeof(params));
-         context->Unmap(params_cb, 0);
-
-         context->CSSetShader(capture_cs, nullptr, 0);
-         ID3D11Buffer* cbs[3] = { params_cb, draw.instance_cb, source == MatrixSource::MvpConstantBuffer ? draw.per_view_cb : nullptr };
-         if (context1 && (draw.instance_cb_num_constants != 0 || draw.per_view_cb_num_constants != 0))
-         {
-            // A buffer bound whole (num 0) gets its own size, in the multiples of 16 constants D3D11.1 wants
-            auto whole = [](ID3D11Buffer* buffer) -> UINT {
-               if (!buffer)
-                  return 16;
-               D3D11_BUFFER_DESC desc = {};
-               buffer->GetDesc(&desc);
-               return (std::min)(4096u, ((desc.ByteWidth / 16) + 15) & ~15u);
-            };
-            UINT first[3] = { 0, draw.instance_cb_first_constant, draw.per_view_cb_first_constant };
-            UINT num[3] = { 16, draw.instance_cb_num_constants ? draw.instance_cb_num_constants : whole(cbs[1]), draw.per_view_cb_num_constants ? draw.per_view_cb_num_constants : whole(cbs[2]) };
-            context1->CSSetConstantBuffers1(0, 3, cbs, first, num);
-         }
-         else
-         {
-            context->CSSetConstantBuffers(0, 3, cbs);
-         }
-         ID3D11ShaderResourceView* srvs[3] = {
-            source == MatrixSource::IndexedInstanceBuffer ? draw.instance_index : nullptr,
-            source == MatrixSource::IndexedInstanceBuffer ? draw.instance_buffer : nullptr,
-            source == MatrixSource::DirectInstanceBuffer ? draw.instance_buffer : nullptr,
-         };
-         context->CSSetShaderResources(0, 3, srvs);
-         UINT initial_count = UINT(-1);
-         context->CSSetUnorderedAccessViews(0, 1, &ring_uav, &initial_count);
-         context->Dispatch((draw.instance_count + 63) / 64, 1, 1);
-         dispatched = true;
-      }
-
-      context->CSSetShader(old_cs, nullptr, 0);
-      if (context1)
-         context1->CSSetConstantBuffers1(0, 3, old_cbs, old_cb_first, old_cb_num);
-      else
-         context->CSSetConstantBuffers(0, 3, old_cbs);
-      context->CSSetShaderResources(0, 3, old_srvs);
-      UINT keep_count = UINT(-1);
-      context->CSSetUnorderedAccessViews(0, 1, &old_uav, &keep_count);
-      SafeRelease(old_cs);
-      for (auto*& p : old_cbs)
-         SafeRelease(p);
-      for (auto*& p : old_srvs)
-         SafeRelease(p);
-      SafeRelease(old_uav);
-      SafeRelease(context1);
+      // The matrix dispatch, with the draw's own bindings
+      CaptureParams params = {};
+      params.instance_count = draw.instance_count;
+      params.dst_slot = dst_slot;
+      params.slot_mask = kRingSlots - 1;
+      const bool dispatched = DispatchCapture(context, params_cb, draw, params, capture_cs, nullptr, nullptr, nullptr, ring_uav, 0, (draw.instance_count + 63) / 64);
 
       const std::lock_guard lock(mutex);
       if (dispatched)
@@ -950,13 +1168,248 @@ namespace RTAO
       {
          stats.skipped[kSkipOther]++;
       }
-      if (immediate)
+      QueueLocked(context, local);
+      return dispatched;
+   }
+
+   void GeometryCapture::QueueLocked(ID3D11DeviceContext* context, std::vector<Rec>& local)
+   {
+      if (local.empty())
+         return;
+      if (context->GetType() == D3D11_DEVICE_CONTEXT_IMMEDIATE)
          CommitLocked(local);
       else
       {
          auto& pending = context_records[context];
          pending.insert(pending.end(), local.begin(), local.end());
+         local.clear();
       }
+   }
+
+   bool GeometryCapture::CaptureFrameDraw(ID3D11DeviceContext* context, const DrawInfo& draw, uint64_t key, uint64_t index_start, uint32_t index_size, bool dynamic_vertices)
+   {
+      const bool skinned = draw.vs->skinned;
+      auto skip = [&](CaptureSkip reason) {
+         const std::lock_guard lock(mutex);
+         stats.draws_seen++;
+         stats.skipped[reason]++;
+         return false;
+      };
+      if (draw.instance_count != 1)
+      {
+         const std::lock_guard lock(mutex);
+         stats.draws_seen++;
+         (skinned ? stats.skinned_instanced : stats.dynamic_instanced)++;
+         return false;
+      }
+      if (!draw.instance_cb || (skinned && !draw.bones))
+         return skip(kSkipBinding);
+
+      // Streams: 0 position, then (indices, weights) per skin set. "first" = byte offset of vertex 0's element in its buffer.
+      struct Stream
+      {
+         ID3D11Buffer* buffer;
+         uint32_t stride;
+         int64_t first;
+         DXGI_FORMAT format;
+         uint32_t code;
+         uint64_t buffer_size;
+         D3D11_USAGE usage;
+      };
+      const uint32_t sets = skinned ? draw.vs->skin_sets : 0;
+      const uint32_t stream_count = 1 + 2 * sets;
+      Stream streams[5] = {};
+      streams[0] = { draw.vertex_buffer, draw.vertex_stride, int64_t(draw.vertex_buffer_offset) + int64_t(draw.base_vertex) * draw.vertex_stride + draw.position_offset, draw.position_format };
+      for (uint32_t set = 0; set < sets; set++)
+      {
+         const DrawInfo::Stream* sources[2] = { &draw.skin_indices[set], &draw.skin_weights[set] };
+         for (uint32_t k = 0; k < 2; k++)
+         {
+            const DrawInfo::Stream& source = *sources[k];
+            if (!source.buffer || source.stride == 0)
+               return skip(kSkipBinding);
+            streams[1 + set * 2 + k] = { source.buffer, source.stride, int64_t(source.offset) + int64_t(draw.base_vertex) * source.stride + source.element_offset, source.format };
+         }
+      }
+      // Vertex range: from the base vertex to the end of the shortest stream (whole elements)
+      uint64_t range = UINT64_MAX;
+      for (uint32_t s = 0; s < stream_count; s++)
+      {
+         Stream& stream = streams[s];
+         stream.code = VertexFormatCode(stream.format);
+         if (stream.code == 0)
+            return skip(kSkipFormat);
+         if (stream.first < 0)
+            return skip(kSkipOther);
+         D3D11_BUFFER_DESC desc = {};
+         stream.buffer->GetDesc(&desc);
+         stream.buffer_size = desc.ByteWidth;
+         stream.usage = desc.Usage;
+         // Only the position stream may be dynamic (copied every draw), and only when the caller routed it here for that
+         if ((desc.Usage == D3D11_USAGE_DYNAMIC || desc.Usage == D3D11_USAGE_STAGING) && !(s == 0 && dynamic_vertices))
+            return skip(kSkipBuffer);
+         const uint64_t element_size = FormatSize(stream.format);
+         if (uint64_t(stream.first) + element_size > desc.ByteWidth)
+            return skip(kSkipBuffer);
+         range = (std::min)(range, (desc.ByteWidth - uint64_t(stream.first) - element_size) / stream.stride + 1);
+      }
+      D3D11_BUFFER_DESC ib_desc = {};
+      draw.index_buffer->GetDesc(&ib_desc);
+      if (index_start + uint64_t(draw.index_count) * index_size > ib_desc.ByteWidth || ib_desc.Usage == D3D11_USAGE_DYNAMIC || ib_desc.Usage == D3D11_USAGE_STAGING)
+         return skip(kSkipBuffer);
+      const uint32_t index_count = draw.index_count - draw.index_count % 3;
+      // Bounded by the index count: skin the draw's vertex range if it is not larger, else one vertex per index (soup)
+      const bool soup = range > index_count;
+      const uint32_t vertex_count = soup ? index_count : uint32_t(range);
+      if (vertex_count < 3)
+         return skip(kSkipOther);
+      // Dynamic vertices: the bytes from vertex 0 to the end of the buffer are copied (the indices may reach any of them)
+      uint64_t dynamic_copy_start = 0, dynamic_copy_bytes = 0;
+      if (dynamic_vertices)
+      {
+         dynamic_copy_start = uint64_t(streams[0].first) & ~uint64_t(3); // 4 byte aligned for the raw view
+         dynamic_copy_bytes = streams[0].buffer_size - dynamic_copy_start;
+         if (dynamic_copy_bytes > kDynamicMaxCopyBytes)
+         {
+            const std::lock_guard lock(mutex);
+            stats.draws_seen++;
+            stats.dynamic_too_large++;
+            return false;
+         }
+      }
+
+      std::vector<Rec> local;
+      CaptureParams params = {};
+      ID3D11ShaderResourceView* arena_view = nullptr;
+      uint64_t index_arena_offset = 0;
+      uint32_t dst = 0;
+      uint64_t dynamic_offset = 0;
+      {
+         const std::lock_guard lock(mutex);
+         stats.draws_seen++;
+         // Arena copies (once per buffer). They must be in place when our dispatch runs: executed already, or recorded
+         // on this same context (in order with it).
+         ID3D11Buffer* needed[6] = {};
+         uint32_t needed_count = 0;
+         for (uint32_t s = dynamic_vertices ? 1 : 0; s < stream_count; s++)
+            needed[needed_count++] = streams[s].buffer;
+         needed[needed_count++] = draw.index_buffer;
+         for (uint32_t n = 0; n < needed_count; n++)
+         {
+            if (!EnsureBufferCopy(context, needed[n], true, local))
+            {
+               stats.skipped[kSkipArenaFull]++;
+               QueueLocked(context, local);
+               return false;
+            }
+         }
+         uint64_t low = UINT64_MAX, high = 0;
+         for (uint32_t n = 0; n < needed_count; n++)
+         {
+            const BufferEntry& entry = buffers[needed[n]];
+            if (!entry.executed && entry.recorded_on != context)
+            {
+               (skinned ? stats.skinned_waiting : stats.dynamic_waiting)++;
+               QueueLocked(context, local);
+               return false;
+            }
+            low = (std::min)(low, entry.arena_offset);
+            high = (std::max)(high, entry.arena_offset + entry.size);
+         }
+         // One arena view must hold all of them
+         const uint64_t view = arena_view_step ? low / arena_view_step : 0;
+         const uint64_t view_start = view * arena_view_step;
+         if (view >= arena_views.size() || high > view_start + arena_view_span)
+         {
+            stats.skipped[kSkipBuffer]++;
+            QueueLocked(context, local);
+            return false;
+         }
+         arena_view = arena_views[size_t(view)];
+         // Budget and ring space
+         if (skin_window + vertex_count > kSkinFrameBudget || (dynamic_vertices && dynamic_window + dynamic_copy_bytes > kDynamicFrameBudget))
+         {
+            stats.frame_overflow++;
+            QueueLocked(context, local);
+            return false;
+         }
+         if (skin_head + vertex_count > kSkinRingVertices)
+         {
+            skin_window += kSkinRingVertices - skin_head;
+            skin_head = 0;
+         }
+         dst = skin_head;
+         skin_head += vertex_count;
+         skin_window += vertex_count;
+         if (dynamic_vertices)
+         {
+            const uint64_t size = (dynamic_copy_bytes + 15) & ~uint64_t(15);
+            if (dynamic_head + size > kDynamicRingBytes)
+            {
+               dynamic_window += kDynamicRingBytes - dynamic_head;
+               dynamic_head = 0;
+            }
+            dynamic_offset = dynamic_head;
+            dynamic_head += size;
+            dynamic_window += size;
+         }
+         (soup ? stats.frame_soup : stats.frame_indexed)++;
+
+         params.skin_vertex_count = vertex_count;
+         params.skin_dst_vertex = dst;
+         params.skin_soup = soup ? 1 : 0;
+         params.skin_sets = sets;
+         params.mtx_offset_cb = skinned ? draw.vs->mtx_offset_cb : kNoOffset;
+         const BufferEntry& ib = buffers[draw.index_buffer];
+         index_arena_offset = ib.arena_offset + index_start;
+         params.skin_index_start = uint32_t(index_arena_offset - view_start);
+         params.skin_index32 = index_size == 4 ? 1 : 0;
+         for (uint32_t s = 0; s < stream_count; s++)
+         {
+            if (s == 0 && dynamic_vertices)
+            {
+               params.stream_base[s] = uint32_t(dynamic_offset + (uint64_t(streams[s].first) - dynamic_copy_start));
+               params.stream_format[s] = streams[s].code | kVertexFormatDynamicBuffer;
+            }
+            else
+            {
+               params.stream_base[s] = uint32_t(buffers[streams[s].buffer].arena_offset + uint64_t(streams[s].first) - view_start);
+               params.stream_format[s] = streams[s].code;
+            }
+            params.stream_stride[s] = streams[s].stride;
+         }
+      }
+
+      if (dynamic_vertices)
+      {
+         // This frame's contents of the dynamic buffer, next to the draw that uses them
+         const D3D11_BOX box = { UINT(dynamic_copy_start), 0, 0, UINT(dynamic_copy_start + dynamic_copy_bytes), 1, 1 };
+         context->CopySubresourceRegion(dynamic_ring, 0, UINT(dynamic_offset), 0, 0, streams[0].buffer, 0, &box);
+      }
+      params.instance_count = 1;
+      const bool dispatched = DispatchCapture(context, params_cb, draw, params, skin_cs, skinned ? draw.bones : nullptr, arena_view, dynamic_ring_srv, skin_ring_uav, 1, (vertex_count + 63) / 64);
+
+      const std::lock_guard lock(mutex);
+      if (dispatched)
+      {
+         Rec record = {};
+         record.type = Rec::FrameMesh;
+         record.mesh_key = key;
+         record.first_slot = dst;
+         record.count = vertex_count;
+         record.index_arena_offset = index_arena_offset;
+         record.index_count = index_count;
+         record.index_format = soup ? DXGI_FORMAT_UNKNOWN : draw.index_format;
+         local.push_back(record);
+         stats.draws_captured++;
+         stats.instances_captured++;
+         (skinned ? stats.skinned_captured : stats.dynamic_captured)++;
+      }
+      else
+      {
+         stats.skipped[kSkipOther]++;
+      }
+      QueueLocked(context, local);
       return dispatched;
    }
 
@@ -1101,6 +1554,8 @@ namespace RTAO
          work.swap(executed);
          evict.swap(evictions);
          last_record_frame = frame;
+         skin_window = 0; // What was handed out so far is consumed by this pass (or dropped)
+         dynamic_window = 0;
          const D3D12_GPU_VIRTUAL_ADDRESS arena = vertex_arena12->GetGPUVirtualAddress();
          for (auto& pair : meshes)
          {
@@ -1251,7 +1706,80 @@ namespace RTAO
          Transition(list, vertex_arena12, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COMMON);
       }
 
+      // 5) Per frame meshes (skinned, dynamic vertex buffers): world space vertices written this frame by
+      //    skin_vertices_cs, one BLAS per draw built or refit now, added as current-frame-only TLAS instances.
+      //    Identity: the draw's mesh key + its ordinal among this frame's draws of that mesh (the CPU can't tell two
+      //    characters sharing a mesh apart; if they swap order the refit still gives the right triangles, only a looser
+      //    BVH until the periodic rebuild).
+      uint64_t frame_draws = 0, frame_vertices = 0, frame_builds = 0, frame_refits = 0, frame_failed = 0;
+      {
+         const BuildContext ctx = { info.device, list, &retirer, info.submit_fence_value };
+         frame_blases.BeginFrame();
+         bool any = false, any_indexed = false;
+         for (const auto& record : work)
+         {
+            if (record.type != GeometryCapture::Rec::FrameMesh)
+               continue;
+            any = true;
+            any_indexed = any_indexed || record.index_format != DXGI_FORMAT_UNKNOWN;
+         }
+         if (any && skin_ring12)
+         {
+            Transition(list, skin_ring12, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+            if (any_indexed)
+               Transition(list, vertex_arena12, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+            const D3D12_GPU_VIRTUAL_ADDRESS vertices = skin_ring12->GetGPUVirtualAddress();
+            const D3D12_GPU_VIRTUAL_ADDRESS arena = vertex_arena12->GetGPUVirtualAddress();
+            static const float identity[3][4] = { { 1, 0, 0, 0 }, { 0, 1, 0, 0 }, { 0, 0, 1, 0 } };
+            std::unordered_map<uint64_t, uint32_t> ordinals;
+            for (const auto& record : work)
+            {
+               if (record.type != GeometryCapture::Rec::FrameMesh)
+                  continue;
+               const uint64_t key = HashCombine(record.mesh_key, 0x5C1A000000000000ull + ordinals[record.mesh_key]++);
+               GpuMesh mesh;
+               mesh.vertices = vertices + uint64_t(record.first_slot) * 12;
+               mesh.vertex_count = record.count;
+               mesh.vertex_stride = 12;
+               mesh.vertex_format = DXGI_FORMAT_R32G32B32_FLOAT;
+               if (record.index_format != DXGI_FORMAT_UNKNOWN)
+               {
+                  mesh.indices = arena + record.index_arena_offset;
+                  mesh.index_count = record.index_count;
+                  mesh.index_format = record.index_format;
+               }
+               bool refit = false;
+               std::string build_error;
+               const D3D12_GPU_VIRTUAL_ADDRESS blas = frame_blases.Update(ctx, key, mesh, refit, build_error);
+               if (!blas)
+               {
+                  frame_failed++;
+                  continue;
+               }
+               tlas.AddFrameInstance(blas, identity);
+               frame_draws++;
+               frame_vertices += record.count;
+               (refit ? frame_refits : frame_builds)++;
+            }
+            frame_blases.EndFrame(ctx);
+            if (any_indexed)
+               Transition(list, vertex_arena12, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COMMON);
+            Transition(list, skin_ring12, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COMMON);
+         }
+         else
+         {
+            frame_blases.EndFrame(ctx); // Evicts the BLASes of draws that went away
+         }
+      }
+
       const std::lock_guard lock(mutex);
+      stats.frame_draws = frame_draws;
+      stats.frame_vertices = frame_vertices;
+      stats.frame_blas_builds += frame_builds;
+      stats.frame_blas_refits += frame_refits;
+      stats.frame_blas_failed += frame_failed;
+      stats.frame_blas_count = frame_blases.Count();
+      stats.frame_blas_bytes = frame_blases.ResultBytes();
       for (uint64_t key : failed_keys)
       {
          auto it = meshes.find(key);

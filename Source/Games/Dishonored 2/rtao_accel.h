@@ -170,7 +170,7 @@ namespace RTAO
       uint32_t main_only = 0, shadow_only = 0, both = 0; // By where they were seen
       uint32_t evicted_young = 0, evicted_promoted = 0; // Pruned by that BeginFrame
       uint32_t added_new = 0; // AddInstance calls since the previous BeginFrame that created an instance
-      uint32_t moving = 0; // Shadow map instances found to be a moved copy of another (that one evicted)
+      uint32_t shadow_young = 0; // Retained shadow map instances not confirmed static yet (moving objects stay here)
    };
 
    class TlasBuilder
@@ -184,12 +184,12 @@ namespace RTAO
       // promoted and age out at once: no trail of copies, no pile-up. A static object in view is promoted quickly.
       static constexpr uint32_t kPromoteFrames = 4;
       static constexpr uint32_t kYoungRetainFrames = 2;
-      // Static instances seen in a shadow map: kept this long after they were last drawn (~2 min at 60 fps). The game
-      // caches its world shadow maps (redrawn only when needed), so a caster can go undrawn for long while it still casts.
+      // Instances seen in a shadow map (see BeginFrame): confirmed static after kShadowPromoteFrames sightings (a moving
+      // object is seen at most twice per key), then kept kShadowRetainFrames after their last draw (~2 min at 60 fps):
+      // casters out of the camera's view; until then kept kShadowYoungRetainFrames (cascades may be time sliced).
+      static constexpr uint32_t kShadowPromoteFrames = 3;
       static constexpr uint32_t kShadowRetainFrames = 7200;
-      // Moving object detection for shadow map instances (see BeginFrame)
-      static constexpr uint32_t kMovingWindowFrames = 8;
-      static constexpr float kMovingDistance = 1.f;
+      static constexpr uint32_t kShadowYoungRetainFrames = 4;
 
       ~TlasBuilder() { Clear(nullptr, 0); }
 
@@ -213,6 +213,7 @@ namespace RTAO
 
       void Clear(Retirer* retirer, uint64_t fence_value);
       uint32_t LastCutoutCount() const { return last_cutout_count; } // Cutout instances in the last Build
+      uint32_t LastMissingBlas() const { return last_missing_blas; } // Retained instances left out of the last Build: their BLAS isn't built (yet)
       uint32_t retain_frames = kRetainFrames;
       uint32_t promote_frames = kPromoteFrames;
       uint32_t young_retain_frames = kYoungRetainFrames;
@@ -227,10 +228,7 @@ namespace RTAO
          uint32_t cutout_record;
          uint8_t mask;
          uint8_t sources;
-         bool moving;
-         uint32_t first_frame;
       };
-      std::unordered_map<uint64_t, std::vector<uint64_t>> recent_shadow; // BLAS key -> shadow instances created recently
       RetentionStats retention_stats;
       uint32_t added_new = 0;
       std::mutex mutex;
@@ -238,6 +236,7 @@ namespace RTAO
       std::vector<D3D12_RAYTRACING_INSTANCE_DESC> frame_instances;
       uint32_t frame = 0;
       uint32_t last_cutout_count = 0;
+      uint32_t last_missing_blas = 0;
 
       static constexpr uint32_t kSlots = 3; // Matches Interop's frames in flight
       ID3D12Resource* instance_upload[kSlots] = {};

@@ -226,6 +226,8 @@ namespace
    bool g_rtao_fast_cutouts = false;
    // Skip draws that repeat one captured earlier in the frame (depth prepass + G-buffer pass) (config "RTAODedup")
    bool g_rtao_dedup = true;
+   bool g_rtao_freeze_scene = false; // Debug, not saved: trace the last TLAS again every frame (no capture, no rebuild)
+   int g_rtao_blas_budget = 64; // New static BLASes built per frame (config "RTAOBlasBudget")
    // Map(WRITE_DISCARD) of game buffers, per recording thread: buffer -> unique id of its last discard. Part of a draw's
    // identity for the dedup, so a per instance buffer rewritten between two draws never makes them look the same.
    std::atomic<uint64_t> g_rtao_discard_counter = 0;
@@ -405,10 +407,12 @@ struct GameDeviceDataDishonored2 final : public GameDeviceData
    // Snapshots for the UI (written by the recorder)
    std::atomic<uint64_t> rtao_blas_count = 0, rtao_blas_bytes = 0;
    std::atomic<uint32_t> rtao_tlas_instances = 0, rtao_gpu_us = 0;
+   D3D12_GPU_VIRTUAL_ADDRESS rtao_last_top = 0; // The last TLAS built (recording thread only), for "Freeze ray tracing scene"
    // GPU time split (us): capture (readback, BLAS builds, per frame meshes), TLAS build, trace, denoise
    std::atomic<uint32_t> rtao_gpu_capture_us = 0, rtao_gpu_tlas_us = 0, rtao_gpu_trace_us = 0, rtao_gpu_filter_us = 0;
    int rtao_last_quality = -1;
    std::atomic<uint32_t> rtao_tlas_cutouts = 0;
+   std::atomic<uint32_t> rtao_tlas_missing_blas = 0; // Retained instances left out of the last TLAS (BLAS not built yet)
 
    // RT sun shadows (after the RTAO objects, so they are destroyed first)
    RTSun::SunPass rtsun_pass;
@@ -899,14 +903,21 @@ public:
          g.rtao_retirer.Collect(info.completed_fence_value);
          g.rtao_timer.Collect(info.frame_slot);
          g.rtao_timer.Begin(list, info.frame_slot);
-         if (!g.rtao_capture.Record(list, info, g.rtao_blases, g.rtao_tlas, g.rtao_retirer, 64, error))
+         // "Freeze ray tracing scene" (debug): no capture consumption, no TLAS rebuild, the last TLAS is traced again. If
+         // the shadows still change while frozen, the cause is in the trace/denoiser/camera, not in the scene.
+         const bool frozen = g_rtao_freeze_scene && g.rtao_last_top != 0;
+         if (!frozen && !g.rtao_capture.Record(list, info, g.rtao_blases, g.rtao_tlas, g.rtao_retirer, uint32_t(std::clamp(g_rtao_blas_budget, 1, 4096)), error))
             return false;
          g.rtao_timer.Mark(list, info.frame_slot);
          const RTAO::BuildContext ctx = { info.device, list, &g.rtao_retirer, info.submit_fence_value };
-         D3D12_GPU_VIRTUAL_ADDRESS top = 0;
-         uint32_t instances = 0;
-         if (!g.rtao_tlas.Build(ctx, g.rtao_blases, info.frame_slot, top, instances, error))
-            return false;
+         D3D12_GPU_VIRTUAL_ADDRESS top = g.rtao_last_top;
+         uint32_t instances = g.rtao_tlas_instances;
+         if (!frozen)
+         {
+            if (!g.rtao_tlas.Build(ctx, g.rtao_blases, info.frame_slot, top, instances, error))
+               return false;
+            g.rtao_last_top = top;
+         }
          g.rtao_timer.Mark(list, info.frame_slot);
          if (!g.rtao_pass.Record(list, info, top, settings, g.rtao_retirer, error, &g.rtao_timer, &g.rtao_capture.GetCutoutBindings())) // Marks the end of the trace
             return false;
@@ -915,6 +926,8 @@ public:
          g.rtao_blas_bytes = g.rtao_blases.ResultBytes();
          g.rtao_tlas_instances = instances;
          g.rtao_tlas_cutouts = g.rtao_tlas.LastCutoutCount();
+         if (!frozen)
+            g.rtao_tlas_missing_blas = g.rtao_tlas.LastMissingBlas();
          g.rtao_gpu_us = uint32_t(g.rtao_timer.LastMs() * 1000.0);
          g.rtao_gpu_capture_us = uint32_t(g.rtao_timer.LastSpanMs(0) * 1000.0);
          g.rtao_gpu_tlas_us = uint32_t(g.rtao_timer.LastSpanMs(1) * 1000.0);
@@ -1435,13 +1448,15 @@ public:
          {
             const RTAO::CaptureStats stats = game_device_data.rtao_capture.GetStats();
             const RTAO::RetentionStats& r = stats.retention;
-            char line[768];
+            char line[1024];
             snprintf(line, sizeof(line),
                "RTAO diag: shadow map draws in %u frames: %u frames with none, max %llu in a frame | TLAS retained %u (promoted %u, young %u; main view only %u, shadow maps only %u, both %u), "
-               "last readback: new %u, evicted %u promoted + %u young, moving copies %u | MVP instances %llu, rekeyed %llu (fuzzy entries %llu) | "
+               "last readback: new %u, evicted %u promoted + %u young, shadow young %u | BLAS: meshes %llu, built %llu, failed %llu, TLAS instances %u, left out (BLAS not built yet) %u, budget %d/frame, arena %llu MB, draws refused: arena full %llu, buffer %llu, ring %llu | MVP instances %llu, rekeyed %llu (fuzzy entries %llu) | "
                "camera: SSAO draws %llu, shared copy from another frame %llu, view projection differed %llu (max element diff %.6f), no thread copy %llu, thread copy another camera %llu",
                g_rtao_shadow_frames, g_rtao_shadow_zero_frames, (unsigned long long)g_rtao_shadow_max_per_frame, r.promoted + r.young, r.promoted, r.young, r.main_only, r.shadow_only, r.both,
-               r.added_new, r.evicted_promoted, r.evicted_young, r.moving, (unsigned long long)stats.mvp_instances, (unsigned long long)stats.mvp_rekeyed, (unsigned long long)stats.fuzzy_entries,
+               r.added_new, r.evicted_promoted, r.evicted_young, r.shadow_young, (unsigned long long)stats.meshes, (unsigned long long)stats.meshes_ready, (unsigned long long)stats.blas_failed,
+               game_device_data.rtao_tlas_instances.load(), game_device_data.rtao_tlas_missing_blas.load(), g_rtao_blas_budget, (unsigned long long)(stats.arena_vertex_bytes >> 20),
+               (unsigned long long)stats.skipped[RTAO::kSkipArenaFull], (unsigned long long)stats.skipped[RTAO::kSkipBuffer], (unsigned long long)stats.skipped[RTAO::kSkipRingFull], (unsigned long long)stats.mvp_instances, (unsigned long long)stats.mvp_rekeyed, (unsigned long long)stats.fuzzy_entries,
                (unsigned long long)g_rtao_view_checks.load(), (unsigned long long)g_rtao_view_other_frame.load(), (unsigned long long)g_rtao_view_mismatch.load(), g_rtao_view_mismatch_max.load() / 1e6,
                (unsigned long long)g_rtao_view_no_thread_copy.load(), (unsigned long long)g_rtao_view_other_camera.load());
             reshade::log::message(reshade::log::level::info, line);
@@ -2761,6 +2776,7 @@ public:
       g_rtao_quality = std::clamp(g_rtao_quality, 0, int(RTAO_QUALITY_COUNT) - 1);
       reshade::get_config_value(runtime, NAME, "RTAOFastCutouts", g_rtao_fast_cutouts);
       reshade::get_config_value(runtime, NAME, "RTAODedup", g_rtao_dedup);
+      reshade::get_config_value(runtime, NAME, "RTAOBlasBudget", g_rtao_blas_budget);
       reshade::get_config_value(runtime, NAME, "RTAOCutoutsExact", g_rtao_cutouts_exact);
 
       auto& game_settings = cb_luma_global_settings.GameSettings;
@@ -2914,6 +2930,16 @@ public:
             ImGui::SetTooltip("Decides once per ray whether cutouts are solid or absent (instead of at every crossed leaf), which skips the per triangle\ncandidate handling: cheaper in foliage (about a quarter of the trace there), slightly different AO under dense vegetation.\nWith \"texture exact\" on, the masks take precedence: the per ray coin only decides cutouts without a mask, so it saves nothing.");
          if (ImGui::Checkbox("RTAO: skip repeated draws", &g_rtao_dedup))
             reshade::set_config_value(runtime, NAME, "RTAODedup", g_rtao_dedup);
+         ImGui::Checkbox("RTAO debug: freeze ray tracing scene", &g_rtao_freeze_scene);
+         if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("Keeps tracing the current ray tracing scene (no new geometry, no removals) until unchecked. Not saved.\n"
+                              "If the RT shadows still change while frozen, the cause is in the trace or the camera, not in what is captured.");
+         if (ImGui::SliderInt("RTAO BLAS builds per frame", &g_rtao_blas_budget, 8, 1024))
+            g_rtao_blas_budget = std::clamp(g_rtao_blas_budget, 8, 1024);
+         if (ImGui::IsItemDeactivatedAfterEdit())
+            reshade::set_config_value(runtime, NAME, "RTAOBlasBudget", g_rtao_blas_budget);
+         if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("New meshes built for ray tracing per frame. A mesh waiting for its build is missing from the scene (late casters).");
          if (ImGui::IsItemHovered())
             ImGui::SetTooltip("Captures an object once per frame even if several passes draw it (depth prepass, G-buffer): saves the per draw\ncapture work on the game's render threads and duplicate per frame BLASes of characters. Turn off if geometry goes missing.");
          if (ImGui::Checkbox("RTAO cutouts: texture exact", &g_rtao_cutouts_exact))
@@ -2934,8 +2960,8 @@ public:
                (unsigned long long)stats.shadow_instances, (unsigned long long)stats.shadow_frame_meshes, (unsigned long long)stats.shadow_skipped, (unsigned long long)stats.shadow_rejected);
             {
                const RTAO::RetentionStats& r = stats.retention;
-               ImGui::Text("TLAS retained %u (promoted %u, young %u; main view only %u, shadow maps only %u, both), last readback: new %u, evicted %u + %u young, moving %u; MVP rekeyed %llu of %llu",
-                  r.promoted + r.young, r.promoted, r.young, r.main_only, r.shadow_only, r.both, r.added_new, r.evicted_promoted, r.evicted_young, r.moving,
+               ImGui::Text("TLAS retained %u (promoted %u, young %u; main view only %u, shadow maps only %u, both %u), last readback: new %u, evicted %u + %u young, shadow young %u; left out (BLAS not built) %u; MVP rekeyed %llu of %llu",
+                  r.promoted + r.young, r.promoted, r.young, r.main_only, r.shadow_only, r.both, r.added_new, r.evicted_promoted, r.evicted_young, r.shadow_young, game_device_data.rtao_tlas_missing_blas.load(),
                   (unsigned long long)stats.mvp_rekeyed, (unsigned long long)stats.mvp_instances);
             }
             ImGui::Text("Main view draws by matrix source: none %llu, direct %llu, indexed %llu, cbuffer %llu, MVP %llu",
@@ -3015,7 +3041,7 @@ public:
          reshade::set_config_value(runtime, NAME, "RTSunRays", g_rtsun_rays);
       if (ImGui::IsItemHovered())
          ImGui::SetTooltip("Rays per pixel per frame (in the penumbra the denoiser averages them over frames).");
-      static const char* rtsun_output_names[int(RTSun::Output::Count)] = { "Denoised", "Raw (no denoiser)", "Geometric N.L (no rays, debug)", "Denoiser history (debug)" };
+      static const char* rtsun_output_names[int(RTSun::Output::Count)] = { "Denoised", "Raw (no denoiser)", "Geometric N.L (no rays, debug)", "Denoiser history (debug)", "Raw hard (no denoiser, no penumbra)" };
       if (ImGui::Combo("RT Sun Output", &g_rtsun_output, rtsun_output_names, int(RTSun::Output::Count)))
       {
          g_rtsun_output = std::clamp(g_rtsun_output, 0, int(RTSun::Output::Count) - 1);

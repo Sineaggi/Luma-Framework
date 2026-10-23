@@ -61,6 +61,7 @@ namespace RTSun
       Raw = 1, // No denoiser
       NdotL = 2, // Geometric N.L of the depth normal, no rays (debug)
       History = 3, // Denoiser history: white kept, black rejected (debug)
+      RawHard = 4, // No denoiser and a point light (no penumbra, so no per frame ray jitter): one hard ray per pixel (debug)
       Count
    };
 

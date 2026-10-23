@@ -497,7 +497,7 @@ namespace RTSun
       std::memcpy(constants.prev_cam_fwd, has_history ? prev_cam_fwd : settings.cam_fwd, sizeof(constants.prev_cam_fwd));
       std::memcpy(constants.light_dir, settings.light_dir, sizeof(constants.light_dir));
       const float radius_rad = (std::max)(settings.angular_diameter_deg, 0.f) * 0.5f * 3.14159265f / 180.f;
-      constants.cone_tan = std::tan((std::min)(radius_rad, 0.5f));
+      constants.cone_tan = settings.output == Output::RawHard ? 0.f : std::tan((std::min)(radius_rad, 0.5f));
       constants.t_max = settings.t_max;
       constants.ray_count = settings.ray_count;
       constants.frame = frame++;

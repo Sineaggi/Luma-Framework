@@ -445,51 +445,17 @@ namespace RTAO
       s.added_new = added_new;
       added_new = 0;
 
-      // Moving objects in the shadow maps: a shadow instance created last frame next to (kMovingDistance) a recent shadow
-      // instance of the same mesh that stopped being drawn exactly when it appeared is the same object, moved. The old
-      // copy goes now and the new one is marked moving (short retention), so a moving object leaves no trail of copies.
-      for (auto mesh_it = recent_shadow.begin(); mesh_it != recent_shadow.end();)
-      {
-         auto& keys = mesh_it->second;
-         std::erase_if(keys, [&](uint64_t key) {
-            auto it = instances.find(key);
-            return it == instances.end() || frame - it->second.first_frame > kMovingWindowFrames;
-         });
-         for (uint64_t new_key : keys)
-         {
-            auto n = instances.find(new_key);
-            if (n == instances.end() || n->second.first_frame != frame - 1)
-               continue;
-            for (uint64_t old_key : keys)
-            {
-               auto o = instances.find(old_key);
-               if (old_key == new_key || o == instances.end() || o->second.last_frame != frame - 2 || o->second.first_frame >= frame - 1)
-                  continue;
-               float d2 = 0.f;
-               for (int a = 0; a < 3; a++)
-               {
-                  const float d = n->second.transform[a][3] - o->second.transform[a][3];
-                  d2 += d * d;
-               }
-               if (d2 > kMovingDistance * kMovingDistance)
-                  continue;
-               n->second.moving = true;
-               instances.erase(o); // Its key stays in "keys" until the next pass, where find() fails
-               s.moving++;
-               s.evicted_young++;
-            }
-         }
-         mesh_it = keys.empty() ? recent_shadow.erase(mesh_it) : std::next(mesh_it);
-      }
-
       for (auto it = instances.begin(); it != instances.end();)
       {
          const Instance& instance = it->second;
-         // Seen in a shadow map and not moving: the game caches its world shadow maps and only redraws them when needed,
-         // so a static caster may not be drawn again for a long time while it still casts. Kept kShadowRetainFrames.
-         const bool shadow_static = (instance.sources & kInstanceSourceShadow) && !instance.moving;
+         // Seen in a shadow map: a static caster is drawn there every frame (in game: no frame without shadow map draws), so
+         // kShadowPromoteFrames sightings confirm it, then it is kept kShadowRetainFrames (casters out of the camera's
+         // view). A moving object gets a new key every frame and is seen at most twice per key (the main view, then the
+         // shadow maps a frame later): it never gets there and ages out after kShadowYoungRetainFrames, no trail.
+         const bool shadow = (instance.sources & kInstanceSourceShadow) != 0;
+         const bool shadow_static = shadow && instance.seen_frames >= kShadowPromoteFrames;
          const bool promoted = shadow_static || instance.seen_frames >= promote_frames;
-         const uint32_t max_age = shadow_static ? (std::max)(retain_frames, kShadowRetainFrames) : (promoted ? retain_frames : young_retain_frames);
+         const uint32_t max_age = shadow_static ? (std::max)(retain_frames, kShadowRetainFrames) : (promoted ? retain_frames : (shadow ? kShadowYoungRetainFrames : young_retain_frames));
          if (frame - instance.last_frame > max_age)
          {
             (promoted ? s.evicted_promoted : s.evicted_young)++;
@@ -497,6 +463,7 @@ namespace RTAO
             continue;
          }
          (promoted ? s.promoted : s.young)++;
+         s.shadow_young += shadow && !promoted;
          const uint8_t sources = it->second.sources;
          if (sources == (kInstanceSourceMain | kInstanceSourceShadow))
             s.both++;
@@ -524,11 +491,7 @@ namespace RTAO
       {
          instance.seen_frames = 1;
          instance.sources = 0;
-         instance.moving = false;
-         instance.first_frame = frame;
          added_new++;
-         if (source == kInstanceSourceShadow)
-            recent_shadow[blas_key].push_back(instance_key);
       }
       else if (instance.last_frame != frame)
          instance.seen_frames++;
@@ -570,6 +533,7 @@ namespace RTAO
       instance_count = 0;
       frame_slot %= kSlots;
       last_cutout_count = 0;
+      last_missing_blas = 0;
       {
          const std::lock_guard lock(mutex);
          descs.clear();
@@ -578,7 +542,10 @@ namespace RTAO
          {
             const D3D12_GPU_VIRTUAL_ADDRESS blas = blases.Get(pair.second.blas_key);
             if (!blas)
+            {
+               last_missing_blas++;
                continue; // Not built (yet)
+            }
             D3D12_RAYTRACING_INSTANCE_DESC desc = {};
             std::memcpy(desc.Transform, pair.second.transform, sizeof(desc.Transform));
             desc.InstanceID = uint32_t(descs.size()) & (kInstanceIdCutoutBit - 1);
@@ -687,7 +654,6 @@ namespace RTAO
          const std::lock_guard lock(mutex);
          instances.clear();
          frame_instances.clear();
-         recent_shadow.clear();
       }
       for (uint32_t i = 0; i < kSlots; i++)
       {

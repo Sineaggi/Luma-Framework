@@ -269,6 +269,10 @@ namespace RTAO
       // Shadow map draws (DrawInfo::shadow_view): captured draws / instances / per frame meshes, skipped (skinned, MVP
       // per frame meshes), instances rejected at readback (MVP derived, not a rigid transform)
       uint64_t shadow_draws = 0, shadow_instances = 0, shadow_frame_meshes = 0, shadow_skipped = 0, shadow_rejected = 0;
+      uint64_t shadow_skipped_skinned = 0, shadow_skipped_mvp_frame = 0; // shadow_skipped split
+      // MVP derived instances, last readback: read back, matched to a known instance although their exact key differed
+      uint64_t mvp_instances = 0, mvp_rekeyed = 0, fuzzy_entries = 0;
+      RetentionStats retention; // The TLAS's retained instances, last readback
    };
    enum CaptureSkip
    {
@@ -380,6 +384,7 @@ namespace RTAO
          CutoutGeometry geometry;
          bool shadow_view = false; // Instances, FrameMesh: from a shadow map draw (kept after the AO pass)
          bool check_rigid = false; // Instances: MVP derived in a shadow map draw (see DrawInfo::shadow_view)
+         bool mvp = false; // Instances: MVP derived matrix (identity matched with a tolerance, see FuzzyKey)
       };
 
       bool EnsureBufferCopy(ID3D11DeviceContext* context, ID3D11Buffer* buffer, bool vertex, std::vector<Rec>& records);
@@ -442,7 +447,23 @@ namespace RTAO
          CutoutGeometry geometry;
          bool shadow_view;
          bool check_rigid;
+         bool mvp;
       };
+      // MVP derived matrices (world = MVP x inverse(VP)) carry float noise that changes with the camera, so their exact
+      // quantized key changes from frame to frame: the same static prop would look like a new object every frame, never
+      // be promoted (TlasBuilder::kPromoteFrames) and drop out 2 frames after leaving the view. FuzzyKey gives them the
+      // key of a known instance of the same mesh within kFuzzyTranslation / kFuzzyRotation instead.
+      static constexpr float kFuzzyCell = 0.5f, kFuzzyTranslation = 0.03f, kFuzzyRotation = 0.01f;
+      struct FuzzyEntry
+      {
+         float rows[12];
+         uint64_t key;
+         uint32_t last_frame;
+      };
+      uint64_t FuzzyKey(uint64_t mesh_key, const float rows[12], uint64_t exact_key);
+      std::unordered_map<uint64_t, std::vector<FuzzyEntry>> fuzzy_cells; // HashCombine(mesh, cell) -> entries
+      uint32_t fuzzy_frame = 0;
+      uint64_t fuzzy_matched_other_key = 0; // Matches whose exact key differed (the noise this fixes), this readback
       std::vector<ReadbackRecord> readback_records[kFrameSlots];
       CaptureStats stats;
       CutoutMaterials cutouts; // Own lock, taken after "mutex" when nested

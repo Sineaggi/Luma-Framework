@@ -249,6 +249,34 @@ static void TestTlasRetention()
    tlas.BeginFrame();
    tlas.AddInstance(2, 1, identity);
    CHECK(tlas.RetainedCount() == 1, "a promoted instance must be pruned after kRetainFrames (got %zu)", tlas.RetainedCount());
+
+   // Shadow map instances: a static caster drawn once (a cached shadow map) stays far beyond kRetainFrames; a moving
+   // object in the shadow maps (a new key every frame, 0.1 apart) leaves no trail
+   {
+      RTAO::TlasBuilder shadow;
+      tlas.BeginFrame();
+      shadow.BeginFrame();
+      shadow.AddInstance(1, 1, identity, RTAO::kInstanceMaskOpaque, RTAO::kNoCutoutRecord, RTAO::kInstanceSourceShadow);
+      // A row of static casters of one mesh drawn in the same frame (books on a shelf): not "moving"
+      for (uint64_t k = 0; k < 5; k++)
+      {
+         float xform[3][4] = { { 1, 0, 0, 10.f + 0.3f * k }, { 0, 1, 0, 0 }, { 0, 0, 1, 0 } };
+         shadow.AddInstance(500 + k, 3, xform, RTAO::kInstanceMaskOpaque, RTAO::kNoCutoutRecord, RTAO::kInstanceSourceShadow);
+      }
+      for (uint64_t f = 0; f < 20; f++)
+      {
+         shadow.BeginFrame();
+         float xform[3][4] = { { 1, 0, 0, 0.1f * f }, { 0, 1, 0, 5 }, { 0, 0, 1, 0 } };
+         shadow.AddInstance(1000 + f, 2, xform, RTAO::kInstanceMaskOpaque, RTAO::kNoCutoutRecord, RTAO::kInstanceSourceShadow);
+      }
+      CHECK(shadow.RetainedCount() <= 1 + 5 + 2, "a moving shadow map object must not leave a trail (retained %zu)", shadow.RetainedCount());
+      for (uint32_t i = 0; i < RTAO::TlasBuilder::kRetainFrames + 50; i++)
+         shadow.BeginFrame();
+      CHECK(shadow.RetainedCount() == 6, "static shadow map casters drawn once must be kept past kRetainFrames (retained %zu)", shadow.RetainedCount());
+      for (uint32_t i = 0; i < RTAO::TlasBuilder::kShadowRetainFrames; i++)
+         shadow.BeginFrame();
+      CHECK(shadow.RetainedCount() == 0, "shadow map casters must go after kShadowRetainFrames (retained %zu)", shadow.RetainedCount());
+   }
    printf("TLAS retention: ok\n");
 }
 

@@ -169,6 +169,16 @@ namespace
    // which the main view never draws but the sun needs (RTAO::DrawInfo::shadow_view)
    bool g_rtao_shadow_casters = true;
    std::atomic<uint64_t> g_rtao_shadow_view_draws = 0; // Indexed draws into shadow maps seen (captured or not)
+   // Shadow map draws per frame (at present): frames with none, the most in one frame, over the current log window
+   uint64_t g_rtao_shadow_draws_at_present = 0;
+   uint32_t g_rtao_shadow_zero_frames = 0, g_rtao_shadow_frames = 0;
+   uint64_t g_rtao_shadow_max_per_frame = 0;
+   // Wobble diagnostics (GetRTAOPerView): SSAO draws, ones whose thread had no per view copy, ones where the thread's
+   // view projection differed from Luma's shared copy (and the largest element difference, x 1e6)
+   std::atomic<uint64_t> g_rtao_view_checks = 0, g_rtao_view_no_thread_copy = 0, g_rtao_view_mismatch = 0, g_rtao_view_other_frame = 0, g_rtao_view_other_camera = 0;
+   std::atomic<uint32_t> g_rtao_view_mismatch_max = 0;
+   thread_local CBPerViewGlobals t_rtao_per_view;
+   thread_local bool t_rtao_per_view_valid = false;
    std::atomic<uint32_t> g_rtao_shadow_view_width = 0, g_rtao_shadow_view_height = 0, g_rtao_shadow_view_slices = 0; // The last shadow map seen
 
    bool RTAOOutputIsRayTraced(int output)
@@ -817,14 +827,54 @@ public:
    // Camera from the game's per view constants (the copy Luma keeps, see UpdateGlobalCB). The game's vertex shaders
    // compute clip = world.x * VP[0] + world.y * VP[1] + world.z * VP[2] + VP[3] on the matrix registers as stored,
    // which is the row vector convention RTAO::PassSettings uses, so the bytes are taken as they are.
+   // The per view constants the SSAO draw uses: the last ones mapped on its recording thread (the game maps the per
+   // view cbuffer on each deferred context before its passes). Luma's shared copy (cb_per_view_global) is whichever view
+   // any thread mapped last, which can be another frame's (the camera a frame off: the traced shadows wobble when the
+   // camera moves, and their TAA jitter differs from the depth's even when it doesn't).
+   static const CBPerViewGlobals& GetRTAOPerView()
+   {
+      bool valid = t_rtao_per_view_valid;
+      // Another camera (e.g. a spot light's perspective shadow view mapped last on this thread): not the SSAO's view
+      if (valid)
+      {
+         const float dx = t_rtao_per_view.cb_wscampos.x - cb_per_view_global.cb_wscampos.x, dy = t_rtao_per_view.cb_wscampos.y - cb_per_view_global.cb_wscampos.y,
+                     dz = t_rtao_per_view.cb_wscampos.z - cb_per_view_global.cb_wscampos.z;
+         if (dx * dx + dy * dy + dz * dz > 4.f)
+         {
+            valid = false;
+            g_rtao_view_other_camera++;
+         }
+      }
+      const CBPerViewGlobals& per_view = valid ? t_rtao_per_view : cb_per_view_global;
+      g_rtao_view_checks++;
+      if (valid && t_rtao_per_view.cb_framenumber != cb_per_view_global.cb_framenumber)
+         g_rtao_view_other_frame++; // The shared copy was another frame's
+      if (!valid)
+         g_rtao_view_no_thread_copy++;
+      else if (std::memcmp(&t_rtao_per_view.cb_viewprojectionmatrix, &cb_per_view_global.cb_viewprojectionmatrix, sizeof(cb_per_view_global.cb_viewprojectionmatrix)) != 0)
+      {
+         g_rtao_view_mismatch++;
+         const float* a = reinterpret_cast<const float*>(&t_rtao_per_view.cb_viewprojectionmatrix);
+         const float* b = reinterpret_cast<const float*>(&cb_per_view_global.cb_viewprojectionmatrix);
+         float diff = 0.f;
+         for (int i = 0; i < 16; i++)
+            diff = (std::max)(diff, std::fabs(a[i] - b[i]));
+         const uint32_t diff_bits = uint32_t((std::min)(diff * 1e6f, 4e9f)); // Max element difference x 1e6
+         uint32_t prev = g_rtao_view_mismatch_max.load();
+         while (diff_bits > prev && !g_rtao_view_mismatch_max.compare_exchange_weak(prev, diff_bits)) {}
+      }
+      return per_view;
+   }
+
    static RTAO::PassSettings MakeRTAOSettings(int output)
    {
       RTAO::PassSettings settings;
-      static_assert(sizeof(settings.view_proj) == sizeof(cb_per_view_global.cb_viewprojectionmatrix));
-      std::memcpy(settings.view_proj, &cb_per_view_global.cb_viewprojectionmatrix, sizeof(settings.view_proj));
+      const CBPerViewGlobals& per_view = GetRTAOPerView();
+      static_assert(sizeof(settings.view_proj) == sizeof(per_view.cb_viewprojectionmatrix));
+      std::memcpy(settings.view_proj, &per_view.cb_viewprojectionmatrix, sizeof(settings.view_proj));
       RTAO::InvertMatrix(settings.view_proj, settings.inv_view_proj);
-      std::memcpy(settings.cam_pos, &cb_per_view_global.cb_wscampos, sizeof(settings.cam_pos));
-      std::memcpy(settings.cam_fwd, &cb_per_view_global.cb_wscamforwarddir, sizeof(settings.cam_fwd));
+      std::memcpy(settings.cam_pos, &per_view.cb_wscampos, sizeof(settings.cam_pos));
+      std::memcpy(settings.cam_fwd, &per_view.cb_wscamforwarddir, sizeof(settings.cam_fwd));
       settings.reversed_z = true; // Dishonored 2 renders with inverted depth (see the DLSS settings)
       settings.radius = (std::max)(g_rtao_radius, 0.01f);
       const int rays = std::clamp(g_rtao_rays, 1, 64);
@@ -1371,6 +1421,36 @@ public:
          game_device_data.rtao_stat_dropped += uint32_t(std::erase_if(game_device_data.rtao_pending, [&](const auto& p) { return game_device_data.rtao_frame - p.frame > 3; }));
       }
       const uint32_t rtao_frames = game_device_data.rtao_frame - game_device_data.rtao_init_frame;
+      // Shadow map draws per frame, and every 600 frames a line with the scene's retention and the camera source
+      // (popping and wobble diagnostics, see RTAO_NOTES.md "Shadow map casters")
+      if (game_device_data.rtao.IsInitialized() && g_rtao_capture_active.load(std::memory_order_relaxed))
+      {
+         const uint64_t shadow_draws = g_rtao_shadow_view_draws.load();
+         const uint64_t delta = shadow_draws - g_rtao_shadow_draws_at_present;
+         g_rtao_shadow_draws_at_present = shadow_draws;
+         g_rtao_shadow_frames++;
+         g_rtao_shadow_zero_frames += delta == 0;
+         g_rtao_shadow_max_per_frame = (std::max)(g_rtao_shadow_max_per_frame, delta);
+         if (g_rtao_shadow_frames >= 600 && game_device_data.rtao_capture.IsInitialized())
+         {
+            const RTAO::CaptureStats stats = game_device_data.rtao_capture.GetStats();
+            const RTAO::RetentionStats& r = stats.retention;
+            char line[768];
+            snprintf(line, sizeof(line),
+               "RTAO diag: shadow map draws in %u frames: %u frames with none, max %llu in a frame | TLAS retained %u (promoted %u, young %u; main view only %u, shadow maps only %u, both %u), "
+               "last readback: new %u, evicted %u promoted + %u young, moving copies %u | MVP instances %llu, rekeyed %llu (fuzzy entries %llu) | "
+               "camera: SSAO draws %llu, shared copy from another frame %llu, view projection differed %llu (max element diff %.6f), no thread copy %llu, thread copy another camera %llu",
+               g_rtao_shadow_frames, g_rtao_shadow_zero_frames, (unsigned long long)g_rtao_shadow_max_per_frame, r.promoted + r.young, r.promoted, r.young, r.main_only, r.shadow_only, r.both,
+               r.added_new, r.evicted_promoted, r.evicted_young, r.moving, (unsigned long long)stats.mvp_instances, (unsigned long long)stats.mvp_rekeyed, (unsigned long long)stats.fuzzy_entries,
+               (unsigned long long)g_rtao_view_checks.load(), (unsigned long long)g_rtao_view_other_frame.load(), (unsigned long long)g_rtao_view_mismatch.load(), g_rtao_view_mismatch_max.load() / 1e6,
+               (unsigned long long)g_rtao_view_no_thread_copy.load(), (unsigned long long)g_rtao_view_other_camera.load());
+            reshade::log::message(reshade::log::level::info, line);
+            g_rtao_shadow_frames = g_rtao_shadow_zero_frames = 0;
+            g_rtao_shadow_max_per_frame = 0;
+            g_rtao_view_checks = g_rtao_view_no_thread_copy = g_rtao_view_mismatch = g_rtao_view_other_frame = g_rtao_view_other_camera = 0;
+            g_rtao_view_mismatch_max = 0;
+         }
+      }
       if (game_device_data.rtao.IsInitialized() && (rtao_frames == 300 || rtao_frames == 3000 || rtao_frames == 30000))
       {
          char buffer[512];
@@ -2417,6 +2497,14 @@ public:
             device_data.cb_per_view_global_buffers.emplace(buffer);
 #endif // DEVELOPMENT
          }
+         // RTAO/RT sun: this thread's last per view constants (as the GPU will see them), for the SSAO draw recorded next
+         // on this thread (see t_rtao_per_view)
+         const CBPerViewGlobals& written = *reinterpret_cast<const CBPerViewGlobals*>(device_data.cb_per_view_global_buffer_map_data);
+         if (MatrixIsProjection(written.cb_projectionmatrix))
+         {
+            t_rtao_per_view = written;
+            t_rtao_per_view_valid = true;
+         }
          device_data.cb_per_view_global_buffer_map_data = nullptr;
       }
    }
@@ -2844,6 +2932,12 @@ public:
             ImGui::Text("Shadow map draws %llu (last map %ux%u, %u slices): captured %llu (%llu instances, %llu per frame meshes), skipped (characters) %llu, MVP instances rejected %llu",
                (unsigned long long)g_rtao_shadow_view_draws.load(), g_rtao_shadow_view_width.load(), g_rtao_shadow_view_height.load(), g_rtao_shadow_view_slices.load(), (unsigned long long)stats.shadow_draws,
                (unsigned long long)stats.shadow_instances, (unsigned long long)stats.shadow_frame_meshes, (unsigned long long)stats.shadow_skipped, (unsigned long long)stats.shadow_rejected);
+            {
+               const RTAO::RetentionStats& r = stats.retention;
+               ImGui::Text("TLAS retained %u (promoted %u, young %u; main view only %u, shadow maps only %u, both), last readback: new %u, evicted %u + %u young, moving %u; MVP rekeyed %llu of %llu",
+                  r.promoted + r.young, r.promoted, r.young, r.main_only, r.shadow_only, r.both, r.added_new, r.evicted_promoted, r.evicted_young, r.moving,
+                  (unsigned long long)stats.mvp_rekeyed, (unsigned long long)stats.mvp_instances);
+            }
             ImGui::Text("Main view draws by matrix source: none %llu, direct %llu, indexed %llu, cbuffer %llu, MVP %llu",
                (unsigned long long)g_rtao_draws_by_source[0].load(), (unsigned long long)g_rtao_draws_by_source[1].load(), (unsigned long long)g_rtao_draws_by_source[2].load(), (unsigned long long)g_rtao_draws_by_source[3].load(), (unsigned long long)g_rtao_draws_by_source[4].load());
             ImGui::Text("Unknown vertex shader %llu, unusable input layout %llu, GPU culled (indirect, not captured) %llu",

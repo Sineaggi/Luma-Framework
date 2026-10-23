@@ -454,6 +454,26 @@ size; config "RTAOShadowCasters", default on), which hold exactly the sun's cast
 To check in game: shadow map draws > 0 (else the shadow maps aren't depth arrays); rejected stays small; and the
 log line shows whether the shadow maps are redrawn every frame (captured draws growing steadily) or cached.
 
+Second in game test (29190ca8): casters still came and went. Three screenshots ~1 s apart with a still camera went
+from fully shaded to one beam to a sunlit room: the casters behind the camera vanished over time. The menu log
+showed the shadow map capture working (~355 draws per frame into a 2048x2048x8 depth array, none rejected). Reading:
+the game caches its world shadow maps (redrawn only when needed), so a caster outside the view is drawn once, then
+aged out by the retention meant for the main view (2 frames young, then 180). Changes:
+- Shadow map instances that aren't moving are kept `kShadowRetainFrames` (7200) from their last draw, promoted at
+  once. A moving object in the shadow maps is caught as a new instance of the same mesh within 1 m of one that stopped
+  being drawn the same frame (`TlasBuilder::BeginFrame`); the old copy is evicted and the new one only kept as young.
+- MVP-only matrices get a tolerant identity (`GeometryCapture::FuzzyKey`, 3 cm / 0.01), since MVP x inverse(VP)
+  carries camera-dependent float noise that changed their exact key. Without it, they never got promoted and
+  vanished 2 frames after leaving the view.
+- MVP per frame meshes (openable windows, doors) are now taken from shadow maps too, behind a GPU rigid transform
+  check in `ResolveInstance` (NaN vertices otherwise). Main view promoted retention went from 180 to 600 frames.
+- Wobble: the camera for the trace came from Luma's shared per view copy, i.e. whichever thread mapped it last (maybe
+  another frame). It now comes from the copy mapped on the SSAO draw's own thread (`GetRTAOPerView`), unless that one
+  is another camera (more than 2 m away).
+- Every 600 frames, a log line "RTAO diag: ..." gives: shadow map draws per frame (frames with none), TLAS retained
+  by source, new and evicted instances, moving copies, MVP rekeys, and how often the shared camera copy was from
+  another frame or differed.
+
 ### Local lights (not implemented)
 
 Point/spot/area lights are in `tlf_light_tCB.co_tlf_lights[]` (float3 mWorldPosition, mRadiusFalloff, mColor,

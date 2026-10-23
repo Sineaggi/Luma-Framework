@@ -215,6 +215,14 @@ uint ResolveInstance(uint i, out float4 rows[3])
             rows[0] /= w_row.w;
             rows[1] /= w_row.w;
             rows[2] /= w_row.w;
+            // A rigid transform (rotation x scale): perpendicular model axes of sane lengths. MVP x inverse(another view's
+            // VP) (a shadow map draw whose PerViewCB isn't its own view) leaves a skew: rejected (as RTAO::IsRigidTransform)
+            float3 ax = float3(rows[0].x, rows[1].x, rows[2].x), ay = float3(rows[0].y, rows[1].y, rows[2].y), az = float3(rows[0].z, rows[1].z, rows[2].z);
+            float lx = length(ax), ly = length(ay), lz = length(az);
+            float shortest = min(lx, min(ly, lz)), longest = max(lx, max(ly, lz));
+            if (!(shortest > 1e-4) || !(longest < 1e4) || longest > shortest * 1000.0 ||
+                abs(dot(ax, ay)) > 0.02 * lx * ly || abs(dot(ax, az)) > 0.02 * lx * lz || abs(dot(ay, az)) > 0.02 * ly * lz)
+                flags = 0;
         }
     }
     else

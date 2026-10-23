@@ -1336,12 +1336,14 @@ namespace RTAO
          dynamic_vertices = vb_desc.Usage == D3D11_USAGE_DYNAMIC;
       }
       const bool frame_mesh = draw.vs->skinned || dynamic_vertices;
-      // Shadow map draws: no skinned meshes (once per cascade, the most expensive capture), no MVP per frame meshes
-      // (world space vertices, nothing to check on the CPU), see DrawInfo::shadow_view
-      if (draw.shadow_view && (draw.vs->skinned || (frame_mesh && draw.vs->source == MatrixSource::MvpConstantBuffer)))
+      // Shadow map draws: no skinned meshes (once per cascade, the most expensive capture), see DrawInfo::shadow_view.
+      // MVP per frame meshes (openable windows, doors) are taken: Luma_RTAO.hlsl ResolveInstance rejects a non rigid MVP
+      // derived matrix on the GPU (NaN vertices, inactive in DXR).
+      if (draw.shadow_view && draw.vs->skinned)
       {
          const std::lock_guard lock(mutex);
          stats.shadow_skipped++;
+         stats.shadow_skipped_skinned++;
          return false;
       }
       // Per frame vertices are decoded by our shader (any VertexFormatCode format), the others go to DXR as they are
@@ -1509,6 +1511,7 @@ namespace RTAO
          record.geometry = geometry;
          record.shadow_view = draw.shadow_view;
          record.check_rigid = draw.shadow_view && source == MatrixSource::MvpConstantBuffer;
+         record.mvp = source == MatrixSource::MvpConstantBuffer;
          local.push_back(record);
          if (identity)
             frame_identities.insert(identity);
@@ -1537,6 +1540,47 @@ namespace RTAO
       }
       QueueLocked(context, local);
       return dispatched;
+   }
+
+   uint64_t GeometryCapture::FuzzyKey(uint64_t mesh_key, const float rows[12], uint64_t exact_key)
+   {
+      const float t[3] = { rows[3], rows[7], rows[11] };
+      int32_t cell[3], lo[3], hi[3];
+      for (int a = 0; a < 3; a++)
+      {
+         cell[a] = int32_t(std::floor(t[a] / kFuzzyCell));
+         lo[a] = int32_t(std::floor((t[a] - kFuzzyTranslation) / kFuzzyCell));
+         hi[a] = int32_t(std::floor((t[a] + kFuzzyTranslation) / kFuzzyCell));
+      }
+      auto cell_key = [&](int32_t x, int32_t y, int32_t z) {
+         return HashCombine(HashCombine(HashCombine(mesh_key, uint64_t(uint32_t(x))), uint64_t(uint32_t(y))), uint64_t(uint32_t(z)));
+      };
+      // The cells within the tolerance of the translation (1 to 8)
+      for (int32_t x = lo[0]; x <= hi[0]; x++)
+         for (int32_t y = lo[1]; y <= hi[1]; y++)
+            for (int32_t z = lo[2]; z <= hi[2]; z++)
+            {
+               auto it = fuzzy_cells.find(cell_key(x, y, z));
+               if (it == fuzzy_cells.end())
+                  continue;
+               for (FuzzyEntry& e : it->second)
+               {
+                  bool same = true;
+                  for (int k = 0; k < 12 && same; k++)
+                     same = std::fabs(e.rows[k] - rows[k]) <= ((k % 4) == 3 ? kFuzzyTranslation : kFuzzyRotation * (std::max)(1.f, std::fabs(e.rows[k])));
+                  if (!same)
+                     continue;
+                  fuzzy_matched_other_key += e.key != exact_key;
+                  e.last_frame = fuzzy_frame;
+                  return e.key; // The stored transform stays the first one seen (the matches are within the tolerance)
+               }
+            }
+      FuzzyEntry entry;
+      std::memcpy(entry.rows, rows, sizeof(entry.rows));
+      entry.key = exact_key;
+      entry.last_frame = fuzzy_frame;
+      fuzzy_cells[cell_key(cell[0], cell[1], cell[2])].push_back(entry);
+      return exact_key;
    }
 
    void GeometryCapture::QueueLocked(ID3D11DeviceContext* context, std::vector<Rec>& local)
@@ -1967,7 +2011,19 @@ namespace RTAO
 
       // 1) Matrices captured 3 frames ago (this slot's last use has completed: Interop waited for its allocator)
       tlas.BeginFrame();
-      uint64_t frame_instances = 0, view_model = 0, frame_cutouts = 0, shadow_rejected = 0;
+      const RetentionStats retention = tlas.GetRetentionStats();
+      uint64_t frame_instances = 0, view_model = 0, frame_cutouts = 0, shadow_rejected = 0, mvp_instances = 0;
+      fuzzy_frame++;
+      fuzzy_matched_other_key = 0;
+      if ((fuzzy_frame & 255) == 0) // Forget entries the TLAS has dropped too
+      {
+         for (auto it = fuzzy_cells.begin(); it != fuzzy_cells.end();)
+         {
+            auto& entries = it->second;
+            entries.erase(std::remove_if(entries.begin(), entries.end(), [&](const FuzzyEntry& e) { return fuzzy_frame - e.last_frame > TlasBuilder::kShadowRetainFrames + 16; }), entries.end());
+            it = entries.empty() ? fuzzy_cells.erase(it) : std::next(it);
+         }
+      }
       if (!readback_records[slot].empty())
       {
          uint64_t total = 0;
@@ -2024,9 +2080,14 @@ namespace RTAO
                      const bool translation = (k % 4) == 3;
                      key = HashCombine(key, uint64_t(int64_t(std::llround(rows[k] * (translation ? 100.f : 1000.f)))));
                   }
+                  if (r.mvp)
+                  {
+                     key = FuzzyKey(r.mesh_key, rows, key);
+                     mvp_instances++;
+                  }
                   float transform[3][4];
                   std::memcpy(transform, rows, sizeof(transform));
-                  tlas.AddInstance(key, r.mesh_key, transform, r.mask, cutout_record);
+                  tlas.AddInstance(key, r.mesh_key, transform, r.mask, cutout_record, r.shadow_view ? kInstanceSourceShadow : kInstanceSourceMain);
                   frame_instances++;
                   frame_cutouts += (r.mask & kInstanceMaskCutout) != 0;
                }
@@ -2076,7 +2137,7 @@ namespace RTAO
                remaining -= len;
                src = (src + len) % kRingSlots;
             }
-            readback_records[slot].push_back({ record.mesh_key, record.count, record.mask, record.material, record.geometry, record.shadow_view, record.check_rigid });
+            readback_records[slot].push_back({ record.mesh_key, record.count, record.mask, record.material, record.geometry, record.shadow_view, record.check_rigid, record.mvp });
          }
          flush();
          Transition(list, ring12, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_COMMON);
@@ -2203,6 +2264,13 @@ namespace RTAO
       stats.frame_cutout_instances = frame_cutouts;
       stats.view_model_instances = view_model;
       stats.shadow_rejected += shadow_rejected;
+      stats.mvp_instances = mvp_instances;
+      stats.mvp_rekeyed = fuzzy_matched_other_key;
+      stats.retention = retention;
+      size_t fuzzy_entries = 0;
+      for (const auto& pair : fuzzy_cells)
+         fuzzy_entries += pair.second.size();
+      stats.fuzzy_entries = fuzzy_entries;
       stats.readback_overflow += overflow;
       stats.tlas_instances = tlas.RetainedCount();
       return true;

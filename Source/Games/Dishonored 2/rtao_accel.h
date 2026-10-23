@@ -159,15 +159,37 @@ namespace RTAO
       uint64_t scratch_capacity = 0, scratch_used = 0, scratch_peak = 0;
    };
 
+   // Where a retained instance was seen (TlasBuilder::AddInstance "source", OR'ed over its life)
+   constexpr uint8_t kInstanceSourceMain = 0x01; // The main view
+   constexpr uint8_t kInstanceSourceShadow = 0x02; // A shadow map draw
+
+   // TLAS retention diagnostics, from the last BeginFrame (and the AddInstance calls before it)
+   struct RetentionStats
+   {
+      uint32_t young = 0, promoted = 0; // Retained instances
+      uint32_t main_only = 0, shadow_only = 0, both = 0; // By where they were seen
+      uint32_t evicted_young = 0, evicted_promoted = 0; // Pruned by that BeginFrame
+      uint32_t added_new = 0; // AddInstance calls since the previous BeginFrame that created an instance
+      uint32_t moving = 0; // Shadow map instances found to be a moved copy of another (that one evicted)
+   };
+
    class TlasBuilder
    {
    public:
-      static constexpr uint32_t kRetainFrames = 180;
+      // ~10 s at 60 fps. A static caster the game stops drawing (out of the view and of the shadow cascades) stays this
+      // long; the shadow maps redraw what is near the camera every frame, so this only bounds what was left behind.
+      static constexpr uint32_t kRetainFrames = 600;
       // An instance only earns kRetainFrames once it was seen in kPromoteFrames different frames. Until then it is kept
       // kYoungRetainFrames. A moving object gets a new identity (its transform) every frame, so its copies never get
       // promoted and age out at once: no trail of copies, no pile-up. A static object in view is promoted quickly.
       static constexpr uint32_t kPromoteFrames = 4;
       static constexpr uint32_t kYoungRetainFrames = 2;
+      // Static instances seen in a shadow map: kept this long after they were last drawn (~2 min at 60 fps). The game
+      // caches its world shadow maps (redrawn only when needed), so a caster can go undrawn for long while it still casts.
+      static constexpr uint32_t kShadowRetainFrames = 7200;
+      // Moving object detection for shadow map instances (see BeginFrame)
+      static constexpr uint32_t kMovingWindowFrames = 8;
+      static constexpr float kMovingDistance = 1.f;
 
       ~TlasBuilder() { Clear(nullptr, 0); }
 
@@ -176,7 +198,8 @@ namespace RTAO
       // Thread safe. "object_to_world" is a row major 3x4 (the D3D12 instance transform layout).
       // "mask": kInstanceMaskOpaque, or kInstanceMaskCutout for alpha tested geometry (non opaque in the TLAS).
       // "cutout_record": cutouts only, see kNoCutoutRecord.
-      void AddInstance(uint64_t instance_key, uint64_t blas_key, const float object_to_world[3][4], uint8_t mask = kInstanceMaskOpaque, uint32_t cutout_record = kNoCutoutRecord);
+      void AddInstance(uint64_t instance_key, uint64_t blas_key, const float object_to_world[3][4], uint8_t mask = kInstanceMaskOpaque, uint32_t cutout_record = kNoCutoutRecord, uint8_t source = kInstanceSourceMain);
+      RetentionStats GetRetentionStats();
       void RemoveInstance(uint64_t instance_key);
       size_t RetainedCount();
       // An instance for the current frame only (dropped at the next BeginFrame), with its BLAS given directly (e.g. from
@@ -203,7 +226,13 @@ namespace RTAO
          uint32_t seen_frames;
          uint32_t cutout_record;
          uint8_t mask;
+         uint8_t sources;
+         bool moving;
+         uint32_t first_frame;
       };
+      std::unordered_map<uint64_t, std::vector<uint64_t>> recent_shadow; // BLAS key -> shadow instances created recently
+      RetentionStats retention_stats;
+      uint32_t added_new = 0;
       std::mutex mutex;
       std::unordered_map<uint64_t, Instance> instances;
       std::vector<D3D12_RAYTRACING_INSTANCE_DESC> frame_instances;

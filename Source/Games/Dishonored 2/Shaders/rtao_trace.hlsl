@@ -1,0 +1,91 @@
+// RTAO trace: one cosine distributed hemisphere of inline ray queries (DXR 1.1) per pixel, from the world
+// position reconstructed from depth. Writes raw visibility (1 = unoccluded) for rtao_filter.hlsl.
+// The normal comes from depth derivatives (the game's G-buffer normal decode is not wired up yet).
+#include "rtao_common.hlsli"
+
+RaytracingAccelerationStructure Scene : register(t0);
+RWTexture2D<float> AoRaw : register(u0);
+
+uint Hash(uint x)
+{
+    x ^= x >> 16; x *= 0x7feb352dU;
+    x ^= x >> 15; x *= 0x846ca68bU;
+    x ^= x >> 16;
+    return x;
+}
+
+float2 Random2(uint2 px, uint i)
+{
+    uint h = Hash(px.x + Hash(px.y + Hash(Frame * 64 + i)));
+    uint h2 = Hash(h);
+    return float2(h & 0xFFFFFF, h2 & 0xFFFFFF) / 16777216.0;
+}
+
+float3 CosineHemisphere(float3 n, float2 u)
+{
+    float3 t = abs(n.z) < 0.999 ? normalize(cross(n, float3(0, 0, 1))) : float3(1, 0, 0);
+    float3 b = cross(n, t);
+    float r = sqrt(u.x);
+    float phi = 6.28318530718 * u.y;
+    return normalize(t * (r * cos(phi)) + b * (r * sin(phi)) + n * sqrt(saturate(1.0 - u.x)));
+}
+
+// Picks the shorter one-sided difference on each axis so the normal doesn't smear across depth edges
+float3 DepthNormal(uint2 px, float3 p0)
+{
+    uint2 l = uint2(px.x > 0 ? px.x - 1 : px.x, px.y);
+    uint2 r = uint2(min(px.x + 1, Size.x - 1), px.y);
+    uint2 u = uint2(px.x, px.y > 0 ? px.y - 1 : px.y);
+    uint2 d = uint2(px.x, min(px.y + 1, Size.y - 1));
+    float3 dl = p0 - WorldPos(l), dr = WorldPos(r) - p0;
+    float3 du = p0 - WorldPos(u), dd = WorldPos(d) - p0;
+    float3 dx = dot(dl, dl) < dot(dr, dr) ? dl : dr;
+    float3 dy = dot(du, du) < dot(dd, dd) ? du : dd;
+    float3 n = cross(dy, dx);
+    float len = length(n);
+    n = len > 1e-12 ? n / len : -CamFwd;
+    return dot(n, CamPos - p0) < 0.0 ? -n : n;
+}
+
+[numthreads(8, 8, 1)]
+void main(uint3 id : SV_DispatchThreadID)
+{
+    uint2 px = id.xy;
+    if (any(px >= Size))
+        return;
+    float d = LoadDepth(px);
+    if (IsSky(d))
+    {
+        AoRaw[px] = 1.0;
+        return;
+    }
+    float3 p0 = WorldPosAt(px, d);
+    float3 n = DepthNormal(px, p0);
+    float view_z = max(ViewZ(p0), 0.0);
+    // Offset grows with distance to stay above the depth reconstruction error
+    float3 origin = p0 + n * (Bias + view_z * 0.002);
+
+    float occlusion = 0.0;
+    uint rays = max(RayCount, 1u);
+    for (uint i = 0; i < rays; i++)
+    {
+        RayDesc ray;
+        ray.Origin = origin;
+        ray.Direction = CosineHemisphere(n, Random2(px, i));
+        ray.TMin = 0.0;
+        ray.TMax = Radius;
+        RayQuery<RAY_FLAG_ACCEPT_FIRST_HIT_AND_END_SEARCH | RAY_FLAG_SKIP_PROCEDURAL_PRIMITIVES | RAY_FLAG_FORCE_OPAQUE> q;
+        q.TraceRayInline(Scene, RAY_FLAG_NONE, 0xFF, ray);
+        q.Proceed();
+        if (q.CommittedStatus() == COMMITTED_TRIANGLE_HIT)
+        {
+            // Soft falloff towards the radius so the AO has no hard edge at Radius
+            float t = q.CommittedRayT() / Radius;
+            occlusion += 1.0 - t * t;
+        }
+    }
+    float ao = 1.0 - occlusion / float(rays);
+    if (DebugMode == 1)
+        ao = n.y * 0.5 + 0.5; // Reconstructed normal (Y)
+    AoRaw[px] = ao;
+}

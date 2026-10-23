@@ -251,8 +251,8 @@ with the shadow map term isolated (`pcf`) from the clouds (`cloud`). Replacing i
 control without touching any of the ~3700 forward shader permutations:
 - `Shaders/Dishonored 2/ScreenShadows_0xF324B47B_0x6C8C2397.ps_5_0.hlsl`: an HLSL port of both (the dither variant
   under `SV_POSITION`), which reads the traced visibility at t3 (a free slot) and combines it according to the mode
-  in LumaGameSettings: Off = the game's `cloud * pcf` (bit for bit the same math), RT = `cloud * rt`, RT x game =
-  `cloud * pcf * rt`. Without a bound visibility texture (RT not ready this frame, other AO modes) it is the game's.
+  in LumaGameSettings: Off = the game's `cloud * pcf`, RT = `cloud * rt`, RT x game = `cloud * pcf * rt`. Without a
+  bound visibility texture (RT not ready this frame, other AO modes) it is the game's.
 - the game's bilateral blur still runs over the result (a little extra softening, also over the traced penumbra).
 - the trace runs in the same D3D12 submission as RTAO, right after the AO, from the same depth and TLAS, into a
   second texture shared with D3D11 (owned by the sun pass, copied inside the recorder: Interop is unchanged).
@@ -268,6 +268,33 @@ side above the horizon (world z up; a light below the horizon lights nothing), a
 reported next to it. Both come from the screen shadows draw's PerInstanceCB, copied (D3D11 CopySubresourceRegion,
 honouring `PSSetConstantBuffers1` offsets) into a staging ring and read back a few frames later without stalling:
 the trace uses the direction from a few frames ago, which is fine for a light that moves slowly if at all.
+
+### Implementation (rtsun_pass.{h,cpp}, Shaders/rtsun_*.hlsl, main.cpp)
+
+- Trace (`rtsun_trace.hlsl`): per pixel of the AO target, from the depth reconstructed world position, offset along
+  the depth normal like the AO (`bias + 0.002 * view depth`), `RayCount` RayQuery rays toward the light, jittered
+  uniformly over the light's disc (F4 RtShadows' ConeSampleDisk, `tan(angular diameter / 2)`), TMax 2000. A
+  geometric normal facing away from the light (N.L < -0.05) is shadowed without rays. Cutouts as in the AO trace
+  (stochastic with the RTAO cutout opacity). Denoiser (`rtsun_filter.hlsl`): the RTAO one, own history.
+- The pass owns its D3D12 output (R16_UNORM UAV) and a texture shared with D3D11 (same rules as Interop's), copied
+  at the end of its recording: Interop::Run is unchanged, the sun just records after the AO in the same recorder.
+  Its targets are re-created on the D3D11 side at the SSAO draw (AO size); old D3D12 objects are retired by the next
+  recording.
+- D3D11: at the screen shadows draw (`DrawRTSunScreenShadows`), the PerInstanceCB is copied for the light
+  direction (`LightCapture`), and if a trace was queued by this or the previous frame's SSAO draw, the visibility is
+  bound at PS t3 around the original draw (state restored, Luma's settings cbuffer set by hand since the draw is
+  replaced).
+- Verified offline (Tests/rtsun_test.inl, RTX 4090): the HLSL port is bit exact against the game's two shaders
+  (Luma's dump) in mode Off and RT x game on random inputs, RT = clouds x rt; a hard light matches the analytic CPU
+  shadow on all 32719 receiver pixels away from edges; the traced penumbra matches the analytic disc integral
+  (0.53 deg: 59 px vs 68, 6 deg: 716 px vs 729, denoised mean abs error < 0.004); 0.10 ms at 320x180 with 4 rays.
+  The light direction comes back from a DYNAMIC cbuffer bound with an offset (PSSetConstantBuffers1).
+
+To check in game: the frame order (RT sun stats: "draws using it" grows, "using the game's" stays ~0); that the
+captured direction matches the shadows (log line "RT sun: light direction ..."; with "RT x game", traced and shadow
+map shadows must overlap); the y channel claim (the forward pass must darken where the visibility is 0: "View AO
+only" = RT sun visibility vs the image); the AO target size (if the SSAO target is half resolution the sun mask is
+too, and the game's blur upsamples it).
 
 ### Local lights (not implemented)
 

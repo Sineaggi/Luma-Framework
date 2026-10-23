@@ -19,6 +19,7 @@
 #include "rtao_accel.h"
 #include "rtao_capture.h"
 #include "rtao_pass.h"
+#include "rtsun_pass.h"
 
 #include <shared_mutex>
 
@@ -193,6 +194,31 @@ namespace
    std::atomic<uint64_t> g_rtao_ps_reflected = 0, g_rtao_ps_discard = 0, g_rtao_ps_alpha_tested = 0;
    std::atomic<uint64_t> g_rtao_draws_alpha_tested = 0; // Main view draws with an alpha tested pixel shader
 
+   // RT sun shadows (RTAO_NOTES.md "RT sun shadows"): the directional light's visibility, traced in the RTAO D3D12
+   // submission (at the SSAO draw, from the RTAO TLAS), used by the game's screen shadows pass (replaced shaders
+   // ScreenShadows_*.hlsl) in place of, or on top of, its cascaded shadow maps. Needs AO mode RTAO.
+   ShaderHashesList shader_hashes_ScreenShadows;
+   enum RTSunMode : int
+   {
+      RTSUN_MODE_OFF = 0, // The game's shadow maps
+      RTSUN_MODE_RT = 1, // Ray traced (times the cloud shadow)
+      RTSUN_MODE_RT_X_GAME = 2, // Ray traced x the game's shadow maps
+      RTSUN_MODE_COUNT
+   };
+   int g_rtsun_mode = RTSUN_MODE_OFF; // Config "RTSunMode" (mirrored in LumaGameSettings.RTSunMode for the shaders)
+   float g_rtsun_angle = 0.75f; // The light's angular diameter, degrees (config "RTSunAngle"); the real sun is 0.53
+   int g_rtsun_rays = 1; // Per pixel per frame (config "RTSunRays")
+   int g_rtsun_output = int(RTSun::Output::Denoised); // Config "RTSunOutput"
+   std::mutex g_rtsun_status_mutex;
+   std::string g_rtsun_status;
+
+   void SetRTSunStatus(std::string status, bool error)
+   {
+      reshade::log::message(error ? reshade::log::level::error : reshade::log::level::info, ("RT sun: " + status).c_str());
+      const std::lock_guard lock(g_rtsun_status_mutex);
+      g_rtsun_status = std::move(status);
+   }
+
    int GetEffectiveAOMode()
    {
       int mode = g_ao_mode.load();
@@ -290,6 +316,8 @@ struct GameDeviceDataDishonored2 final : public GameDeviceData
       int output = 0;
       std::shared_ptr<RTAO::GeometryCapture::PendingRecords> capture_records; // Captured before the split: in the prefix
       uint32_t frame = 0;
+      bool sun = false; // Also trace the RT sun shadows
+      RTSun::SunSettings sun_settings = {};
    };
    std::mutex rtao_pending_mutex;
    std::vector<RTAOPendingSplit> rtao_pending;
@@ -319,6 +347,17 @@ struct GameDeviceDataDishonored2 final : public GameDeviceData
    std::atomic<uint64_t> rtao_blas_count = 0, rtao_blas_bytes = 0;
    std::atomic<uint32_t> rtao_tlas_instances = 0, rtao_gpu_us = 0;
    std::atomic<uint32_t> rtao_tlas_cutouts = 0;
+
+   // RT sun shadows (after the RTAO objects, so they are destroyed first)
+   RTSun::SunPass rtsun_pass;
+   RTSun::LightCapture rtsun_light;
+   bool rtsun_failed = false; // Init failed (the pass stays off)
+   int rtsun_last_output = -1;
+   // rtao_frame of the last SSAO draw that queued a sun trace (the screen shadows draw only uses a fresh one)
+   std::atomic<uint32_t> rtsun_scheduled_frame = UINT32_MAX / 2;
+   std::atomic<uint32_t> rtsun_gpu_us = 0, rtsun_record_failures = 0, rtsun_bound_draws = 0, rtsun_stale_draws = 0;
+   std::atomic<bool> rtsun_logged_error = false;
+   float rtsun_logged_dir[3] = {};
 };
 
 //TODOFT: Building shaders menu (apply gamma?)
@@ -478,6 +517,9 @@ public:
          }
       }
 
+      RTSun::SunSettings sun_settings;
+      const bool sun = ray_traced && PrepareRTSun(native_device, game_device_data, settings, ao_desc.Width, ao_desc.Height, sun_settings);
+
       // 1) Copy the depth into the texture shared with D3D12
       {
          DrawStateStack<DrawStateStackType::FullGraphics> draw_state_stack;
@@ -500,7 +542,7 @@ public:
       // 2) D3D11 -> D3D12 -> D3D11
       if (immediate)
       {
-         const bool ok = ray_traced ? rtao.Run(native_device_context, MakeRTAORecorder(game_device_data, settings), error) : rtao.Run(native_device_context, constants, error);
+         const bool ok = ray_traced ? rtao.Run(native_device_context, MakeRTAORecorder(game_device_data, settings, sun ? &sun_settings : nullptr), error) : rtao.Run(native_device_context, constants, error);
          if (!ok)
          {
             game_device_data.rtao_stat_failed++;
@@ -512,6 +554,8 @@ public:
          }
          game_device_data.rtao_stat_inline_ok++;
          game_device_data.rtao_capture.MarkAOPassDone();
+         if (sun)
+            game_device_data.rtsun_scheduled_frame = game_device_data.rtao_frame;
       }
       else
       {
@@ -521,6 +565,8 @@ public:
          pending.settings = settings;
          pending.output = output;
          pending.frame = game_device_data.rtao_frame;
+         pending.sun = sun;
+         pending.sun_settings = sun_settings;
          // Geometry recorded so far on this context lands in the prefix (executed before the D3D12 pass)
          if (ray_traced)
             pending.capture_records = game_device_data.rtao_capture.TakeContextRecords(native_device_context);
@@ -531,6 +577,8 @@ public:
          const std::lock_guard lock(game_device_data.rtao_pending_mutex);
          game_device_data.rtao_pending.push_back(std::move(pending));
          game_device_data.rtao_stat_splits++;
+         if (sun)
+            game_device_data.rtsun_scheduled_frame = game_device_data.rtao_frame;
       }
 
       // 3) Write the shared AO into the game's AO render target, reusing the game's own fullscreen draw state
@@ -589,6 +637,14 @@ public:
             return;
          srv = rtao_srv;
          rtao_srv->Release();
+      }
+      else if (g_ao_view_mode == 3)
+      {
+         ID3D11ShaderResourceView* sun_srv = game_device_data.rtsun_pass.GetSRV();
+         if (!sun_srv)
+            return;
+         srv = sun_srv;
+         sun_srv->Release();
       }
       else
       {
@@ -715,9 +771,11 @@ public:
       return settings;
    }
 
-   static RTAO::Recorder MakeRTAORecorder(GameDeviceDataDishonored2& game_device_data, const RTAO::PassSettings& settings)
+   static RTAO::Recorder MakeRTAORecorder(GameDeviceDataDishonored2& game_device_data, const RTAO::PassSettings& settings, const RTSun::SunSettings* sun = nullptr)
    {
-      return [&game_device_data, settings](ID3D12GraphicsCommandList4* list, const RTAO::RecordInfo& info, std::string& error) {
+      const bool has_sun = sun != nullptr;
+      const RTSun::SunSettings sun_settings = sun ? *sun : RTSun::SunSettings{};
+      return [&game_device_data, settings, has_sun, sun_settings](ID3D12GraphicsCommandList4* list, const RTAO::RecordInfo& info, std::string& error) {
          auto& g = game_device_data;
          g.rtao_retirer.Collect(info.completed_fence_value);
          g.rtao_timer.Collect(info.frame_slot);
@@ -737,8 +795,121 @@ public:
          g.rtao_tlas_instances = instances;
          g.rtao_tlas_cutouts = g.rtao_tlas.LastCutoutCount();
          g.rtao_gpu_us = uint32_t(g.rtao_timer.LastMs() * 1000.0);
+         if (has_sun)
+            RecordRTSun(g, list, info, top, sun_settings); // Its own timer; a failure never fails the AO
          return true;
       };
+   }
+
+   // RT sun shadows, at the SSAO draw (render thread of that draw): starts the pass, sizes its output like the AO, and
+   // fills the settings from the AO camera and the captured light direction. False: no sun trace this frame.
+   static bool PrepareRTSun(ID3D11Device* native_device, GameDeviceDataDishonored2& game_device_data, const RTAO::PassSettings& ao_settings, uint32_t width, uint32_t height, RTSun::SunSettings& out)
+   {
+      if (g_rtsun_mode == RTSUN_MODE_OFF || game_device_data.rtsun_failed)
+         return false;
+      std::string error;
+      auto& rtao = game_device_data.rtao;
+      if (!game_device_data.rtsun_pass.IsInitialized())
+      {
+         if (!game_device_data.rtsun_pass.Init(rtao.GetDevice(), rtao.GetTimestampFrequency(), error))
+         {
+            game_device_data.rtsun_failed = true;
+            SetRTSunStatus("failed to start, the game's shadows stay: " + error, true);
+            return false;
+         }
+         SetRTSunStatus("ready, waiting for the light direction (screen shadows pass)", false);
+      }
+      if (!game_device_data.rtsun_pass.EnsureTargets(native_device, width, height, error))
+      {
+         if (!game_device_data.rtsun_logged_error.exchange(true))
+            SetRTSunStatus("targets failed: " + error, true);
+         return false;
+      }
+      if (!game_device_data.rtsun_light.GetDirection(out.light_dir))
+         return false;
+      std::memcpy(out.view_proj, ao_settings.view_proj, sizeof(out.view_proj));
+      std::memcpy(out.inv_view_proj, ao_settings.inv_view_proj, sizeof(out.inv_view_proj));
+      std::memcpy(out.cam_pos, ao_settings.cam_pos, sizeof(out.cam_pos));
+      std::memcpy(out.cam_fwd, ao_settings.cam_fwd, sizeof(out.cam_fwd));
+      out.reversed_z = ao_settings.reversed_z;
+      out.bias = ao_settings.bias;
+      out.cutout_opacity = ao_settings.cutout_opacity;
+      out.angular_diameter_deg = std::clamp(g_rtsun_angle, 0.f, 10.f);
+      out.ray_count = uint32_t(std::clamp(g_rtsun_rays, 1, 16));
+      const int output = std::clamp(g_rtsun_output, 0, int(RTSun::Output::Count) - 1);
+      out.output = RTSun::Output(output);
+      out.reset_history = output != game_device_data.rtsun_last_output;
+      game_device_data.rtsun_last_output = output;
+      return true;
+   }
+
+   // Present: reads back the light direction copies, logs it when it changes (more than ~2 degrees)
+   static void PollRTSunLight(ID3D11Device* native_device, GameDeviceDataDishonored2& game_device_data)
+   {
+      com_ptr<ID3D11DeviceContext> immediate;
+      native_device->GetImmediateContext(&immediate);
+      game_device_data.rtsun_light.Poll(immediate.get(), game_device_data.rtao_frame);
+      float dir[3], sun[3];
+      if (!game_device_data.rtsun_light.GetDirection(dir, nullptr, sun))
+         return;
+      float* logged = game_device_data.rtsun_logged_dir;
+      if (dir[0] * logged[0] + dir[1] * logged[1] + dir[2] * logged[2] > 0.9994f)
+         return;
+      std::memcpy(logged, dir, sizeof(game_device_data.rtsun_logged_dir));
+      char buffer[256];
+      snprintf(buffer, sizeof(buffer), "light direction (toward the light, from the shadow map axis) %.3f %.3f %.3f, atmosphere sun %.3f %.3f %.3f (angle between %.1f deg)",
+         dir[0], dir[1], dir[2], sun[0], sun[1], sun[2], std::acos(std::clamp(dir[0] * sun[0] + dir[1] * sun[1] + dir[2] * sun[2], -1.f, 1.f)) * 57.29578f);
+      reshade::log::message(reshade::log::level::info, (std::string("RT sun: ") + buffer).c_str());
+   }
+
+   // Inside the RTAO recorder, after the AO (same TLAS)
+   static void RecordRTSun(GameDeviceDataDishonored2& g, ID3D12GraphicsCommandList4* list, const RTAO::RecordInfo& info, D3D12_GPU_VIRTUAL_ADDRESS top, const RTSun::SunSettings& sun_settings)
+   {
+      std::string error;
+      if (g.rtsun_pass.Record(list, info, top, sun_settings, g.rtao_retirer, error))
+      {
+         g.rtsun_gpu_us = uint32_t(g.rtsun_pass.LastGpuMs() * 1000.0);
+         if (g.rtsun_pass.TraceCount() == 1)
+            SetRTSunStatus("tracing", false);
+         return;
+      }
+      g.rtsun_record_failures++;
+      if (!g.rtsun_logged_error.exchange(true))
+         SetRTSunStatus("trace failed (the visibility is not updated): " + error, true);
+   }
+
+   // The game's screen shadows draw (replaced pixel shaders ScreenShadows_*.hlsl): captures the light direction, and
+   // binds this frame's traced visibility at t3 for the draw. Returns true if it drew (state restored after).
+   static bool DrawRTSunScreenShadows(ID3D11Device* native_device, ID3D11DeviceContext* native_device_context, CommandListData& cmd_list_data, DeviceData& device_data, GameDeviceDataDishonored2& game_device_data, bool& updated_cbuffers, std::function<void()>* original_draw_dispatch_func)
+   {
+      if (g_rtsun_mode == RTSUN_MODE_OFF || GetEffectiveAOMode() != AO_MODE_RTAO)
+         return false;
+      std::string error;
+      if (!original_draw_dispatch_func || !*original_draw_dispatch_func || !game_device_data.rtsun_light.Init(native_device, error))
+         return false;
+      const uint32_t frame = game_device_data.rtao_frame;
+      game_device_data.rtsun_light.OnScreenShadowsDraw(native_device_context, frame);
+      // Traced by this frame's SSAO draw (or the previous frame's, if the recording threads raced): otherwise the game's
+      if (frame - game_device_data.rtsun_scheduled_frame.load() > 1 || game_device_data.rtsun_pass.TraceCount() == 0)
+      {
+         game_device_data.rtsun_stale_draws++;
+         return false;
+      }
+      ID3D11ShaderResourceView* visibility = game_device_data.rtsun_pass.GetSRV();
+      if (!visibility)
+         return false;
+      com_ptr<ID3D11ShaderResourceView> previous;
+      native_device_context->PSGetShaderResources(3, 1, &previous);
+      native_device_context->PSSetShaderResources(3, 1, &visibility);
+      // The core doesn't set Luma's cbuffers for draws the game code replaces (RTSunMode is in LumaSettings)
+      SetLumaConstantBuffers(native_device_context, cmd_list_data, device_data, reshade::api::shader_stage::pixel, LumaConstantBufferType::LumaSettings);
+      updated_cbuffers = true;
+      (*original_draw_dispatch_func)();
+      ID3D11ShaderResourceView* const restore = previous.get();
+      native_device_context->PSSetShaderResources(3, 1, &restore);
+      visibility->Release();
+      game_device_data.rtsun_bound_draws++;
+      return true;
    }
 
    // Deferred SSAO only: map the game's FinishCommandList() to our pending split, and run the D3D12 pass right before
@@ -786,7 +957,7 @@ public:
             context->ExecuteCommandList(pending.prefix.get(), TRUE);
             game_device_data.rtao_capture.Commit(pending.capture_records); // The prefix's draws have now executed
             std::string error;
-            const bool ok = RTAOOutputIsRayTraced(pending.output) ? game_device_data.rtao.Run(context.get(), MakeRTAORecorder(game_device_data, pending.settings), error) : game_device_data.rtao.Run(context.get(), pending.constants, error);
+            const bool ok = RTAOOutputIsRayTraced(pending.output) ? game_device_data.rtao.Run(context.get(), MakeRTAORecorder(game_device_data, pending.settings, pending.sun ? &pending.sun_settings : nullptr), error) : game_device_data.rtao.Run(context.get(), pending.constants, error);
             (ok ? game_device_data.rtao_stat_deferred_ok : game_device_data.rtao_stat_failed)++;
             if (!ok && !game_device_data.rtao_logged_run_error.exchange(true))
             {
@@ -1064,6 +1235,8 @@ public:
       game_device_data.rtao_frame++;
       if (game_device_data.rtao_capture.IsInitialized())
          game_device_data.rtao_capture.OnPresent();
+      if (g_rtsun_mode != RTSUN_MODE_OFF)
+         PollRTSunLight(native_device, game_device_data);
       if (g_ao_view_mode != 0)
          DrawAOView(native_device, device_data, game_device_data);
 
@@ -1222,6 +1395,13 @@ public:
             const std::lock_guard lock(game_device_data.ao_view_mutex);
             game_device_data.ao_view_resource = resource; // The last one of the frame is the final AO
          }
+      }
+
+      if (original_shader_hashes.Contains(shader_hashes_ScreenShadows))
+      {
+         if (DrawRTSunScreenShadows(native_device, native_device_context, cmd_list_data, device_data, game_device_data, updated_cbuffers, original_draw_dispatch_func))
+            return DrawOrDispatchOverrideType::Replaced;
+         return DrawOrDispatchOverrideType::None;
       }
 
       if (original_shader_hashes.Contains(shader_hashes_SSAO))
@@ -2265,6 +2445,15 @@ public:
       reshade::get_config_value(runtime, NAME, "RTAOCutouts", g_rtao_cutouts);
       reshade::get_config_value(runtime, NAME, "RTAOCutoutOpacity", g_rtao_cutout_opacity);
       g_rtao_cutout_opacity = std::clamp(g_rtao_cutout_opacity, 0.f, 1.f);
+      reshade::get_config_value(runtime, NAME, "RTSunMode", g_rtsun_mode);
+      reshade::get_config_value(runtime, NAME, "RTSunAngle", g_rtsun_angle);
+      reshade::get_config_value(runtime, NAME, "RTSunRays", g_rtsun_rays);
+      reshade::get_config_value(runtime, NAME, "RTSunOutput", g_rtsun_output);
+      g_rtsun_mode = std::clamp(g_rtsun_mode, 0, int(RTSUN_MODE_COUNT) - 1);
+      g_rtsun_angle = std::clamp(g_rtsun_angle, 0.f, 10.f);
+      g_rtsun_rays = std::clamp(g_rtsun_rays, 1, 16);
+      g_rtsun_output = std::clamp(g_rtsun_output, 0, int(RTSun::Output::Count) - 1);
+      cb_luma_global_settings.GameSettings.RTSunMode = uint32_t(g_rtsun_mode);
 
       auto& game_settings = cb_luma_global_settings.GameSettings;
       reshade::get_config_value(runtime, NAME, "BloomStrength", game_settings.BloomStrength);
@@ -2341,10 +2530,10 @@ public:
       {
          ImGui::SetTooltip("Off: no AO (the game's own SSAO/DWAO draws nothing on PC).\nHBAO+: the game's NVIDIA HBAO+ (sets the game's r_hbao; the in game AO menu stays in sync).\nXeGTAO: Intel's ground truth AO, replacing the game's SSAO pass.\nRTAO: ray traced AO on a side D3D12 device (needs DXR 1.1, falls back to XeGTAO if unavailable).");
       }
-      static const char* ao_view_names[] = { "Off", "Final AO (after the game's blur)", "RTAO output (before the game's blur)" };
+      static const char* ao_view_names[] = { "Off", "Final AO (after the game's blur)", "RTAO output (before the game's blur)", "RT sun visibility (before the game's blur)" };
       ImGui::Combo("View AO only (debug)", &g_ao_view_mode, ao_view_names, IM_ARRAYSIZE(ao_view_names));
       if (ImGui::IsItemHovered())
-         ImGui::SetTooltip("Shows the AO buffer fullscreen in grey (white = no occlusion) instead of the game.\n\"Final AO\" works with every AO mode (the game's SSAO, XeGTAO, RTAO), so you can compare them directly.\nWith RTAO, the RTAO Output choice (e.g. BLAS coverage, no denoiser) is what shows here.");
+         ImGui::SetTooltip("Shows the AO buffer fullscreen in grey (white = no occlusion) instead of the game.\n\"Final AO\" works with every AO mode (the game's SSAO, XeGTAO, RTAO), so you can compare them directly.\nWith RTAO, the RTAO Output choice (e.g. BLAS coverage, no denoiser) is what shows here.\n\"RT sun visibility\" shows the ray traced sun/moon shadows (white = lit), see RT Sun Shadows below.");
       if (ao_mode == AO_MODE_RTAO)
       {
          std::string status;
@@ -2433,6 +2622,80 @@ public:
                (unsigned long long)stats.frame_blas_builds, (unsigned long long)stats.frame_blas_refits, (unsigned long long)stats.frame_blas_failed, (unsigned long long)stats.frame_blas_count, stats.frame_blas_bytes / 1048576.0);
             ImGui::TreePop();
          }
+      }
+
+      DrawRTSunSettings(device_data);
+   }
+
+   void DrawRTSunSettings(DeviceData& device_data)
+   {
+      reshade::api::effect_runtime* runtime = nullptr;
+      ImGui::SeparatorText("Sun Shadows");
+      static const char* rtsun_mode_names[RTSUN_MODE_COUNT] = { "Off (game shadow maps)", "Ray traced (experimental)", "Ray traced x game shadow maps" };
+      if (ImGui::Combo("RT Sun Shadows", &g_rtsun_mode, rtsun_mode_names, RTSUN_MODE_COUNT))
+      {
+         g_rtsun_mode = std::clamp(g_rtsun_mode, 0, int(RTSUN_MODE_COUNT) - 1);
+         cb_luma_global_settings.GameSettings.RTSunMode = uint32_t(g_rtsun_mode);
+         device_data.cb_luma_global_settings_dirty = true;
+         reshade::set_config_value(runtime, NAME, "RTSunMode", g_rtsun_mode);
+      }
+      if (ImGui::IsItemHovered())
+         ImGui::SetTooltip("Ray traced sun/moon shadows for the world (the game's screen shadows pass), from RTAO's ray tracing scene.\n"
+                           "Ray traced: replaces the shadow maps. Ray traced x game: both (an object missing from the ray tracing scene still casts its shadow map shadow).\n"
+                           "Characters' skin and hair, and transparent surfaces, keep the game's shadow maps (they don't read the screen shadows).\nNeeds Ambient Occlusion = RTAO.");
+      if (g_rtsun_mode == RTSUN_MODE_OFF)
+         return;
+      if (GetEffectiveAOMode() != AO_MODE_RTAO)
+      {
+         ImGui::TextWrapped("Needs Ambient Occlusion = RTAO (the sun shares its ray tracing scene and D3D12 pass). Using the game's shadows.");
+         return;
+      }
+      if (ImGui::SliderFloat("RT Sun Angular Size", &g_rtsun_angle, 0.f, 5.f, "%.2f deg"))
+         g_rtsun_angle = std::clamp(g_rtsun_angle, 0.f, 10.f);
+      if (ImGui::IsItemDeactivatedAfterEdit())
+         reshade::set_config_value(runtime, NAME, "RTSunAngle", g_rtsun_angle);
+      if (ImGui::IsItemHovered())
+         ImGui::SetTooltip("The light's apparent diameter: the softness of the penumbra (wider with the distance to the caster).\n0.53 is the real sun, 0 is a hard shadow. Wider costs denoiser noise, not trace time.");
+      DrawResetButton(g_rtsun_angle, 0.75f, "RTSunAngle");
+      if (ImGui::SliderInt("RT Sun Rays", &g_rtsun_rays, 1, 8))
+         g_rtsun_rays = std::clamp(g_rtsun_rays, 1, 16);
+      if (ImGui::IsItemDeactivatedAfterEdit())
+         reshade::set_config_value(runtime, NAME, "RTSunRays", g_rtsun_rays);
+      if (ImGui::IsItemHovered())
+         ImGui::SetTooltip("Rays per pixel per frame (in the penumbra the denoiser averages them over frames).");
+      static const char* rtsun_output_names[int(RTSun::Output::Count)] = { "Denoised", "Raw (no denoiser)", "Geometric N.L (no rays, debug)", "Denoiser history (debug)" };
+      if (ImGui::Combo("RT Sun Output", &g_rtsun_output, rtsun_output_names, int(RTSun::Output::Count)))
+      {
+         g_rtsun_output = std::clamp(g_rtsun_output, 0, int(RTSun::Output::Count) - 1);
+         reshade::set_config_value(runtime, NAME, "RTSunOutput", g_rtsun_output);
+      }
+      if (ImGui::IsItemHovered())
+         ImGui::SetTooltip("What the trace writes. Check it with \"View AO only\" = RT sun visibility.");
+
+      auto& game_device_data = GetGameDeviceData(device_data);
+      std::string status;
+      {
+         const std::lock_guard lock(g_rtsun_status_mutex);
+         status = g_rtsun_status;
+      }
+      ImGui::TextWrapped("RT sun status: %s", status.empty() ? "waiting for the RTAO pass" : status.c_str());
+      if (ImGui::TreeNode("RT sun stats"))
+      {
+         float dir[3] = {}, sun[3] = {};
+         uint32_t dir_frame = 0;
+         if (game_device_data.rtsun_light.GetDirection(dir, &dir_frame, sun))
+         {
+            ImGui::Text("Light direction (toward the light) %.3f %.3f %.3f, %u frames old", dir[0], dir[1], dir[2], game_device_data.rtao_frame - dir_frame);
+            ImGui::Text("Atmosphere sun %.3f %.3f %.3f", sun[0], sun[1], sun[2]);
+         }
+         else
+         {
+            ImGui::Text("Light direction: not captured yet (no screen shadows draw seen)");
+         }
+         ImGui::Text("GPU time (trace + denoise + copy): %.2f ms", game_device_data.rtsun_gpu_us.load() / 1000.0);
+         ImGui::Text("Traces %u, failed %u; screen shadows draws using it %u, using the game's (no fresh trace) %u", game_device_data.rtsun_pass.TraceCount(),
+            game_device_data.rtsun_record_failures.load(), game_device_data.rtsun_bound_draws.load(), game_device_data.rtsun_stale_draws.load());
+         ImGui::TreePop();
       }
    }
 
@@ -2565,6 +2828,8 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD ul_reason_for_call, LPVOID lpReserv
       shader_hashes_UnprojectDepth.compute_shaders.emplace(std::stoul("74E15FB8", nullptr, 16)); // DH DOTO
       shader_hashes_SSAO.pixel_shaders.emplace(0x94445D2D); // DH2 + DH DOTO
       shader_hashes_AODenoise.pixel_shaders.emplace(0x4CD2BE39); // DH2
+      shader_hashes_ScreenShadows.pixel_shaders.emplace(0xF324B47B); // DH2 "screenShadowsNoJitter"
+      shader_hashes_ScreenShadows.pixel_shaders.emplace(0x6C8C2397); // DH2 "screenShadows" (dithered)
       // All UI pixel shaders (these are all Shader Model 4.0, as opposed to the rest of the rendering using SM5.0)
       shader_hashes_UI.pixel_shaders = {
          std::stoul("6FE8114D", nullptr, 16),

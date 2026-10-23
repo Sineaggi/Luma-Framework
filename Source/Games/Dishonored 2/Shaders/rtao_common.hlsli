@@ -15,7 +15,12 @@ cbuffer PassConstants : register(b0)
     uint2 Size;         uint2 DepthSize;
     uint DepthPacked;   uint ReversedZ;  uint FilterMode; float AlphaMin;
     float ClampK;       float Bias;      uint DebugMode;  float Strength;
+    float CutoutOpacity; uint3 CutoutPad;
 };
+
+// Must match rtao_accel.h
+static const uint kInstanceMaskCutout = 0x02;
+static const uint kInstanceIdCutoutBit = 1u << 23;
 
 Texture2D<float4> DepthTex : register(t1);
 

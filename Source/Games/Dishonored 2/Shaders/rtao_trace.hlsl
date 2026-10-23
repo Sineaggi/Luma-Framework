@@ -92,6 +92,12 @@ void main(uint3 id : SV_DispatchThreadID)
     // Offset grows with distance to stay above the depth reconstruction error
     float3 origin = p0 + n * (Bias + view_z * 0.002);
 
+    // Cutouts (alpha tested instances, forced non opaque in the TLAS; every other instance is forced opaque): at
+    // opacity 1 the ray forces everything opaque (no candidates, the plain opaque trace), at 0 its mask leaves them out.
+    // In between, each (ray, cutout triangle) crossing stops the ray with that probability: a stochastic stand-in for
+    // the texture's coverage, which the temporal denoiser averages like the rest of the ray noise.
+    const uint ray_flags = CutoutOpacity >= 1.0 ? RAY_FLAG_FORCE_OPAQUE : RAY_FLAG_NONE;
+    const uint ray_mask = CutoutOpacity <= 0.0 ? (0xFF & ~kInstanceMaskCutout) : 0xFF;
     float occlusion = 0.0;
     uint rays = max(RayCount, 1u);
     for (uint i = 0; i < rays; i++)
@@ -101,9 +107,19 @@ void main(uint3 id : SV_DispatchThreadID)
         ray.Direction = CosineHemisphere(n, Random2(px, i));
         ray.TMin = 0.0;
         ray.TMax = Radius;
-        RayQuery<RAY_FLAG_ACCEPT_FIRST_HIT_AND_END_SEARCH | RAY_FLAG_SKIP_PROCEDURAL_PRIMITIVES | RAY_FLAG_FORCE_OPAQUE> q;
-        q.TraceRayInline(Scene, RAY_FLAG_NONE, 0xFF, ray);
-        q.Proceed();
+        RayQuery<RAY_FLAG_ACCEPT_FIRST_HIT_AND_END_SEARCH | RAY_FLAG_SKIP_PROCEDURAL_PRIMITIVES> q;
+        q.TraceRayInline(Scene, ray_flags, ray_mask, ray);
+        const uint seed = Hash(px.x * 0x9E3779B9u + Hash(px.y + Hash(Frame * 64 + i + 0x5bd1e995u)));
+        while (q.Proceed())
+        {
+            // Only cutout instances produce candidates
+            if (q.CandidateType() == CANDIDATE_NON_OPAQUE_TRIANGLE && (q.CandidateInstanceID() & kInstanceIdCutoutBit) != 0)
+            {
+                uint h = Hash(seed ^ Hash(q.CandidateInstanceIndex() * 0x8DA6B343u + q.CandidatePrimitiveIndex()));
+                if (float(h & 0xFFFFFF) / 16777216.0 < CutoutOpacity)
+                    q.CommitNonOpaqueTriangleHit(); // Ends the search (ACCEPT_FIRST_HIT_AND_END_SEARCH)
+            }
+        }
         if (q.CommittedStatus() == COMMITTED_TRIANGLE_HIT)
         {
             // Soft falloff towards the radius so the AO has no hard edge at Radius

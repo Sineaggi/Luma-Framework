@@ -64,9 +64,23 @@ namespace RTAO
       uint32_t mvp_cb[4] = { kNoOffset, kNoOffset, kNoOffset, kNoOffset }; // cb_mvpmatrixx/y/z/w, bytes (clip.x = dot(pos, x) ...)
       uint32_t per_view_cb_slot = kNoOffset; // PerViewCB
       uint32_t view_proj_cb = kNoOffset; // cb_viewprojectionmatrix in PerViewCB, bytes
+      // Vertex animated vegetation (ro_windbuffer, ro_splineinfos or cb_vegetanim_*, see RTAO_NOTES.md "Wind"). Its matrix
+      // comes from one of the families above like any mesh; the wind displacement is ignored (captured in rest pose).
+      bool wind = false;
    };
    // Uses D3DReflect (D3DCompiler_47.dll, loaded on first use)
    bool ReflectVertexShader(const void* code, size_t code_size, VertexShaderInfo& out);
+
+   // Alpha tested ("cutout") pixel shaders: leaves, grates, fences. See RTAO_NOTES.md "Alpha tested geometry".
+   struct PixelShaderInfo
+   {
+      bool discard = false; // The bytecode has a discard instruction
+      bool alpha_tested = false; // A discard depends on a read of a diffuse/opacity/alpha texture (not dithering, not dissolve)
+   };
+   // True if the DXBC (SHEX/SHDR chunk) contains a discard instruction. No D3DReflect needed.
+   bool DxbcHasDiscard(const void* code, size_t code_size);
+   // Uses D3DReflect (texture names) and a data flow pass over the bytecode, only for shaders that discard
+   bool ReflectPixelShader(const void* code, size_t code_size, PixelShaderInfo& out);
 
    struct InputLayoutInfo
    {
@@ -121,6 +135,7 @@ namespace RTAO
       ID3D11ShaderResourceView* instance_index = nullptr;
       ID3D11Buffer* per_view_cb = nullptr; // The bound PerViewCB (MvpConstantBuffer only)
       uint32_t per_view_cb_first_constant = 0, per_view_cb_num_constants = 0;
+      bool cutout = false; // Alpha tested (the bound pixel shader): its instances go into the TLAS as cutouts (kInstanceMaskCutout)
    };
 
    struct CaptureStats
@@ -132,6 +147,8 @@ namespace RTAO
       uint64_t frame_instances = 0; // Read back last frame
       uint64_t view_model_instances = 0, late_records = 0, readback_overflow = 0, after_ao_records = 0;
       uint64_t tlas_instances = 0;
+      // Foliage: captured draws/instances of wind (vertex animated) and alpha tested (cutout) draws, cutouts read back last frame
+      uint64_t wind_draws = 0, wind_instances = 0, cutout_draws = 0, cutout_instances = 0, frame_cutout_instances = 0;
    };
    enum CaptureSkip
    {
@@ -199,6 +216,7 @@ namespace RTAO
       struct Rec
       {
          enum Type : uint8_t { Instances, BufferCopy } type;
+         uint8_t mask; // Instances: TLAS instance mask (kInstanceMaskOpaque / kInstanceMaskCutout)
          uint64_t mesh_key; // Instances
          uint32_t first_slot;
          uint32_t count;
@@ -238,8 +256,14 @@ namespace RTAO
       uint32_t frame = 0;
       uint32_t last_record_frame = 0;
       bool after_ao_pass = false;
-      // Per frame slot: what was copied into that readback buffer (mesh key, count), in order
-      std::vector<std::pair<uint64_t, uint32_t>> readback_records[kFrameSlots];
+      // Per frame slot: what was copied into that readback buffer, in order
+      struct ReadbackRecord
+      {
+         uint64_t mesh_key;
+         uint32_t count;
+         uint8_t mask;
+      };
+      std::vector<ReadbackRecord> readback_records[kFrameSlots];
       CaptureStats stats;
    };
 

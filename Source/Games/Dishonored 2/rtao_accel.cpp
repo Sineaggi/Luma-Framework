@@ -301,6 +301,7 @@ namespace RTAO
       out = 0;
       instance_count = 0;
       frame_slot %= kSlots;
+      last_cutout_count = 0;
       {
          const std::lock_guard lock(mutex);
          descs.clear();
@@ -312,9 +313,17 @@ namespace RTAO
                continue; // Not built (yet)
             D3D12_RAYTRACING_INSTANCE_DESC desc = {};
             std::memcpy(desc.Transform, pair.second.transform, sizeof(desc.Transform));
-            desc.InstanceID = uint32_t(descs.size()) & 0xFFFFFF;
+            desc.InstanceID = uint32_t(descs.size()) & (kInstanceIdCutoutBit - 1);
             desc.InstanceMask = pair.second.mask;
             desc.Flags = D3D12_RAYTRACING_INSTANCE_FLAG_TRIANGLE_CULL_DISABLE | D3D12_RAYTRACING_INSTANCE_FLAG_FORCE_OPAQUE;
+            if (pair.second.mask & kInstanceMaskCutout)
+            {
+               // Same BLAS as an opaque draw of the mesh (built OPAQUE), overridden per instance: the trace's candidate
+               // loop decides each hit. Opaque instances stay forced opaque, so they cost nothing extra.
+               desc.Flags = D3D12_RAYTRACING_INSTANCE_FLAG_TRIANGLE_CULL_DISABLE | D3D12_RAYTRACING_INSTANCE_FLAG_FORCE_NON_OPAQUE;
+               desc.InstanceID |= kInstanceIdCutoutBit;
+               last_cutout_count++;
+            }
             desc.AccelerationStructure = blas;
             descs.push_back(desc);
          }

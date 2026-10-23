@@ -182,8 +182,11 @@ struct GameDeviceDataDishonored2 final : public GameDeviceData
    std::mutex rtao_pending_mutex;
    std::vector<RTAOPendingSplit> rtao_pending;
    uint32_t rtao_frame = 0;
+   uint32_t rtao_init_frame = 0;
    std::atomic<bool> rtao_logged_context_type = false;
    std::atomic<bool> rtao_logged_run_error = false;
+   // Diagnostics, logged a few times per session (OnPresent)
+   std::atomic<uint32_t> rtao_stat_inline_ok = 0, rtao_stat_splits = 0, rtao_stat_mapped = 0, rtao_stat_deferred_ok = 0, rtao_stat_failed = 0, rtao_stat_dropped = 0;
 };
 
 //TODOFT: Building shaders menu (apply gamma?)
@@ -258,6 +261,7 @@ public:
             return false;
          }
          SetRTAOStatus("D3D12 interop ready, " + rtao.GetDescription(), false);
+         game_device_data.rtao_init_frame = game_device_data.rtao_frame;
       }
 
       const auto copy_vs = device_data.native_vertex_shaders.find(CompileTimeStringHash("Copy VS"));
@@ -339,12 +343,14 @@ public:
       {
          if (!rtao.Run(native_device_context, constants, error))
          {
+            game_device_data.rtao_stat_failed++;
             if (!game_device_data.rtao_logged_run_error.exchange(true))
             {
                SetRTAOStatus("D3D12 pass failed: " + error, true);
             }
             return false;
          }
+         game_device_data.rtao_stat_inline_ok++;
       }
       else
       {
@@ -358,6 +364,7 @@ public:
          }
          const std::lock_guard lock(game_device_data.rtao_pending_mutex);
          game_device_data.rtao_pending.push_back(std::move(pending));
+         game_device_data.rtao_stat_splits++;
       }
 
       // 3) Write the shared AO into the game's AO render target, reusing the game's own fullscreen draw state
@@ -413,7 +420,9 @@ public:
          }
          context->ExecuteCommandList(pending.prefix.get(), TRUE);
          std::string error;
-         if (!game_device_data.rtao.Run(context.get(), pending.constants, error) && !game_device_data.rtao_logged_run_error.exchange(true))
+         const bool ok = game_device_data.rtao.Run(context.get(), pending.constants, error);
+         (ok ? game_device_data.rtao_stat_deferred_ok : game_device_data.rtao_stat_failed)++;
+         if (!ok && !game_device_data.rtao_logged_run_error.exchange(true))
          {
             SetRTAOStatus("D3D12 pass failed (deferred): " + error, true); // The composite then reads the previous AO
          }
@@ -431,6 +440,7 @@ public:
             if (pending.deferred_context == context.get() && pending.remainder_command_list == nullptr)
             {
                pending.remainder_command_list = command_list.get();
+               game_device_data.rtao_stat_mapped++;
                break;
             }
          }
@@ -683,7 +693,16 @@ public:
       game_device_data.rtao_frame++;
       {
          const std::lock_guard lock(game_device_data.rtao_pending_mutex);
-         std::erase_if(game_device_data.rtao_pending, [&](const auto& p) { return game_device_data.rtao_frame - p.frame > 3; });
+         game_device_data.rtao_stat_dropped += uint32_t(std::erase_if(game_device_data.rtao_pending, [&](const auto& p) { return game_device_data.rtao_frame - p.frame > 3; }));
+      }
+      const uint32_t rtao_frames = game_device_data.rtao_frame - game_device_data.rtao_init_frame;
+      if (game_device_data.rtao.IsInitialized() && (rtao_frames == 300 || rtao_frames == 3000 || rtao_frames == 30000))
+      {
+         char buffer[256];
+         snprintf(buffer, sizeof(buffer), "RTAO: %u frames after init: inline passes %u, deferred splits %u, mapped %u, deferred passes %u, failed %u, dropped %u",
+            rtao_frames, game_device_data.rtao_stat_inline_ok.load(), game_device_data.rtao_stat_splits.load(), game_device_data.rtao_stat_mapped.load(),
+            game_device_data.rtao_stat_deferred_ok.load(), game_device_data.rtao_stat_failed.load(), game_device_data.rtao_stat_dropped.load());
+         reshade::log::message(reshade::log::level::info, buffer);
       }
    }
    

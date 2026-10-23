@@ -396,7 +396,8 @@ static void TestLightCapture(ID3D11Device* device, ID3D11DeviceContext* context)
 // The replacement screen shadows shaders against the game's (Luma's dump), on random inputs
 static void TestScreenShadowsShader(ID3D11Device* device, ID3D11DeviceContext* context)
 {
-   const char* dump = "C:\\Program Files (x86)\\Steam\\steamapps\\common\\Dishonored2\\Luma\\Dishonored 2\\Dump\\";
+   const std::string dump_dir = GameShaderDumpDir(); // Luma's shader dump of the game (read at test time, not committed)
+   const char* dump = dump_dir.c_str();
    struct Variant
    {
       const char* original;

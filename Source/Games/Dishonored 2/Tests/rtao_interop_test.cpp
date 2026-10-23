@@ -27,6 +27,22 @@
 #include <cstring>
 #include <vector>
 
+// Where Luma dumped the game's shaders (RTAO_GAME_SHADER_DUMP, or the default Steam install). The reflection checks
+// read the game's own shaders from there at test time; no game data is part of the repository.
+static std::string GameShaderDumpDir()
+{
+   char buffer[1024];
+   const DWORD length = GetEnvironmentVariableA("RTAO_GAME_SHADER_DUMP", buffer, sizeof(buffer));
+   if (length > 0 && length < sizeof(buffer))
+   {
+      std::string dir(buffer, length);
+      if (dir.back() != '\\' && dir.back() != '/')
+         dir += '\\';
+      return dir;
+   }
+   return "C:\\Program Files (x86)\\Steam\\steamapps\\common\\Dishonored2\\Luma\\Dishonored 2\\Dump\\";
+}
+
 static int g_failures = 0;
 #define CHECK(cond, ...)                         \
    do                                            \
@@ -550,7 +566,8 @@ static void TestRayTracedScene(ID3D11Device* device, ID3D11DeviceContext* contex
 // Reflects some of the game's own vertex shaders, if Luma's dump of them is on this machine
 static void TestReflection()
 {
-   const char* dump = "C:\\Program Files (x86)\\Steam\\steamapps\\common\\Dishonored2\\Luma\\Dishonored 2\\Dump\\";
+   const std::string dump_dir = GameShaderDumpDir(); // Luma's shader dump of the game (read at test time, not committed)
+   const char* dump = dump_dir.c_str();
    struct Case
    {
       const char* file;

@@ -12,7 +12,7 @@ shared textures + a shared fence), against geometry captured from the game's own
   frames once seen in 4. Geometry drawn after the AO pass, the UI, particles, water and the first-person view model
   are left out.
 - **Pass:** cosine-distributed rays from the depth-reconstructed position, then a cross-bilateral + temporal
-  denoiser (ported from the user's Fallout 4 RtShadows), then a power curve (Strength).
+  denoiser (ported from Sineaggi's Fallout 4 RtShadows (f4-mods)), then a power curve (Strength).
 - **Cost (RTX 4090, 3440x1440):** about 0.8 ms indoors and 2.3 ms on the Karnaca docks before the performance work.
   The quality modes / dedup aim at about 1 ms there (not yet measured in game).
 

@@ -1,5 +1,5 @@
-// RTAO denoiser, ported from the user's Fallout 4 RtShadows denoiser (f4-mods/RtShadows/shadow_filter.hlsl) and
-// reduced to one AO channel: a 3x3 cross-bilateral on view depth plus a plane term from depth derivatives,
+// RTAO denoiser. Ported from f4-mods by Sineaggi (Fallout 4 RtShadows, RtShadows/shadow_filter.hlsl), reduced to one
+// AO channel: a 3x3 cross-bilateral on view depth plus a plane term from depth derivatives,
 // then reprojected temporal accumulation into a double-buffered packed history with a neighbourhood clamp.
 #include "rtao_common.hlsli"
 

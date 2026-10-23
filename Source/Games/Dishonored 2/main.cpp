@@ -89,7 +89,7 @@ namespace
    // Set when g_ao_mode changed and the game's r_hbao has to follow (applied on present, on the render thread)
    std::atomic<bool> g_ao_mode_apply_pending = true;
 
-   // The game's r_hbao cvar, driven from Luma (Steam 1.77.9.0). The addresses are the ones the user's AO menu ASI
+   // The game's r_hbao cvar, driven from Luma (Steam 1.77.9.0). The addresses are the ones Sineaggi's AO menu ASI
    // uses (Dishonored2AOMenu.asi); nothing is hooked, the engine's own idCVar::SetBool is called.
    struct GameAOCvars
    {
@@ -155,7 +155,7 @@ namespace
    int g_rtao_debug_mode = RTAO_OUTPUT_AO;
    // "View AO only" debug: 0 off, 1 the final AO (the game's blur output, any AO mode), 2 the RTAO output before the game's blur
    int g_ao_view_mode = 0;
-   float g_rtao_strength = 2.f; // RTAO power curve (config "RTAOStrength"); 2 matched XeGTAO's depth in the user's test
+   float g_rtao_strength = 2.f; // RTAO power curve (config "RTAOStrength"); 2 matched XeGTAO's depth in testing
    float g_rtao_radius = 1.5f; // World units (config "RTAORadius")
    int g_rtao_rays = 4; // Per pixel per frame (config "RTAORays")
    int g_rtao_capture_pass = 1; // 0: depth only draws (no render target bound), 1: every depth writing draw (config "RTAOCapturePass")

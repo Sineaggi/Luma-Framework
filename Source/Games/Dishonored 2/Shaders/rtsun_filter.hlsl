@@ -1,4 +1,4 @@
-// RT sun shadows denoiser: the RTAO denoiser (rtao_filter.hlsl, itself from f4-mods/RtShadows/shadow_filter.hlsl)
+// RT sun shadows denoiser: the RTAO denoiser (rtao_filter.hlsl, itself ported from f4-mods by Sineaggi)
 // with its own history: a 3x3 cross-bilateral on view depth plus a plane term, then reprojected temporal
 // accumulation into a double-buffered packed history with a neighbourhood clamp. Output: visibility, 1 = lit.
 #include "rtsun_common.hlsli"

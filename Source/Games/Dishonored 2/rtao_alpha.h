@@ -1,8 +1,8 @@
 #pragma once
 
 // RTAO texture exact cutouts: alpha tested geometry (leaves, grates, fences, hair) occludes where its texture's alpha
-// passes the game's test, per texel, instead of with a fixed probability. Modelled on the user's Fallout 4 code
-// (f4-mods/rtcore/alpha_atlas.h: one R8 mask per material in a private Texture2DArray, crossing as a shared strip).
+// passes the game's test, per texel, instead of with a fixed probability. Ported from f4-mods by Sineaggi
+// (Fallout 4, rtcore/alpha_atlas.h: one R8 mask per material in a private Texture2DArray, crossing as a shared strip).
 //
 // Design (and why):
 //  - What the game tests (RTAO_NOTES.md "Texture exact cutouts", ReflectPixelShader): discard if

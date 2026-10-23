@@ -3,7 +3,7 @@
 // RTAO interop (milestone M0): a side D3D12 device on the game's D3D11 adapter, plus the textures and the fence
 // the two APIs share. Pure D3D11/D3D12, no Luma or ReShade dependencies, so it can be lifted elsewhere.
 //
-// Patterned on the user's Fallout 4 RT core (f4-mods/rtcore/rt_device.h), including its measured sharing rules
+// Ported from f4-mods by Sineaggi (Fallout 4 RT core, rtcore/rt_device.h), including its measured sharing rules
 // (RTX 4090, Win11):
 //  - a D3D12 texture created with D3D12_HEAP_FLAG_SHARED opens in D3D11 (OpenSharedResource1) only with
 //    D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET alone. Adding ALLOW_UNORDERED_ACCESS makes the open fail, so

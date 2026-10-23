@@ -1,7 +1,7 @@
 #pragma once
 
-// RTAO acceleration structures: engine agnostic, D3D12 only. Ported in spirit from the user's Fallout 4 RT core
-// (f4-mods/rtcore/blas_cache.h, tlas_build.h) with the Creation Engine parts left out:
+// RTAO acceleration structures: engine agnostic, D3D12 only. Ported from f4-mods by Sineaggi
+// (Fallout 4 RT core: rtcore/blas_cache.h, tlas_build.h) with the Creation Engine parts left out:
 //  - BlasCache: one bottom level AS per unique mesh, keyed by a caller supplied 64 bit id. Built once (opaque,
 //    PREFER_FAST_TRACE), kept until evicted.
 //  - TlasBuilder: instances retained in a sliding window keyed by a caller supplied instance id, rebuilt into a

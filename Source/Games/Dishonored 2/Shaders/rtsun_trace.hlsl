@@ -1,5 +1,5 @@
 // RT sun shadows trace: per pixel, RayCount inline ray queries (DXR 1.1) from the world position reconstructed from
-// depth toward the directional light, jittered inside the light's disc (soft penumbra, F4 RtShadows' ConeSampleDisk).
+// depth toward the directional light, jittered inside the light's disc (soft penumbra, ConeSampleDisk from Sineaggi's f4-mods RtShadows).
 // Writes raw visibility (1 = lit) for rtsun_filter.hlsl. Same TLAS, bias and cutout handling as rtao_trace.hlsl
 // (texture exact masks through rtao_cutout.hlsli, the stochastic opacity / fast cutouts for cutouts without a mask).
 // Always full resolution (RTAO Quality doesn't apply: a hard shadow edge doesn't survive a half resolution upsample).

@@ -261,7 +261,8 @@ namespace RTAO
       ++frame;
       for (auto it = instances.begin(); it != instances.end();)
       {
-         if (frame - it->second.last_frame > retain_frames)
+         const uint32_t max_age = it->second.seen_frames >= promote_frames ? retain_frames : young_retain_frames;
+         if (frame - it->second.last_frame > max_age)
             it = instances.erase(it);
          else
             ++it;
@@ -270,13 +271,17 @@ namespace RTAO
 
    void TlasBuilder::AddInstance(uint64_t instance_key, uint64_t blas_key, const float object_to_world[3][4], uint8_t mask)
    {
-      Instance instance;
+      const std::lock_guard lock(mutex);
+      auto [it, inserted] = instances.try_emplace(instance_key);
+      Instance& instance = it->second;
+      if (inserted)
+         instance.seen_frames = 1;
+      else if (instance.last_frame != frame)
+         instance.seen_frames++;
       std::memcpy(instance.transform, object_to_world, sizeof(instance.transform));
       instance.blas_key = blas_key;
       instance.mask = mask;
-      const std::lock_guard lock(mutex);
-      instance.last_frame = frame;
-      instances[instance_key] = instance; // Re-adding refreshes the transform (moved objects) and the age
+      instance.last_frame = frame; // Re-adding refreshes the transform and the age
    }
 
    void TlasBuilder::RemoveInstance(uint64_t instance_key)

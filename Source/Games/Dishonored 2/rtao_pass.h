@@ -34,7 +34,7 @@ namespace RTAO
       float clamp_k;
       float bias;
       uint32_t debug_mode;
-      float pad0;
+      float strength;
    };
    static_assert(sizeof(PassConstants) == 240);
 
@@ -63,6 +63,7 @@ namespace RTAO
       float alpha_min = 1.f / 32.f;
       float clamp_k = 1.f / 16.f;
       uint32_t debug_mode = 0; // 1 reconstructed normal Y (raw), 2 history rejection (filtered), 3 BLAS coverage (raw)
+      float strength = 1.f; // Power curve on the denoised AO (> 1 deepens it)
       bool reset_history = false;
    };
 

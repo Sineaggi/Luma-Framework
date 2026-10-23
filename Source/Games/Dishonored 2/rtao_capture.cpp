@@ -159,6 +159,8 @@ namespace RTAO
             index_slot = bind.BindPoint;
          else if (strcmp(bind.Name, "PerInstanceCB") == 0 && bind.Type == D3D_SIT_CBUFFER)
             out.instance_cb_slot = bind.BindPoint;
+         else if (strcmp(bind.Name, "PerViewCB") == 0 && bind.Type == D3D_SIT_CBUFFER)
+            out.per_view_cb_slot = bind.BindPoint;
       }
       if (out.skip_reason && strcmp(out.skip_reason, "not reflected") != 0)
       {
@@ -166,14 +168,28 @@ namespace RTAO
          return false;
       }
 
-      bool rows_used = false;
+      bool rows_used = false, mvp_used = false;
+      if (out.per_view_cb_slot != kNoOffset)
+      {
+         ID3D11ShaderReflectionConstantBuffer* cb = reflection->GetConstantBufferByName("PerViewCB");
+         D3D11_SHADER_BUFFER_DESC cb_desc = {};
+         if (cb && SUCCEEDED(cb->GetDesc(&cb_desc)))
+         {
+            for (UINT v = 0; v < cb_desc.Variables; v++)
+            {
+               D3D11_SHADER_VARIABLE_DESC var = {};
+               if (SUCCEEDED(cb->GetVariableByIndex(v)->GetDesc(&var)) && var.Name && strcmp(var.Name, "cb_viewprojectionmatrix") == 0)
+                  out.view_proj_cb = var.StartOffset;
+            }
+         }
+      }
       if (out.instance_cb_slot != kNoOffset)
       {
          ID3D11ShaderReflectionConstantBuffer* cb = reflection->GetConstantBufferByName("PerInstanceCB");
          D3D11_SHADER_BUFFER_DESC cb_desc = {};
          if (cb && SUCCEEDED(cb->GetDesc(&cb_desc)))
          {
-            uint32_t used_rows = 0;
+            uint32_t used_rows = 0, used_mvp = 0;
             for (UINT v = 0; v < cb_desc.Variables; v++)
             {
                D3D11_SHADER_VARIABLE_DESC var = {};
@@ -199,8 +215,19 @@ namespace RTAO
                   out.row_cb[2] = var.StartOffset;
                   used_rows += used;
                }
+               else if (strncmp(var.Name, "cb_mvpmatrix", 12) == 0 && var.Name[12] != 0 && var.Name[13] == 0)
+               {
+                  const char c = var.Name[12];
+                  const int index = c == 'x' ? 0 : (c == 'y' ? 1 : (c == 'z' ? 2 : (c == 'w' ? 3 : -1)));
+                  if (index >= 0)
+                  {
+                     out.mvp_cb[index] = var.StartOffset;
+                     used_mvp += used;
+                  }
+               }
             }
             rows_used = used_rows == 3;
+            mvp_used = used_mvp == 4;
          }
       }
       reflection->Release();
@@ -234,9 +261,21 @@ namespace RTAO
       {
          out.source = MatrixSource::ConstantBuffer;
       }
+      else if (mvp_used && out.mvp_cb[0] != kNoOffset && out.mvp_cb[1] != kNoOffset && out.mvp_cb[2] != kNoOffset && out.mvp_cb[3] != kNoOffset)
+      {
+         out.source = MatrixSource::MvpConstantBuffer;
+         if (out.view_proj_cb == kNoOffset)
+         {
+            // Most MVP-only shaders (~190 of ~200 in the game's dump) don't declare PerViewCB, but the game keeps it bound
+            // at b1 through a pass. Read it there, at its usual layout (CBPerViewGlobals: cb_viewprojectionmatrix at 32).
+            // If something else is bound, the capture shader's affine check rejects the matrix.
+            out.per_view_cb_slot = 1;
+            out.view_proj_cb = 32;
+         }
+      }
       else
       {
-         out.skip_reason = "no model matrix (MVP only)";
+         out.skip_reason = mvp_used ? "MVP only, no PerViewCB" : "no model matrix";
          return false;
       }
       if (out.source != MatrixSource::ConstantBuffer && out.instance_cb_slot == kNoOffset)
@@ -244,7 +283,7 @@ namespace RTAO
       if (out.instance_cb_slot == kNoOffset)
       {
          out.depth_hack_cb = kNoOffset;
-         if (out.source == MatrixSource::ConstantBuffer)
+         if (out.source == MatrixSource::ConstantBuffer || out.source == MatrixSource::MvpConstantBuffer)
          {
             out.skip_reason = "no PerInstanceCB";
             out.source = MatrixSource::None;
@@ -443,7 +482,8 @@ namespace RTAO
          return skip(kSkipFormat);
       const MatrixSource source = draw.vs->source;
       if ((source == MatrixSource::DirectInstanceBuffer && !draw.instance_buffer) || (source == MatrixSource::IndexedInstanceBuffer && (!draw.instance_buffer || !draw.instance_index)) ||
-         (source == MatrixSource::ConstantBuffer && !draw.instance_cb) || (draw.vs->instance_offset_cb != kNoOffset && !draw.instance_cb))
+         (source == MatrixSource::ConstantBuffer && !draw.instance_cb) || (source == MatrixSource::MvpConstantBuffer && (!draw.instance_cb || !draw.per_view_cb)) ||
+         (draw.vs->instance_offset_cb != kNoOffset && !draw.instance_cb))
          return skip(kSkipBinding);
       if (draw.instance_count > kRingSlots / 8)
          return skip(kSkipRingFull);
@@ -514,12 +554,12 @@ namespace RTAO
       context->QueryInterface(IID_PPV_ARGS(&context1));
       ID3D11ComputeShader* old_cs = nullptr;
       context->CSGetShader(&old_cs, nullptr, nullptr);
-      ID3D11Buffer* old_cbs[2] = {};
-      UINT old_cb_first[2] = {}, old_cb_num[2] = {};
+      ID3D11Buffer* old_cbs[3] = {};
+      UINT old_cb_first[3] = {}, old_cb_num[3] = {};
       if (context1)
-         context1->CSGetConstantBuffers1(0, 2, old_cbs, old_cb_first, old_cb_num);
+         context1->CSGetConstantBuffers1(0, 3, old_cbs, old_cb_first, old_cb_num);
       else
-         context->CSGetConstantBuffers(0, 2, old_cbs);
+         context->CSGetConstantBuffers(0, 3, old_cbs);
       ID3D11ShaderResourceView* old_srvs[3] = {};
       context->CSGetShaderResources(0, 3, old_srvs);
       ID3D11UnorderedAccessView* old_uav = nullptr;
@@ -538,20 +578,30 @@ namespace RTAO
          std::memcpy(params.row_cb, draw.vs->row_cb, sizeof(params.row_cb));
          params.depth_hack_cb = draw.vs->depth_hack_cb;
          params.record_row0 = draw.vs->record_row0;
+         std::memcpy(params.mvp_cb, draw.vs->mvp_cb, sizeof(params.mvp_cb));
+         params.view_proj_cb = draw.vs->view_proj_cb;
          std::memcpy(mapped.pData, &params, sizeof(params));
          context->Unmap(params_cb, 0);
 
          context->CSSetShader(capture_cs, nullptr, 0);
-         ID3D11Buffer* cbs[2] = { params_cb, draw.instance_cb };
-         if (context1 && draw.instance_cb_num_constants != 0)
+         ID3D11Buffer* cbs[3] = { params_cb, draw.instance_cb, source == MatrixSource::MvpConstantBuffer ? draw.per_view_cb : nullptr };
+         if (context1 && (draw.instance_cb_num_constants != 0 || draw.per_view_cb_num_constants != 0))
          {
-            UINT first[2] = { 0, draw.instance_cb_first_constant };
-            UINT num[2] = { 16, draw.instance_cb_num_constants };
-            context1->CSSetConstantBuffers1(0, 2, cbs, first, num);
+            // A buffer bound whole (num 0) gets its own size, in the multiples of 16 constants D3D11.1 wants
+            auto whole = [](ID3D11Buffer* buffer) -> UINT {
+               if (!buffer)
+                  return 16;
+               D3D11_BUFFER_DESC desc = {};
+               buffer->GetDesc(&desc);
+               return (std::min)(4096u, ((desc.ByteWidth / 16) + 15) & ~15u);
+            };
+            UINT first[3] = { 0, draw.instance_cb_first_constant, draw.per_view_cb_first_constant };
+            UINT num[3] = { 16, draw.instance_cb_num_constants ? draw.instance_cb_num_constants : whole(cbs[1]), draw.per_view_cb_num_constants ? draw.per_view_cb_num_constants : whole(cbs[2]) };
+            context1->CSSetConstantBuffers1(0, 3, cbs, first, num);
          }
          else
          {
-            context->CSSetConstantBuffers(0, 2, cbs);
+            context->CSSetConstantBuffers(0, 3, cbs);
          }
          ID3D11ShaderResourceView* srvs[3] = {
             source == MatrixSource::IndexedInstanceBuffer ? draw.instance_index : nullptr,
@@ -567,9 +617,9 @@ namespace RTAO
 
       context->CSSetShader(old_cs, nullptr, 0);
       if (context1)
-         context1->CSSetConstantBuffers1(0, 2, old_cbs, old_cb_first, old_cb_num);
+         context1->CSSetConstantBuffers1(0, 3, old_cbs, old_cb_first, old_cb_num);
       else
-         context->CSSetConstantBuffers(0, 2, old_cbs);
+         context->CSSetConstantBuffers(0, 3, old_cbs);
       context->CSSetShaderResources(0, 3, old_srvs);
       UINT keep_count = UINT(-1);
       context->CSSetUnorderedAccessViews(0, 1, &old_uav, &keep_count);

@@ -156,6 +156,7 @@ static const Box kBoxes[] = {
    { { -1, 0, -1 }, { 1, 2, 1 } },
    { { 3, 0, 2 }, { 4, 3, 3 } },
    { { -4.5f, 0.6f, -1 }, { -3.5f, 1.6f, 0 } }, // 0.6 above the ground, inside the 1.5 AO radius
+   { { 4.5f, 0, -4 }, { 5.5f, 1, -3 } }, // Captured through the MVP-only family
 };
 static constexpr int kBoxCount = int(sizeof(kBoxes) / sizeof(kBoxes[0]));
 
@@ -202,17 +203,30 @@ static void TestTlasRetention()
 {
    RTAO::TlasBuilder tlas;
    const float identity[3][4] = { { 1, 0, 0, 0 }, { 0, 1, 0, 0 }, { 0, 0, 1, 0 } };
-   tlas.BeginFrame();
-   tlas.AddInstance(1, 1, identity);
-   tlas.AddInstance(2, 1, identity);
-   for (uint32_t i = 0; i < RTAO::TlasBuilder::kRetainFrames; i++)
+   // 1 and 2 are static and in view long enough to be promoted
+   for (uint32_t i = 0; i < RTAO::TlasBuilder::kPromoteFrames; i++)
+   {
+      tlas.BeginFrame();
+      tlas.AddInstance(1, 1, identity);
+      tlas.AddInstance(2, 1, identity);
+   }
+   // A moving object: a new identity (key) every frame
+   for (uint64_t key = 100; key < 110; key++)
    {
       tlas.BeginFrame();
       tlas.AddInstance(2, 1, identity); // 2 stays in view, 1 left the view
+      tlas.AddInstance(key, 1, identity);
    }
-   CHECK(tlas.RetainedCount() == 2, "an instance must be kept for kRetainFrames after it left the view (got %zu)", tlas.RetainedCount());
+   CHECK(tlas.RetainedCount() == 2 + RTAO::TlasBuilder::kYoungRetainFrames + 1, "a moving object keeps only its last few copies (got %zu)", tlas.RetainedCount());
+   for (uint32_t i = 0; i < RTAO::TlasBuilder::kRetainFrames - 10; i++)
+   {
+      tlas.BeginFrame();
+      tlas.AddInstance(2, 1, identity);
+   }
+   CHECK(tlas.RetainedCount() == 2, "a promoted instance must be kept for kRetainFrames after it left the view, the moving copies gone (got %zu)", tlas.RetainedCount());
    tlas.BeginFrame();
-   CHECK(tlas.RetainedCount() == 1, "an instance must be pruned after kRetainFrames (got %zu)", tlas.RetainedCount());
+   tlas.AddInstance(2, 1, identity);
+   CHECK(tlas.RetainedCount() == 1, "a promoted instance must be pruned after kRetainFrames (got %zu)", tlas.RetainedCount());
    printf("TLAS retention: ok\n");
 }
 
@@ -543,6 +557,8 @@ static void TestReflection()
       { "0x000209DB.vs_5_0.cso", RTAO::MatrixSource::IndexedInstanceBuffer, nullptr },
       { "0x0008106B.vs_5_0.cso", RTAO::MatrixSource::ConstantBuffer, nullptr },
       { "0x0236F519.vs_5_0.cso", RTAO::MatrixSource::None, "skinned" },
+      { "0x0275C69D.vs_5_0.cso", RTAO::MatrixSource::MvpConstantBuffer, nullptr }, // MVP only, declares PerViewCB
+      { "0x00E0ECFF.vs_5_0.cso", RTAO::MatrixSource::MvpConstantBuffer, nullptr }, // MVP only, PerViewCB assumed at b1
    };
    int tested = 0;
    for (const Case& c : cases)
@@ -704,9 +720,47 @@ static void TestGeometryCapture(ID3D11Device* device, ID3D11DeviceContext* conte
       return MakeBuffer(device, D3D11_BIND_CONSTANT_BUFFER, cb.data(), 480);
    };
    ID3D11Buffer* model_cb = make_cb_family(kBoxes[3], 1.f);
+
+   // Family 4: MVP only (cb_mvpmatrixz @16, y @32, x @48, w @64, as in the game's skinned shaders; depth hack @84),
+   // with the draw's PerViewCB holding cb_viewprojectionmatrix @32
+   ID3D11Buffer* mvp_cb = nullptr;
+   ID3D11Buffer* per_view_cb = nullptr;
+   {
+      Mat4 model;
+      float t[12];
+      BoxTransform(kBoxes[4], t);
+      model(0, 0) = t[0];
+      model(1, 1) = t[5];
+      model(2, 2) = t[10];
+      model(3, 0) = t[3];
+      model(3, 1) = t[7];
+      model(3, 2) = t[11];
+      model(3, 3) = 1.f;
+      const Mat4 mvp = Mul(model, view_proj);
+      std::vector<float> cb(96 / 4, 0.f);
+      const uint32_t column_offsets[4] = { 48, 32, 16, 64 }; // x, y, z, w
+      for (int c = 0; c < 4; c++)
+         for (int r = 0; r < 4; r++)
+            cb[column_offsets[c] / 4 + r] = mvp(r, c);
+      cb[84 / 4] = 1.f;
+      mvp_cb = MakeBuffer(device, D3D11_BIND_CONSTANT_BUFFER, cb.data(), 96);
+      std::vector<float> view(112 / 4, 0.f);
+      std::memcpy(&view[32 / 4], view_proj.m, 64);
+      per_view_cb = MakeBuffer(device, D3D11_BIND_CONSTANT_BUFFER, view.data(), 112);
+   }
    ID3D11Buffer* view_model_cb = make_cb_family({ { -50, -50, -50 }, { 50, 50, 50 } }, 0.25f);
 
-   RTAO::VertexShaderInfo direct_vs, indexed_vs, cb_vs;
+   RTAO::VertexShaderInfo direct_vs, indexed_vs, cb_vs, mvp_vs;
+   mvp_vs.source = RTAO::MatrixSource::MvpConstantBuffer;
+   mvp_vs.skip_reason = nullptr;
+   mvp_vs.instance_cb_slot = 2;
+   mvp_vs.mvp_cb[0] = 48;
+   mvp_vs.mvp_cb[1] = 32;
+   mvp_vs.mvp_cb[2] = 16;
+   mvp_vs.mvp_cb[3] = 64;
+   mvp_vs.depth_hack_cb = 84;
+   mvp_vs.per_view_cb_slot = 1;
+   mvp_vs.view_proj_cb = 32;
    direct_vs.source = RTAO::MatrixSource::DirectInstanceBuffer;
    direct_vs.skip_reason = nullptr;
    direct_vs.instance_cb_slot = 2;
@@ -758,6 +812,10 @@ static void TestGeometryCapture(ID3D11Device* device, ID3D11DeviceContext* conte
    draw_cb.instance_cb = model_cb;
    RTAO::DrawInfo draw_view_model = draw_cb;
    draw_view_model.instance_cb = view_model_cb;
+   RTAO::DrawInfo draw_mvp = base_draw();
+   draw_mvp.vs = &mvp_vs;
+   draw_mvp.instance_cb = mvp_cb;
+   draw_mvp.per_view_cb = per_view_cb;
 
    ID3DBlob* cs_code = Compile(L"..\\..\\..\\..\\Shaders\\Dishonored 2\\Luma_RTAO.hlsl", "capture_instances_cs", "cs_5_0");
    ID3D11ComputeShader* capture_cs = nullptr;
@@ -787,6 +845,7 @@ static void TestGeometryCapture(ID3D11Device* device, ID3D11DeviceContext* conte
       // The "game" draws: two families on the immediate context, the third (and the view model) on a deferred one
       CHECK(capture.CaptureDraw(context, draw_direct), "capture (direct)");
       CHECK(capture.CaptureDraw(context, draw_indexed), "capture (indexed)");
+      CHECK(capture.CaptureDraw(context, draw_mvp), "capture (MVP only)");
       CHECK(capture.CaptureDraw(deferred, draw_cb), "capture (cbuffer)");
       CHECK(capture.CaptureDraw(deferred, draw_view_model), "capture (view model)");
       ID3D11CommandList* command_list = nullptr;
@@ -844,7 +903,7 @@ static void TestGeometryCapture(ID3D11Device* device, ID3D11DeviceContext* conte
       (unsigned long long)stats.buffers_copied, (unsigned long long)(stats.arena_vertex_bytes / 1024), (unsigned long long)stats.blas_built, (unsigned long long)stats.tlas_instances, (unsigned long long)stats.view_model_instances);
    CHECK(stats.meshes == 1 && stats.blas_built == 1, "all families draw the same mesh: one BLAS");
    CHECK(stats.buffers_copied == 2, "the vertex and index buffers are copied once");
-   CHECK(stats.tlas_instances == 4, "4 boxes in the TLAS (the view model left out), got %llu", (unsigned long long)stats.tlas_instances);
+   CHECK(stats.tlas_instances == kBoxCount, "%d boxes in the TLAS (the view model left out), got %llu", kBoxCount, (unsigned long long)stats.tlas_instances);
    CHECK(stats.view_model_instances == 1, "the view model draw must be flagged");
 
    auto average = [&](const std::vector<float>& ao, auto predicate, int& count) {
@@ -873,7 +932,8 @@ static void TestGeometryCapture(ID3D11Device* device, ID3D11DeviceContext* conte
       const V3 p = hit_pos[i];
       return hit_id[i] == 0 && p.x > -4.4f && p.x < -3.6f && p.z > -0.9f && p.z < -0.1f;
    };
-   int c[5];
+   auto is_near_mvp_box = [&](UINT i) { return hit_id[i] == 0 && BoxDistance(hit_pos[i], kBoxes[4]) < 0.15f; };
+   int c[6];
    const float sky = average(raw, is_sky, c[0]), open = average(raw, is_open_ground, c[1]), corner = average(raw, is_corner, c[2]);
    const float near_b = average(raw, is_near_b, c[3]), under = average(raw, is_under_floating, c[4]);
    printf("captured scene AO (raw): sky %.3f, open ground %.3f, wall corner (direct family) %.3f, next to box B (indexed family) %.3f, under the floating box (cbuffer family, deferred) %.3f\n", sky, open, corner, near_b, under);
@@ -882,6 +942,9 @@ static void TestGeometryCapture(ID3D11Device* device, ID3D11DeviceContext* conte
    CHECK(c[2] > 10 && corner < 0.8f, "direct family box occludes");
    CHECK(c[3] > 5 && near_b < 0.8f, "indexed family box occludes");
    CHECK(c[4] > 10 && under < 0.9f, "cbuffer family box occludes");
+   const float near_mvp = average(raw, is_near_mvp_box, c[5]);
+   printf("next to the MVP family box: %.3f (%d px)\n", near_mvp, c[5]);
+   CHECK(c[5] > 5 && near_mvp < 0.8f, "MVP family box occludes");
 
    // BLAS coverage debug: the captured geometry must line up with the depth
    std::vector<float> coverage = run_frame(RTAO::FilterMode::Off, 3);
@@ -903,7 +966,7 @@ static void TestGeometryCapture(ID3D11Device* device, ID3D11DeviceContext* conte
    blases.Clear(nullptr, 0);
    capture.Shutdown();
    deferred->Release();
-   for (IUnknown* p : std::initializer_list<IUnknown*>{ vb, ib, direct_buffer, direct_srv, direct_cb_buffer, indexed_buffer, indexed_srv, index_buffer, index_srv, indexed_cb_buffer, model_cb, view_model_cb, depth_srv, depth_texture })
+   for (IUnknown* p : std::initializer_list<IUnknown*>{ vb, ib, direct_buffer, direct_srv, direct_cb_buffer, indexed_buffer, indexed_srv, index_buffer, index_srv, indexed_cb_buffer, model_cb, view_model_cb, mvp_cb, per_view_cb, depth_srv, depth_texture })
       p->Release();
 }
 

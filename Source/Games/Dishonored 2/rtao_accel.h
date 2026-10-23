@@ -106,6 +106,11 @@ namespace RTAO
    {
    public:
       static constexpr uint32_t kRetainFrames = 180;
+      // An instance only earns kRetainFrames once it was seen in kPromoteFrames different frames. Until then it is kept
+      // kYoungRetainFrames. A moving object gets a new identity (its transform) every frame, so its copies never get
+      // promoted and age out at once: no trail of copies, no pile-up. A static object in view is promoted quickly.
+      static constexpr uint32_t kPromoteFrames = 4;
+      static constexpr uint32_t kYoungRetainFrames = 2;
 
       ~TlasBuilder() { Clear(nullptr, 0); }
 
@@ -122,6 +127,8 @@ namespace RTAO
 
       void Clear(Retirer* retirer, uint64_t fence_value);
       uint32_t retain_frames = kRetainFrames;
+      uint32_t promote_frames = kPromoteFrames;
+      uint32_t young_retain_frames = kYoungRetainFrames;
 
    private:
       struct Instance
@@ -129,6 +136,7 @@ namespace RTAO
          float transform[3][4];
          uint64_t blas_key;
          uint32_t last_frame;
+         uint32_t seen_frames;
          uint8_t mask;
       };
       std::mutex mutex;

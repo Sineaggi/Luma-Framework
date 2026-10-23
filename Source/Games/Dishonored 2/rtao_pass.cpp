@@ -300,6 +300,7 @@ namespace RTAO
       constants.clamp_k = settings.clamp_k;
       constants.bias = settings.bias;
       constants.debug_mode = settings.debug_mode;
+      constants.strength = settings.strength;
       const uint32_t slot = info.frame_slot % kSlots;
       std::memcpy(constants_mapped + slot * kConstantsStride, &constants, sizeof(constants));
 

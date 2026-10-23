@@ -129,5 +129,6 @@ void main(uint3 id : SV_DispatchThreadID)
         new_age = 1u;
     }
     HistCur[px] = PackHist(out_ao, z0, new_age);
-    AoFiltered[px] = DebugMode == 2 ? (rejected ? 0.0 : 1.0) : out_ao;
+    // Strength: a power curve on the output only (the history keeps the linear value)
+    AoFiltered[px] = DebugMode == 2 ? (rejected ? 0.0 : 1.0) : pow(saturate(out_ao), max(Strength, 0.01));
 }

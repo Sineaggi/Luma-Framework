@@ -14,7 +14,7 @@ cbuffer PassConstants : register(b0)
     float3 PrevCamFwd;  uint HistValid;
     uint2 Size;         uint2 DepthSize;
     uint DepthPacked;   uint ReversedZ;  uint FilterMode; float AlphaMin;
-    float ClampK;       float Bias;      uint DebugMode;  float Pad0;
+    float ClampK;       float Bias;      uint DebugMode;  float Strength;
 };
 
 Texture2D<float4> DepthTex : register(t1);

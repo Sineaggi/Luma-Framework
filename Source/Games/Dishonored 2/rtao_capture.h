@@ -44,6 +44,8 @@ namespace RTAO
       DirectInstanceBuffer = 1, // StructuredBuffer ro_directinstancebuffer, stride 96, rows at 48/64/80
       IndexedInstanceBuffer = 2, // Buffer<uint> ro_instancebufferindex -> StructuredBuffer ro_instancebuffer, stride 48
       ConstantBuffer = 3, // PerInstanceCB cb_modelmatrixx/y/z
+      MvpConstantBuffer = 4, // PerInstanceCB cb_mvpmatrixx/y/z/w only: world = MVP x inverse(PerViewCB cb_viewprojectionmatrix)
+      Count
    };
 
    // What a vertex shader needs for capture, from its reflection
@@ -59,6 +61,9 @@ namespace RTAO
       uint32_t instance_buffer_stride = 0;
       uint32_t instance_index_slot = kNoOffset;
       uint32_t record_row0 = 0; // Byte offset of the x row in an instance record
+      uint32_t mvp_cb[4] = { kNoOffset, kNoOffset, kNoOffset, kNoOffset }; // cb_mvpmatrixx/y/z/w, bytes (clip.x = dot(pos, x) ...)
+      uint32_t per_view_cb_slot = kNoOffset; // PerViewCB
+      uint32_t view_proj_cb = kNoOffset; // cb_viewprojectionmatrix in PerViewCB, bytes
    };
    // Uses D3DReflect (D3DCompiler_47.dll, loaded on first use)
    bool ReflectVertexShader(const void* code, size_t code_size, VertexShaderInfo& out);
@@ -88,8 +93,11 @@ namespace RTAO
       uint32_t depth_hack_cb;
       uint32_t record_row0;
       uint32_t pad[2];
+      uint32_t mvp_cb[4];
+      uint32_t view_proj_cb;
+      uint32_t pad2[3];
    };
-   static_assert(sizeof(CaptureParams) == 48);
+   static_assert(sizeof(CaptureParams) == 80);
 
    // Everything the caller reads from the context at the draw
    struct DrawInfo
@@ -111,6 +119,8 @@ namespace RTAO
       uint32_t instance_cb_first_constant = 0, instance_cb_num_constants = 0; // VSGetConstantBuffers1 (0, 0: whole buffer)
       ID3D11ShaderResourceView* instance_buffer = nullptr;
       ID3D11ShaderResourceView* instance_index = nullptr;
+      ID3D11Buffer* per_view_cb = nullptr; // The bound PerViewCB (MvpConstantBuffer only)
+      uint32_t per_view_cb_first_constant = 0, per_view_cb_num_constants = 0;
    };
 
    struct CaptureStats

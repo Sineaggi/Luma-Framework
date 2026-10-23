@@ -170,8 +170,8 @@ namespace
    std::unordered_map<uint64_t, RTAO::InputLayoutInfo> g_rtao_input_layouts;
    std::atomic<bool> g_rtao_capture_active = false; // Set while RTAO traces, so the draw hook costs nothing otherwise
    std::atomic<uint32_t> g_rtao_main_depth_width = 0, g_rtao_main_depth_height = 0; // The main view's depth size
-   std::atomic<uint64_t> g_rtao_vs_by_source[4] = {}; // Reflected vertex shaders, by RTAO::MatrixSource
-   std::atomic<uint64_t> g_rtao_draws_by_source[4] = {}; // Main view draws, by their vertex shader's matrix source
+   std::atomic<uint64_t> g_rtao_vs_by_source[5] = {}; // Reflected vertex shaders, by RTAO::MatrixSource
+   std::atomic<uint64_t> g_rtao_draws_by_source[5] = {}; // Main view draws, by their vertex shader's matrix source
    std::atomic<uint64_t> g_rtao_draws_unknown_shader = 0, g_rtao_draws_unusable_layout = 0, g_rtao_indirect_draws = 0, g_rtao_draws_not_triangle_list = 0;
    // Main view draws whose vertex shader can't be captured, by reason (the reasons are static strings)
    std::mutex g_rtao_skip_reason_mutex;
@@ -685,6 +685,7 @@ public:
       settings.ray_count = uint32_t(std::clamp(g_rtao_rays, 1, 64));
       settings.filter_mode = (output == RTAO_OUTPUT_AO) ? RTAO::FilterMode::Temporal : RTAO::FilterMode::Off;
       settings.debug_mode = output == RTAO_OUTPUT_COVERAGE ? 3 : 0;
+      settings.strength = g_rtao_strength;
       return settings;
    }
 
@@ -1607,7 +1608,7 @@ public:
                continue;
             RTAO::VertexShaderInfo info;
             RTAO::ReflectVertexShader(desc->code, desc->code_size, info);
-            g_rtao_vs_by_source[(std::min)(uint32_t(info.source), 3u)]++;
+            g_rtao_vs_by_source[(std::min)(uint32_t(info.source), 4u)]++;
             const std::unique_lock lock(g_rtao_shader_mutex);
             g_rtao_vertex_shaders[pipeline.handle] = info;
          }
@@ -1708,7 +1709,7 @@ public:
          if (layout_it != g_rtao_input_layouts.end())
             layout_info = layout_it->second;
       }
-      g_rtao_draws_by_source[(std::min)(uint32_t(vs_info.source), 3u)]++;
+      g_rtao_draws_by_source[(std::min)(uint32_t(vs_info.source), 4u)]++;
       if (vs_info.source == RTAO::MatrixSource::None)
       {
          const std::lock_guard lock(g_rtao_skip_reason_mutex);
@@ -1747,6 +1748,18 @@ public:
          draw.instance_cb_first_constant = first_constant;
          draw.instance_cb_num_constants = num_constants;
       }
+      com_ptr<ID3D11Buffer> per_view_cb;
+      if (vs_info.source == RTAO::MatrixSource::MvpConstantBuffer && vs_info.per_view_cb_slot != RTAO::kNoOffset)
+      {
+         com_ptr<ID3D11DeviceContext1> context1;
+         UINT first_constant = 0, num_constants = 0;
+         if (SUCCEEDED(context->QueryInterface(&context1)))
+            context1->VSGetConstantBuffers1(vs_info.per_view_cb_slot, 1, &per_view_cb, &first_constant, &num_constants);
+         else
+            context->VSGetConstantBuffers(vs_info.per_view_cb_slot, 1, &per_view_cb);
+         draw.per_view_cb_first_constant = first_constant;
+         draw.per_view_cb_num_constants = num_constants;
+      }
       if (vs_info.instance_buffer_slot != RTAO::kNoOffset)
          context->VSGetShaderResources(vs_info.instance_buffer_slot, 1, &instance_buffer);
       if (vs_info.instance_index_slot != RTAO::kNoOffset)
@@ -1760,6 +1773,7 @@ public:
       draw.instance_cb = instance_cb.get();
       draw.instance_buffer = instance_buffer.get();
       draw.instance_index = instance_index.get();
+      draw.per_view_cb = per_view_cb.get();
 
       auto& device_data = *device->get_private_data<DeviceData>();
       if (device_data.game)
@@ -2077,6 +2091,8 @@ public:
       reshade::get_config_value(runtime, NAME, "RTAORadius", g_rtao_radius);
       reshade::get_config_value(runtime, NAME, "RTAORays", g_rtao_rays);
       reshade::get_config_value(runtime, NAME, "RTAOCapturePass", g_rtao_capture_pass);
+      reshade::get_config_value(runtime, NAME, "RTAOStrength", g_rtao_strength);
+      g_rtao_strength = std::clamp(g_rtao_strength, 0.25f, 4.f);
       g_rtao_radius = std::clamp(g_rtao_radius, 0.05f, 50.f);
       g_rtao_rays = std::clamp(g_rtao_rays, 1, 64);
       g_rtao_capture_pass = std::clamp(g_rtao_capture_pass, 0, 1);
@@ -2186,8 +2202,13 @@ public:
             reshade::set_config_value(runtime, NAME, "RTAOCapturePass", g_rtao_capture_pass);
          if (ImGui::IsItemHovered())
             ImGui::SetTooltip("Which main view draws feed the ray tracing scene. Use \"All\" if the coverage view shows missing (grey) geometry.");
-         if (ImGui::SliderFloat("RTAO Test Strength", &g_rtao_strength, 0.f, 4.f))
-            g_rtao_strength = std::clamp(g_rtao_strength, 0.f, 4.f);
+         if (ImGui::SliderFloat("RTAO Strength", &g_rtao_strength, 0.25f, 4.f, "%.2f"))
+            g_rtao_strength = std::clamp(g_rtao_strength, 0.25f, 4.f);
+         if (ImGui::IsItemDeactivatedAfterEdit())
+            reshade::set_config_value(runtime, NAME, "RTAOStrength", g_rtao_strength);
+         if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("Deepens (> 1) or lightens (< 1) the ray traced AO: a power curve on the result. 1 = as traced.");
+         DrawResetButton(g_rtao_strength, 1.f, "RTAOStrength");
 
          auto& game_device_data = GetGameDeviceData(device_data);
          if (game_device_data.rtao_capture.IsInitialized() && ImGui::TreeNode("RTAO stats"))
@@ -2195,8 +2216,8 @@ public:
             const RTAO::CaptureStats stats = game_device_data.rtao_capture.GetStats();
             ImGui::Text("GPU time (capture readback, BLAS/TLAS builds, trace, denoise): %.2f ms", game_device_data.rtao_gpu_us.load() / 1000.0);
             ImGui::Text("Draws seen %llu, captured %llu (%llu instances)", (unsigned long long)stats.draws_seen, (unsigned long long)stats.draws_captured, (unsigned long long)stats.instances_captured);
-            ImGui::Text("Main view draws by matrix source: none %llu, direct %llu, indexed %llu, cbuffer %llu",
-               (unsigned long long)g_rtao_draws_by_source[0].load(), (unsigned long long)g_rtao_draws_by_source[1].load(), (unsigned long long)g_rtao_draws_by_source[2].load(), (unsigned long long)g_rtao_draws_by_source[3].load());
+            ImGui::Text("Main view draws by matrix source: none %llu, direct %llu, indexed %llu, cbuffer %llu, MVP %llu",
+               (unsigned long long)g_rtao_draws_by_source[0].load(), (unsigned long long)g_rtao_draws_by_source[1].load(), (unsigned long long)g_rtao_draws_by_source[2].load(), (unsigned long long)g_rtao_draws_by_source[3].load(), (unsigned long long)g_rtao_draws_by_source[4].load());
             ImGui::Text("Unknown vertex shader %llu, unusable input layout %llu, GPU culled (indirect, not captured) %llu",
                (unsigned long long)g_rtao_draws_unknown_shader.load(), (unsigned long long)g_rtao_draws_unusable_layout.load(), (unsigned long long)g_rtao_indirect_draws.load());
             ImGui::Text("Skipped: shader %llu, format %llu, buffer %llu, arena full %llu, ring %llu, binding %llu, other %llu",
@@ -2205,8 +2226,8 @@ public:
             ImGui::Text("Meshes %llu (%llu with a BLAS, %llu failed), BLAS %llu (%.1f MB), buffers copied %llu (arena %.1f MB)", (unsigned long long)stats.meshes, (unsigned long long)stats.meshes_ready,
                (unsigned long long)stats.blas_failed, (unsigned long long)game_device_data.rtao_blas_count.load(), game_device_data.rtao_blas_bytes.load() / 1048576.0, (unsigned long long)stats.buffers_copied, stats.arena_vertex_bytes / 1048576.0);
             ImGui::Text("TLAS instances %u, instances read back last frame %llu, view model instances %llu, draws after the AO pass (left out) %llu", game_device_data.rtao_tlas_instances.load(), (unsigned long long)stats.frame_instances, (unsigned long long)stats.view_model_instances, (unsigned long long)stats.after_ao_records);
-            ImGui::Text("Vertex shaders reflected: none %llu, direct %llu, indexed %llu, cbuffer %llu", (unsigned long long)g_rtao_vs_by_source[0].load(), (unsigned long long)g_rtao_vs_by_source[1].load(),
-               (unsigned long long)g_rtao_vs_by_source[2].load(), (unsigned long long)g_rtao_vs_by_source[3].load());
+            ImGui::Text("Vertex shaders reflected: none %llu, direct %llu, indexed %llu, cbuffer %llu, MVP %llu", (unsigned long long)g_rtao_vs_by_source[0].load(), (unsigned long long)g_rtao_vs_by_source[1].load(),
+               (unsigned long long)g_rtao_vs_by_source[2].load(), (unsigned long long)g_rtao_vs_by_source[3].load(), (unsigned long long)g_rtao_vs_by_source[4].load());
             ImGui::TreePop();
          }
       }

@@ -78,7 +78,7 @@ namespace
    std::atomic<bool> g_rtao_unavailable = false;
    std::mutex g_rtao_status_mutex;
    std::string g_rtao_status; // Last RTAO init result or error, shown in the UI
-   // What the M0 D3D12 kernel writes (0 depth based test AO, 1 test pattern). Not saved.
+   // What the M0 D3D12 kernel writes (0 depth based test AO, 1 test pattern). Config key "RTAOTestOutput".
    int g_rtao_debug_mode = 0;
    float g_rtao_strength = 1.f;
 
@@ -1411,6 +1411,8 @@ public:
             ao_mode = xegtao_enable ? AO_MODE_XEGTAO : AO_MODE_OFF;
       }
       g_ao_mode = (ao_mode >= AO_MODE_OFF && ao_mode < AO_MODE_COUNT) ? ao_mode : AO_MODE_XEGTAO;
+      reshade::get_config_value(runtime, NAME, "RTAOTestOutput", g_rtao_debug_mode);
+      g_rtao_debug_mode = std::clamp(g_rtao_debug_mode, 0, 1);
 
       auto& game_settings = cb_luma_global_settings.GameSettings;
       reshade::get_config_value(runtime, NAME, "BloomStrength", game_settings.BloomStrength);
@@ -1486,7 +1488,8 @@ public:
          }
          ImGui::TextWrapped("RTAO status: %s", status.empty() ? "waiting for the SSAO pass" : status.c_str());
          static const char* rtao_debug_mode_names[] = { "Depth test AO", "Test pattern" };
-         ImGui::Combo("RTAO Test Output", &g_rtao_debug_mode, rtao_debug_mode_names, IM_ARRAYSIZE(rtao_debug_mode_names));
+         if (ImGui::Combo("RTAO Test Output", &g_rtao_debug_mode, rtao_debug_mode_names, IM_ARRAYSIZE(rtao_debug_mode_names)))
+            reshade::set_config_value(runtime, NAME, "RTAOTestOutput", g_rtao_debug_mode);
          ImGui::SliderFloat("RTAO Test Strength", &g_rtao_strength, 0.f, 4.f);
       }
    }

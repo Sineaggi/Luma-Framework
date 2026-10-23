@@ -167,6 +167,10 @@ namespace
    // Geometry capture: what each game vertex shader / input layout means for capture, by native object pointer
    std::shared_mutex g_rtao_shader_mutex;
    std::unordered_map<uint64_t, RTAO::VertexShaderInfo> g_rtao_vertex_shaders;
+   std::unordered_map<uint64_t, uint32_t> g_rtao_vertex_shader_hashes; // Luma's shader hash (as in the Dump folder names), diagnostics
+   // Diagnostics: each uncaptured main view (shader, reason) logged once, up to a limit
+   std::mutex g_rtao_diag_mutex;
+   std::unordered_set<uint64_t> g_rtao_diag_logged;
    std::unordered_map<uint64_t, RTAO::InputLayoutInfo> g_rtao_input_layouts;
    std::atomic<bool> g_rtao_capture_active = false; // Set while RTAO traces, so the draw hook costs nothing otherwise
    std::atomic<uint32_t> g_rtao_main_depth_width = 0, g_rtao_main_depth_height = 0; // The main view's depth size
@@ -1609,8 +1613,19 @@ public:
             RTAO::VertexShaderInfo info;
             RTAO::ReflectVertexShader(desc->code, desc->code_size, info);
             g_rtao_vs_by_source[(std::min)(uint32_t(info.source), 4u)]++;
+            const uint32_t hash = Shader::BinToHash(static_cast<const uint8_t*>(desc->code), desc->code_size);
+            if (info.skip_reason && strcmp(info.skip_reason, "no VERTEX_POSITION") == 0)
+            {
+               std::string signature;
+               RTAO::VertexShaderInfo unused;
+               RTAO::ReflectVertexShader(desc->code, desc->code_size, unused, &signature);
+               char buffer[512];
+               snprintf(buffer, sizeof(buffer), "RTAO: vertex shader 0x%08X has no VERTEX_POSITION input (inputs: %s)", hash, signature.empty() ? "none" : signature.c_str());
+               reshade::log::message(reshade::log::level::info, buffer);
+            }
             const std::unique_lock lock(g_rtao_shader_mutex);
             g_rtao_vertex_shaders[pipeline.handle] = info;
+            g_rtao_vertex_shader_hashes[pipeline.handle] = hash;
          }
          else if (subobject.type == reshade::api::pipeline_subobject_type::input_layout && subobject.data)
          {
@@ -1639,6 +1654,7 @@ public:
          return;
       const std::unique_lock lock(g_rtao_shader_mutex);
       g_rtao_vertex_shaders.erase(pipeline.handle);
+      g_rtao_vertex_shader_hashes.erase(pipeline.handle);
       g_rtao_input_layouts.erase(pipeline.handle);
    }
 
@@ -1672,6 +1688,31 @@ public:
       return true;
    }
 
+   // Logs an uncaptured main view draw once per (vertex shader, reason), so the log names what is missing
+   static void LogRTAOUncaptured(ID3D11DeviceContext* context, const char* reason, const char* detail = nullptr)
+   {
+      com_ptr<ID3D11VertexShader> vs;
+      context->VSGetShader(&vs, nullptr, nullptr);
+      uint32_t hash = 0;
+      {
+         const std::shared_lock lock(g_rtao_shader_mutex);
+         auto it = g_rtao_vertex_shader_hashes.find(uint64_t(uintptr_t(vs.get())));
+         if (it != g_rtao_vertex_shader_hashes.end())
+            hash = it->second;
+      }
+      const uint64_t key = (uint64_t(hash) << 32) ^ uint64_t(uintptr_t(reason));
+      {
+         const std::lock_guard lock(g_rtao_diag_mutex);
+         if (g_rtao_diag_logged.size() >= 200 || !g_rtao_diag_logged.insert(key).second)
+            return;
+      }
+      com_ptr<ID3D11PixelShader> ps;
+      context->PSGetShader(&ps, nullptr, nullptr);
+      char buffer[256];
+      snprintf(buffer, sizeof(buffer), "RTAO: not captured: VS 0x%08X (PS object %p): %s%s%s", hash, (void*)ps.get(), reason, detail ? " " : "", detail ? detail : "");
+      reshade::log::message(reshade::log::level::info, buffer);
+   }
+
    static bool OnRTAODrawIndexed(reshade::api::command_list* cmd_list, uint32_t index_count, uint32_t instance_count, uint32_t first_index, int32_t vertex_offset, uint32_t first_instance)
    {
       if (!g_rtao_capture_active.load(std::memory_order_relaxed))
@@ -1687,6 +1728,9 @@ public:
       if (topology != D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST)
       {
          g_rtao_draws_not_triangle_list++;
+         char detail[48];
+         snprintf(detail, sizeof(detail), "(topology %d, %u indices, %u instances)", int(topology), index_count, instance_count);
+         LogRTAOUncaptured(context, "not a triangle list", detail);
          return false;
       }
 
@@ -1712,8 +1756,11 @@ public:
       g_rtao_draws_by_source[(std::min)(uint32_t(vs_info.source), 4u)]++;
       if (vs_info.source == RTAO::MatrixSource::None)
       {
-         const std::lock_guard lock(g_rtao_skip_reason_mutex);
-         g_rtao_skip_reasons[vs_info.skip_reason ? vs_info.skip_reason : "unknown"]++;
+         {
+            const std::lock_guard lock(g_rtao_skip_reason_mutex);
+            g_rtao_skip_reasons[vs_info.skip_reason ? vs_info.skip_reason : "unknown"]++;
+         }
+         LogRTAOUncaptured(context, vs_info.skip_reason ? vs_info.skip_reason : "unknown");
          return false;
       }
       if (!layout_info.has_position || layout_info.position_per_instance)
@@ -1776,8 +1823,17 @@ public:
       draw.per_view_cb = per_view_cb.get();
 
       auto& device_data = *device->get_private_data<DeviceData>();
-      if (device_data.game)
-         GetGameDeviceData(device_data).rtao_capture.CaptureDraw(context, draw);
+      if (device_data.game && !GetGameDeviceData(device_data).rtao_capture.CaptureDraw(context, draw))
+      {
+         D3D11_BUFFER_DESC vb_desc = {}, ib_desc = {};
+         if (vertex_buffer)
+            vertex_buffer->GetDesc(&vb_desc);
+         if (index_buffer)
+            index_buffer->GetDesc(&ib_desc);
+         char detail[96];
+         snprintf(detail, sizeof(detail), "(VB usage %d, IB usage %d, position format %d, index format %d)", int(vb_desc.Usage), int(ib_desc.Usage), int(layout_info.position_format), int(index_format));
+         LogRTAOUncaptured(context, "capture refused", detail);
+      }
       return false;
    }
 

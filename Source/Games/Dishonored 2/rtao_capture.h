@@ -65,8 +65,9 @@ namespace RTAO
       uint32_t per_view_cb_slot = kNoOffset; // PerViewCB
       uint32_t view_proj_cb = kNoOffset; // cb_viewprojectionmatrix in PerViewCB, bytes
    };
-   // Uses D3DReflect (D3DCompiler_47.dll, loaded on first use)
-   bool ReflectVertexShader(const void* code, size_t code_size, VertexShaderInfo& out);
+   // Uses D3DReflect (D3DCompiler_47.dll, loaded on first use). "input_signature", if given, receives the input
+   // semantics (diagnostics).
+   bool ReflectVertexShader(const void* code, size_t code_size, VertexShaderInfo& out, std::string* input_signature = nullptr);
 
    struct InputLayoutInfo
    {

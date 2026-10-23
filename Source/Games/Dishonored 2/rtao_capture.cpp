@@ -89,7 +89,7 @@ namespace RTAO
 
    // ---- Reflection
 
-   bool ReflectVertexShader(const void* code, size_t code_size, VertexShaderInfo& out)
+   bool ReflectVertexShader(const void* code, size_t code_size, VertexShaderInfo& out, std::string* input_signature)
    {
       out = {};
       auto reflect = GetD3DReflect();
@@ -114,6 +114,12 @@ namespace RTAO
          reflection->GetInputParameterDesc(i, &parameter);
          if (!parameter.SemanticName)
             continue;
+         if (input_signature)
+         {
+            char item[96];
+            snprintf(item, sizeof(item), "%s%s%u", input_signature->empty() ? "" : " ", parameter.SemanticName, parameter.SemanticIndex);
+            *input_signature += item;
+         }
          if (_stricmp(parameter.SemanticName, "VERTEX_SKININDICES") == 0)
          {
             out.skip_reason = "skinned";

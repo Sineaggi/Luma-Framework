@@ -200,6 +200,9 @@ namespace RTAO
       Stream skin_indices[2];
       Stream skin_weights[2];
       ID3D11ShaderResourceView* bones = nullptr; // The bound ro_matrices
+      // Changes whenever the game rewrote (Map DISCARD, on the recording thread) a buffer behind the draw's per instance
+      // bindings, so a draw only counts as a duplicate of an earlier one if its data can't have changed in between
+      uint64_t binding_version = 0;
    };
 
    struct CaptureStats
@@ -227,6 +230,9 @@ namespace RTAO
       uint64_t tlas_instances = 0;
       // Foliage: captured draws/instances of wind (vertex animated) and alpha tested (cutout) draws, cutouts read back last frame
       uint64_t wind_draws = 0, wind_instances = 0, cutout_draws = 0, cutout_instances = 0, frame_cutout_instances = 0;
+      // Skipped as duplicates of a draw captured earlier in the frame (same mesh and per instance bindings, e.g. the depth
+      // prepass and the G-buffer pass drawing the same objects): static draws, per frame (skinned/dynamic) meshes
+      uint64_t dedup_draws = 0, dedup_frame_meshes = 0;
    };
    enum CaptureSkip
    {
@@ -246,6 +252,8 @@ namespace RTAO
       // Skinned draws / draws with a DYNAMIC vertex buffer are captured only while these are set
       std::atomic<bool> skinning_enabled = true;
       std::atomic<bool> dynamic_enabled = true;
+      // Draws with the same identity as one captured earlier in the frame are skipped (see CaptureStats::dedup_draws)
+      std::atomic<bool> dedup_enabled = true;
       bool IsInitialized() const { return ring11 != nullptr; }
       void Shutdown();
 
@@ -327,7 +335,7 @@ namespace RTAO
 
       bool EnsureBufferCopy(ID3D11DeviceContext* context, ID3D11Buffer* buffer, bool vertex, std::vector<Rec>& records);
       // Skinned or dynamic vertex buffer draws: world space vertices for this frame (see the header comment)
-      bool CaptureFrameDraw(ID3D11DeviceContext* context, const DrawInfo& draw, uint64_t key, uint64_t index_start, uint32_t index_size, bool dynamic_vertices);
+      bool CaptureFrameDraw(ID3D11DeviceContext* context, const DrawInfo& draw, uint64_t key, uint64_t identity, uint64_t index_start, uint32_t index_size, bool dynamic_vertices);
       void CommitLocked(std::vector<Rec>& records);
       void QueueLocked(ID3D11DeviceContext* context, std::vector<Rec>& local);
 
@@ -364,6 +372,7 @@ namespace RTAO
       std::unordered_map<uint64_t, MeshEntry> meshes;
       std::vector<uint64_t> evictions;
       std::unordered_map<ID3D11DeviceContext*, std::vector<Rec>> context_records;
+      std::unordered_set<uint64_t> frame_identities; // Draws captured this frame (dedup), cleared at OnPresent
       struct ListRecords
       {
          std::vector<Rec> records;

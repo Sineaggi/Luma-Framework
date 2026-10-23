@@ -187,3 +187,40 @@ Texture exact path (not implemented): the coverage the game really uses is `diff
   sample the slice (point/bilinear, LOD 0 or a ray cone LOD), `CommitNonOpaqueTriangleHit()` if alpha >= reference.
   Cost: a few dependent loads per candidate; the stochastic version stays as the fallback for materials without a
   slice.
+
+## Performance (rtao-perf)
+
+In game (Karnaca docks, 3440x1440, RTX 4090) the RT pass took 2.29 ms (indoors ~0.8). The standalone benchmark
+(`Tests/rtao_interop_test.exe bench`: a street of 2821 instances, 652 of them foliage cutouts of 250 to 1200 overlapping
+leaf cards, 1M triangles, depth rasterized by D3D11, medians over 60 frames) splits the old pass (High, 4 rays) into
+TLAS build 0.17 ms, trace 0.86 ms (0.69 with cutouts forced opaque, 0.50 with them masked out: the per crossing
+candidate loop costs ~0.2 to 0.4 ms there), denoise 0.18 ms.
+- TLAS build: ~0.03 ms fixed + ~0.05 ms per 1000 instances; neither FAST_TRACE nor a default heap copy of the instance
+  descs helps. Not touched (distance culling would need instance bounds the CPU doesn't have).
+- Denoise: the 3x3 neighbourhood (raw value + world position from depth) is loaded once per 8x8 group into groupshared
+  memory instead of 9 times per pixel: 0.18 -> 0.14 ms, same output.
+- "RTAO Quality" (config `RTAOQuality`, default Low): Low traces "RTAO Rays" at one pixel per 2x2 block (position
+  cycling over 4 frames, `kTraceJitter`), and the denoiser's bilateral (plus a 1.5 px gaussian) upsamples it; Medium
+  traces every pixel with half the rays; High is the old pass. Bench totals: High 1.22 ms, Medium 0.73, Low 0.53. Mean
+  abs error of the denoised AO against a 128 ray reference: High 0.0203 static / 0.0251 after a camera move, Medium
+  0.0224 / 0.0272, Low 0.0205 / 0.0250 (and the least frame to frame flicker): the denoiser hides the lower ray count,
+  Low only looks a bit softer on fine detail. Debug outputs (raw, coverage) always trace at full resolution.
+- "Fast cutouts" (config `RTAOFastCutouts`, default off): one coin per ray instead of one per crossed cutout triangle
+  (the ray treats all cutouts as solid with probability 1 - (1 - opacity)^2, else masks them out), so traversal never
+  returns candidates: trace 0.86 -> 0.64 ms at High, 0.22 -> 0.17 at Low. Error 0.0203 -> 0.0250: thin single layers
+  occlude a bit more, dense canopies a bit less than per crossing.
+- GPU time split: GpuTimer::Mark; the UI ("RTAO stats") and the periodic log show capture / TLAS / trace / denoise.
+
+### Duplicate draws (dedup, config `RTAODedup`, default on)
+
+With "All depth writing draws", an object drawn by the depth prepass and again by a depth writing G-buffer pass was
+captured twice: two matrix dispatches on the game's thread, two readback entries (merged by the TLAS key anyway) and,
+for skinned/dynamic meshes, two skinning dispatches and two per frame BLASes at the same place. A draw is now skipped if
+one with the same identity was captured earlier in the frame: mesh key + bound PerInstanceCB (object, first/num
+constants) + instance buffer and index SRVs + PerViewCB (MVP family) + bone palette SRV + instance count + cutout flag +
+a binding version. The version guards against a buffer the game rewrites between draws (a small per draw cbuffer
+updated with Map DISCARD would otherwise make every draw of the mesh look the same): main.cpp's map hook gives each
+Map(WRITE_DISCARD) a unique id, kept per recording thread, and the draw mixes in the ids of its vertex buffer, cbuffers
+and the resources behind its SRVs. Not covered: buffers rewritten with UpdateSubresource/copies, or by another thread
+between the two draws (a ring wrapping mid frame); the worst case is an object missing for that frame (retention hides
+it for static objects). Counted in "RTAO stats" and the log ("per frame duplicates skipped").

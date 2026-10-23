@@ -7,6 +7,8 @@
 // Build (x64 Native Tools prompt, from this folder):
 //   cl /nologo /std:c++20 /EHsc /O2 /I.. rtao_interop_test.cpp ..\rtao_interop.cpp ..\rtao_accel.cpp ..\rtao_pass.cpp ..\rtao_capture.cpp d3d11.lib d3dcompiler.lib
 // Run from this folder (it reads the shaders by relative path): rtao_interop_test.exe
+// Benchmark (no debug layer): rtao_interop_test.exe bench [folder for .pgm images], RTAO_BENCH_FILTER=<name part> to
+// run only some configurations (see RunBenchmark / BenchConfigs).
 
 #ifndef NOMINMAX
 #define NOMINMAX
@@ -907,9 +909,17 @@ static void TestGeometryCapture(ID3D11Device* device, ID3D11DeviceContext* conte
    settings.cam_fwd[0] = f.x; settings.cam_fwd[1] = f.y; settings.cam_fwd[2] = f.z;
 
    uint32_t last_tlas_cutouts = 0;
+   bool repeat_draws = false; // Another pass drawing the direct family again, once as is and once with rewritten bindings
    auto run_frame = [&](RTAO::FilterMode filter_mode, uint32_t debug_mode) {
       // The "game" draws: two families on the immediate context, the third (and the view model) on a deferred one
       CHECK(capture.CaptureDraw(context, draw_direct), "capture (direct)");
+      if (repeat_draws)
+      {
+         CHECK(capture.CaptureDraw(context, draw_direct), "repeated draw");
+         RTAO::DrawInfo rewritten = draw_direct;
+         rewritten.binding_version = 7;
+         CHECK(capture.CaptureDraw(deferred, rewritten), "draw with rewritten per instance data");
+      }
       CHECK(capture.CaptureDraw(context, draw_indexed), "capture (indexed)");
       CHECK(capture.CaptureDraw(context, draw_mvp), "capture (MVP only)");
       CHECK(capture.CaptureDraw(context, draw_cutout), "capture (cutout, wind)");
@@ -949,7 +959,7 @@ static void TestGeometryCapture(ID3D11Device* device, ID3D11DeviceContext* conte
          if (!tlas.Build(ctx, blases, info.frame_slot, top, count, err))
             return false;
          last_tlas_cutouts = tlas.LastCutoutCount();
-         if (!pass.Record(list, info, top, settings, retirer, err))
+         if (!pass.Record(list, info, top, settings, retirer, err, &timer))
             return false;
          timer.End(list, info.frame_slot);
          return true;
@@ -1017,6 +1027,24 @@ static void TestGeometryCapture(ID3D11Device* device, ID3D11DeviceContext* conte
    const float near_mvp = average(raw, is_near_mvp_box, c[5]);
    printf("next to the MVP family box: %.3f (%d px)\n", near_mvp, c[5]);
    CHECK(c[5] > 5 && near_mvp < 0.8f, "MVP family box occludes");
+   CHECK(timer.LastSpanCount() == 2 && timer.LastSpanMs(0) > 0.0 && std::fabs(timer.LastSpanMs(0) + timer.LastSpanMs(1) - timer.LastMs()) < 1e-6,
+      "GPU timer: the pass marks the end of the trace (2 spans that add up, got %u)", timer.LastSpanCount());
+
+   // Dedup: a repeat of a draw in the same frame (same mesh and bindings) is skipped, one whose per instance data was
+   // rewritten in between (another binding version) is captured
+   {
+      const RTAO::CaptureStats before = capture.GetStats();
+      repeat_draws = true;
+      for (int i = 0; i < 4; i++)
+         raw = run_frame(RTAO::FilterMode::Off, 0);
+      repeat_draws = false;
+      const RTAO::CaptureStats after = capture.GetStats();
+      printf("dedup: %llu repeated draws skipped in 4 frames, %llu captured, TLAS instances %llu\n", (unsigned long long)(after.dedup_draws - before.dedup_draws),
+         (unsigned long long)(after.draws_captured - before.draws_captured), (unsigned long long)after.tlas_instances);
+      CHECK(after.dedup_draws - before.dedup_draws == 4, "one repeated draw per frame skipped");
+      CHECK(after.draws_captured - before.draws_captured == 4 * 7, "6 draws + the rewritten one captured per frame");
+      CHECK(after.tlas_instances == kBoxCount, "same TLAS (got %llu)", (unsigned long long)after.tlas_instances);
+   }
 
    // BLAS coverage debug: the captured geometry must line up with the depth
    std::vector<float> coverage = run_frame(RTAO::FilterMode::Off, 3);
@@ -1059,6 +1087,61 @@ static void TestGeometryCapture(ID3D11Device* device, ID3D11DeviceContext* conte
    CHECK(near_cutout[0] > 0.97f, "opacity 0 must leave the cutout box out");
    CHECK(near_cutout[2] < 0.8f, "opacity 1 must make the cutout box solid");
    CHECK(near_cutout[1] < near_cutout[0] - 0.03f && near_cutout[1] > near_cutout[2] + 0.03f, "opacity 0.5 must occlude between no box and a solid box");
+
+   // Fast cutouts (one coin per ray, no candidate loop): also partial
+   {
+      settings.cutout_mode = 2;
+      double sum = 0;
+      int count = 0;
+      for (int frame = 0; frame < 16; frame++)
+         sum += average(run_frame(RTAO::FilterMode::Off, 0), is_near_cutout, count);
+      settings.cutout_mode = 0;
+      const float fast = float(sum / 16);
+      printf("fast cutouts, opacity 0.5: next to the cutout box %.3f\n", fast);
+      CHECK(fast < near_cutout[0] - 0.03f && fast > near_cutout[2] + 0.03f, "fast cutouts at 0.5 must occlude between no box and a solid box");
+   }
+
+   // Quality Low (half resolution trace + upsample in the denoiser) converges to about the full resolution result
+   {
+      settings.half_res = false;
+      settings.reset_history = true;
+      std::vector<float> full, half;
+      for (int frame = 0; frame < 32; frame++)
+      {
+         full = run_frame(RTAO::FilterMode::Temporal, 0);
+         settings.reset_history = false;
+      }
+      settings.half_res = true;
+      settings.reset_history = true;
+      for (int frame = 0; frame < 32; frame++)
+      {
+         half = run_frame(RTAO::FilterMode::Temporal, 0);
+         settings.reset_history = false;
+      }
+      settings.half_res = false;
+      int count = 0;
+      const float full_corner = average(full, is_corner, count), half_corner = average(half, is_corner, count);
+      const float full_under = average(full, is_under_floating, count), half_under = average(half, is_under_floating, count);
+      const float half_open = average(half, is_open_ground, count), half_sky = average(half, is_sky, count);
+      double diff = 0;
+      int geometry = 0;
+      bool finite = true;
+      for (UINT i = 0; i < W * H; i++)
+      {
+         finite = finite && std::isfinite(half[i]) && half[i] >= 0.f && half[i] <= 1.f;
+         if (hit_id[i] >= 0)
+         {
+            diff += std::fabs(half[i] - full[i]);
+            geometry++;
+         }
+      }
+      printf("quality low (half res, 32 frames): wall corner %.3f (full res %.3f), under the floating box %.3f (%.3f), open ground %.3f, sky %.3f, mean abs diff to full res %.4f\n", half_corner, full_corner,
+         half_under, full_under, half_open, half_sky, diff / std::max(geometry, 1));
+      CHECK(finite, "half resolution AO must be finite and in [0, 1]");
+      CHECK(std::fabs(half_corner - full_corner) < 0.06f && std::fabs(half_under - full_under) < 0.06f, "half resolution must match full resolution in the corners");
+      CHECK(half_open > 0.97f && half_sky > 0.999f, "half resolution: open ground and sky unoccluded");
+      CHECK(diff / std::max(geometry, 1) < 0.03, "half resolution close to full resolution overall");
+   }
 
    CHECK(interop.WaitForIdle(5000), "WaitForIdle");
    retirer.ReleaseAll();
@@ -1445,6 +1528,7 @@ static void TestFrameMeshes(ID3D11Device* device, ID3D11DeviceContext* context, 
    settings.cam_fwd[0] = f.x; settings.cam_fwd[1] = f.y; settings.cam_fwd[2] = f.z;
 
    uint32_t tlas_count = 0;
+   bool repeat_draws = false; // Draws two of the per frame meshes a second time (another pass): skipped as duplicates
    auto run_frame = [&](int pose, uint32_t debug_mode) {
       // The pose: bones (DEFAULT buffer) and the dynamic vertices (Map discard), as the game would update them
       palette = make_palette(pose);
@@ -1470,6 +1554,11 @@ static void TestFrameMeshes(ID3D11Device* device, ID3D11DeviceContext* context, 
       CHECK(!capture.CaptureDraw(context, draw_instanced), "an instanced skinned draw must be skipped");
       CHECK(capture.CaptureDraw(context, draw_dynamic), "capture (dynamic vertex buffer)");
       CHECK(capture.CaptureDraw(deferred, draw2), "capture (skinned, MVP only, deferred)");
+      if (repeat_draws)
+      {
+         CHECK(capture.CaptureDraw(context, draw1), "repeated skinned draw");
+         CHECK(capture.CaptureDraw(deferred, draw_dynamic), "repeated dynamic draw (other context)");
+      }
       ID3D11CommandList* command_list = nullptr;
       deferred->FinishCommandList(FALSE, &command_list);
       capture.OnFinishCommandList(deferred, command_list);
@@ -1577,6 +1666,19 @@ static void TestFrameMeshes(ID3D11Device* device, ID3D11DeviceContext* context, 
       CHECK(frame_hits > 500 && matched > hits * 0.98 && frame_matched > frame_hits * 0.98, "per frame meshes must line up with the depth (pose %d)", pose);
    }
 
+   // Repeated draws in a frame: no second skinning dispatch, no second per frame BLAS
+   {
+      const RTAO::CaptureStats before = capture.GetStats();
+      repeat_draws = true;
+      run_frame(0, 0);
+      repeat_draws = false;
+      const RTAO::CaptureStats after = capture.GetStats();
+      printf("frame meshes dedup: %llu repeated draws skipped, last frame %llu per frame meshes, TLAS %u\n", (unsigned long long)(after.dedup_frame_meshes - before.dedup_frame_meshes),
+         (unsigned long long)after.frame_draws, tlas_count);
+      CHECK(after.dedup_frame_meshes - before.dedup_frame_meshes == 2, "the 2 repeated per frame draws must be skipped");
+      CHECK(after.skinned_captured - before.skinned_captured == 3 && after.frame_draws == 4 && tlas_count == 5, "no duplicate per frame BLAS");
+   }
+
    CHECK(interop.WaitForIdle(5000), "WaitForIdle");
    retirer.ReleaseAll();
    pass.Shutdown(nullptr, 0);
@@ -1588,9 +1690,486 @@ static void TestFrameMeshes(ID3D11Device* device, ID3D11DeviceContext* context, 
       p->Release();
 }
 
-int main()
+// ---- Benchmark ("rtao_interop_test.exe bench", without RTAO_D3D12_DEBUG): a heavy synthetic street at 3440x1440
+// (Karnaca docks like: ~2900 TLAS instances, ~650 of them foliage cutouts made of thousands of overlapping leaf cards),
+// depth rasterized by D3D11, then BLAS/TLAS + the AO pass. Prints the GPU time per span (TLAS build, trace, filter)
+// and, per configuration, the error of the denoised AO against a 128 ray reference (static and moving camera).
+
+struct BenchMesh
+{
+   std::vector<float> positions;
+   std::vector<uint32_t> indices;
+};
+
+static uint32_t BenchRand(uint32_t& state)
+{
+   state = state * 1664525u + 1013904223u;
+   return state >> 8;
+}
+static float BenchRandF(uint32_t& state) { return float(BenchRand(state) & 0xFFFF) / 65535.f; }
+static V3 Add(V3 a, V3 b) { return { a.x + b.x, a.y + b.y, a.z + b.z }; }
+static V3 Scale(V3 a, float s) { return { a.x * s, a.y * s, a.z * s }; }
+
+// Leaf cards: "count" random quads of half size [h0, h1], centers in an ellipsoid of radii "r" around "center"
+static BenchMesh MakeFoliage(uint32_t seed, uint32_t count, V3 center, V3 r, float h0, float h1)
+{
+   BenchMesh mesh;
+   uint32_t s = seed;
+   for (uint32_t i = 0; i < count; i++)
+   {
+      V3 p;
+      do
+         p = { BenchRandF(s) * 2 - 1, BenchRandF(s) * 2 - 1, BenchRandF(s) * 2 - 1 };
+      while (Dot(p, p) > 1.f);
+      p = Add(center, { p.x * r.x, p.y * r.y, p.z * r.z });
+      V3 d1 = Normalize({ BenchRandF(s) * 2 - 1, BenchRandF(s) * 2 - 1, BenchRandF(s) * 2 - 1 });
+      V3 d2 = Normalize(Cross(d1, Normalize({ BenchRandF(s) * 2 - 1, BenchRandF(s) * 2 - 1, BenchRandF(s) * 2 - 1 })));
+      const float h = h0 + (h1 - h0) * BenchRandF(s);
+      d1 = Scale(d1, h);
+      d2 = Scale(d2, h);
+      const uint32_t base = uint32_t(mesh.positions.size() / 3);
+      const V3 corners[4] = { Sub(Sub(p, d1), d2), Sub(Add(p, d1), d2), Add(Add(p, d1), d2), Add(Sub(p, d1), d2) };
+      for (const V3& c : corners)
+         mesh.positions.insert(mesh.positions.end(), { c.x, c.y, c.z });
+      mesh.indices.insert(mesh.indices.end(), { base, base + 1, base + 2, base, base + 2, base + 3 });
+   }
+   return mesh;
+}
+
+static void WritePgm(const char* path, const std::vector<float>& image, UINT w, UINT h, UINT x0, UINT y0, UINT cw, UINT ch)
+{
+   FILE* file = fopen(path, "wb");
+   if (!file)
+      return;
+   fprintf(file, "P5\n%u %u\n255\n", cw, ch);
+   std::vector<uint8_t> row(cw);
+   for (UINT y = y0; y < y0 + ch && y < h; y++)
+   {
+      for (UINT x = 0; x < cw; x++)
+         row[x] = uint8_t(std::clamp(image[y * w + std::min(x0 + x, w - 1)], 0.f, 1.f) * 255.f + 0.5f);
+      fwrite(row.data(), 1, cw, file);
+   }
+   fclose(file);
+}
+
+struct BenchConfig
+{
+   const char* name;
+   RTAO::PassSettings settings; // Camera fields are filled per frame
+};
+
+static void RunBenchmark(ID3D11Device* device, ID3D11DeviceContext* context, RTAO::Interop& interop, ID3D11VertexShader* copy_vs, ID3D11PixelShader* depth_ps, const std::vector<BenchConfig>& configs, const char* image_dir)
+{
+   std::string error;
+   const UINT W = 3440, H = 1440;
+   CHECK(interop.EnsureTargets(device, W, H, W, H, error), "EnsureTargets: %s", error.c_str());
+
+   // Meshes: 0 cube (buildings, details, crates, trunks, ground), 1 tree canopy, 2 bush
+   std::vector<BenchMesh> meshes(3);
+   meshes[0].positions.assign(kCubeVertices, kCubeVertices + 24);
+   meshes[0].indices.assign(kCubeIndices, kCubeIndices + 36);
+   meshes[1] = MakeFoliage(1, 1200, { 0, 5, 0 }, { 2.6f, 2.f, 2.6f }, 0.3f, 0.45f);
+   meshes[2] = MakeFoliage(2, 250, { 0, 0.7f, 0 }, { 0.9f, 0.7f, 0.9f }, 0.15f, 0.25f);
+
+   struct Instance
+   {
+      uint32_t mesh;
+      float xform[3][4];
+      bool cutout;
+   };
+   std::vector<Instance> instances;
+   auto add_box = [&](V3 mn, V3 mx) {
+      Instance in = { 0, { { mx.x - mn.x, 0, 0, mn.x }, { 0, mx.y - mn.y, 0, mn.y }, { 0, 0, mx.z - mn.z, mn.z } }, false };
+      instances.push_back(in);
+   };
+   auto add_mesh = [&](uint32_t mesh, V3 at, float yaw, float scale, bool cutout) {
+      const float c = std::cos(yaw) * scale, s = std::sin(yaw) * scale;
+      Instance in = { mesh, { { c, 0, s, at.x }, { 0, scale, 0, at.y }, { -s, 0, c, at.z } }, cutout };
+      instances.push_back(in);
+   };
+   // Streets every P along x and z (6 m wide), 10 x 10 blocks of buildings with balconies, crates along the walls,
+   // trees on both sidewalks of the streets running along x, bushes at the walls
+   uint32_t seed = 7;
+   const float P = 16.f;
+   add_box({ -40, -1, -40 }, { 10 * P + 40, 0, 10 * P + 40 });
+   for (int bx = 0; bx < 10; bx++)
+      for (int bz = 0; bz < 10; bz++)
+      {
+         const float x0 = bx * P + 3, z0 = bz * P + 3, height = 6 + 10 * BenchRandF(seed);
+         add_box({ x0, 0, z0 }, { x0 + 10, height, z0 + 10 });
+         for (int d = 0; d < 6; d++)
+         {
+            const float y = 2.5f + d * 1.5f, x = x0 + 1 + 7 * BenchRandF(seed);
+            if (y < height)
+               add_box({ x, y, z0 - 0.8f }, { x + 1.6f, y + 0.15f, z0 });
+         }
+         for (int c = 0; c < 12; c++)
+         {
+            const float x = x0 + 10 * BenchRandF(seed), size = 0.5f + 0.7f * BenchRandF(seed);
+            const float z = BenchRandF(seed) < 0.5f ? z0 - 0.3f - size : z0 + 10.3f;
+            add_box({ x, 0, z }, { x + size, size, z + size });
+         }
+         for (int b = 0; b < 3; b++)
+            add_mesh(2, { x0 + 10 * BenchRandF(seed), 0, BenchRandF(seed) < 0.5f ? z0 - 0.6f : z0 + 10.6f }, 6.28f * BenchRandF(seed), 0.8f + 0.5f * BenchRandF(seed), true);
+      }
+   for (int street = 0; street <= 10; street++)
+      for (int side = 0; side < 2; side++)
+         for (float x = 1.5f; x < 10 * P; x += 10.f)
+         {
+            const V3 at = { x + 2 * BenchRandF(seed), 0, street * P + (side ? 2.f : -2.f) };
+            add_box({ at.x - 0.15f, 0, at.z - 0.15f }, { at.x + 0.15f, 3.5f, at.z + 0.15f });
+            add_mesh(1, at, 6.28f * BenchRandF(seed), 0.8f + 0.4f * BenchRandF(seed), true);
+         }
+   uint32_t cutouts = 0;
+   size_t triangles = 0;
+   for (const Instance& in : instances)
+   {
+      cutouts += in.cutout;
+      triangles += meshes[in.mesh].indices.size() / 3;
+   }
+   printf("bench scene: %zu instances (%u cutouts), %zu triangles, %ux%u\n", instances.size(), cutouts, triangles, W, H);
+
+   // D3D11 depth: every instance's triangles pre-transformed into one buffer, reversed Z
+   std::vector<float> world;
+   world.reserve(triangles * 9);
+   for (const Instance& in : instances)
+      for (uint32_t index : meshes[in.mesh].indices)
+      {
+         const float* p = &meshes[in.mesh].positions[index * 3];
+         for (int r = 0; r < 3; r++)
+            world.push_back(in.xform[r][0] * p[0] + in.xform[r][1] * p[1] + in.xform[r][2] * p[2] + in.xform[r][3]);
+      }
+   ID3D11Buffer* world_vb = MakeBuffer(device, D3D11_BIND_VERTEX_BUFFER, world.data(), UINT(world.size() * 4));
+   const char* vs_source = "cbuffer C : register(b0) { row_major float4x4 VP; }; float4 main(float3 p : POSITION) : SV_Position { return mul(float4(p, 1), VP); }";
+   ID3DBlob* vs_blob = nullptr;
+   ID3DBlob* vs_errors = nullptr;
+   D3DCompile(vs_source, strlen(vs_source), "bench_vs", nullptr, nullptr, "main", "vs_5_0", 0, 0, &vs_blob, &vs_errors);
+   if (!vs_blob)
+   {
+      printf("bench VS: %s\n", vs_errors ? (const char*)vs_errors->GetBufferPointer() : "?");
+      g_failures++;
+      return;
+   }
+   ID3D11VertexShader* bench_vs = nullptr;
+   device->CreateVertexShader(vs_blob->GetBufferPointer(), vs_blob->GetBufferSize(), nullptr, &bench_vs);
+   const D3D11_INPUT_ELEMENT_DESC element = { "POSITION", 0, DXGI_FORMAT_R32G32B32_FLOAT, 0, 0, D3D11_INPUT_PER_VERTEX_DATA, 0 };
+   ID3D11InputLayout* layout = nullptr;
+   device->CreateInputLayout(&element, 1, vs_blob->GetBufferPointer(), vs_blob->GetBufferSize(), &layout);
+   vs_blob->Release();
+   D3D11_TEXTURE2D_DESC depth_desc = { W, H, 1, 1, DXGI_FORMAT_R32_TYPELESS, { 1, 0 }, D3D11_USAGE_DEFAULT, D3D11_BIND_DEPTH_STENCIL | D3D11_BIND_SHADER_RESOURCE, 0, 0 };
+   ID3D11Texture2D* depth_texture = nullptr;
+   device->CreateTexture2D(&depth_desc, nullptr, &depth_texture);
+   D3D11_DEPTH_STENCIL_VIEW_DESC dsv_desc = {};
+   dsv_desc.Format = DXGI_FORMAT_D32_FLOAT;
+   dsv_desc.ViewDimension = D3D11_DSV_DIMENSION_TEXTURE2D;
+   ID3D11DepthStencilView* dsv = nullptr;
+   device->CreateDepthStencilView(depth_texture, &dsv_desc, &dsv);
+   D3D11_SHADER_RESOURCE_VIEW_DESC srv_desc = {};
+   srv_desc.Format = DXGI_FORMAT_R32_FLOAT;
+   srv_desc.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D;
+   srv_desc.Texture2D.MipLevels = 1;
+   ID3D11ShaderResourceView* depth_srv = nullptr;
+   device->CreateShaderResourceView(depth_texture, &srv_desc, &depth_srv);
+   D3D11_DEPTH_STENCIL_DESC ds_desc = {};
+   ds_desc.DepthEnable = TRUE;
+   ds_desc.DepthWriteMask = D3D11_DEPTH_WRITE_MASK_ALL;
+   ds_desc.DepthFunc = D3D11_COMPARISON_GREATER;
+   ID3D11DepthStencilState* ds_state = nullptr;
+   device->CreateDepthStencilState(&ds_desc, &ds_state);
+   D3D11_RASTERIZER_DESC rs_desc = {};
+   rs_desc.FillMode = D3D11_FILL_SOLID;
+   rs_desc.CullMode = D3D11_CULL_NONE;
+   rs_desc.DepthClipEnable = TRUE;
+   ID3D11RasterizerState* rs_state = nullptr;
+   device->CreateRasterizerState(&rs_desc, &rs_state);
+   D3D11_BUFFER_DESC cb_desc = { 64, D3D11_USAGE_DEFAULT, D3D11_BIND_CONSTANT_BUFFER, 0, 0, 0 };
+   ID3D11Buffer* vp_cb = nullptr;
+   device->CreateBuffer(&cb_desc, nullptr, &vp_cb);
+   D3D11_TEXTURE2D_DESC staging_desc = depth_desc;
+   staging_desc.Usage = D3D11_USAGE_STAGING;
+   staging_desc.BindFlags = 0;
+   staging_desc.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+   ID3D11Texture2D* depth_staging = nullptr;
+   device->CreateTexture2D(&staging_desc, nullptr, &depth_staging);
+
+   struct Camera
+   {
+      Mat4 view_proj, inv_view_proj;
+      V3 eye, fwd;
+   };
+   // Street level, looking down a tree lined street; "t" moves the camera forward and turns it a little
+   auto make_camera = [&](float t) {
+      Camera cam;
+      cam.eye = { 20 + t * 0.04f, 1.7f, 5 * P + 0.5f };
+      const float yaw = 0.15f + t * 0.004f;
+      const V3 target = Add(cam.eye, { std::cos(yaw), -0.12f, std::sin(yaw) });
+      const V3 up = { 0, 1, 0 };
+      const V3 f = Normalize(Sub(target, cam.eye)), r = Normalize(Cross(up, f)), u = Cross(f, r);
+      cam.fwd = f;
+      Mat4 view;
+      view(0, 0) = r.x; view(0, 1) = u.x; view(0, 2) = f.x;
+      view(1, 0) = r.y; view(1, 1) = u.y; view(1, 2) = f.y;
+      view(2, 0) = r.z; view(2, 1) = u.z; view(2, 2) = f.z;
+      view(3, 0) = -Dot(r, cam.eye); view(3, 1) = -Dot(u, cam.eye); view(3, 2) = -Dot(f, cam.eye); view(3, 3) = 1;
+      const float n = 0.1f, fr = 2000.f, sy = 1.f / std::tan(0.5f * 1.0f), sx = sy / (float(W) / float(H));
+      Mat4 proj;
+      proj(0, 0) = sx;
+      proj(1, 1) = sy;
+      proj(2, 2) = -n / (fr - n);
+      proj(2, 3) = 1;
+      proj(3, 2) = n * fr / (fr - n);
+      cam.view_proj = Mul(view, proj);
+      cam.inv_view_proj = Inverse(cam.view_proj);
+      return cam;
+   };
+   std::vector<uint8_t> sky_mask; // Of the last rasterized camera
+   auto rasterize = [&](const Camera& cam, bool read_mask) {
+      context->UpdateSubresource(vp_cb, 0, nullptr, cam.view_proj.m, 0, 0);
+      context->ClearDepthStencilView(dsv, D3D11_CLEAR_DEPTH, 0.f, 0);
+      D3D11_VIEWPORT viewport = { 0, 0, (float)W, (float)H, 0, 1 };
+      context->RSSetViewports(1, &viewport);
+      context->RSSetState(rs_state);
+      context->OMSetDepthStencilState(ds_state, 0);
+      context->OMSetRenderTargets(0, nullptr, dsv);
+      context->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+      context->IASetInputLayout(layout);
+      const UINT stride = 12, offset = 0;
+      context->IASetVertexBuffers(0, 1, &world_vb, &stride, &offset);
+      context->VSSetShader(bench_vs, nullptr, 0);
+      context->VSSetConstantBuffers(0, 1, &vp_cb);
+      context->PSSetShader(nullptr, nullptr, 0);
+      context->Draw(UINT(world.size() / 3), 0);
+      context->OMSetRenderTargets(0, nullptr, nullptr);
+      context->RSSetState(nullptr);
+      context->OMSetDepthStencilState(nullptr, 0);
+      if (read_mask)
+      {
+         context->CopyResource(depth_staging, depth_texture);
+         D3D11_MAPPED_SUBRESOURCE mapped;
+         context->Map(depth_staging, 0, D3D11_MAP_READ, 0, &mapped);
+         sky_mask.assign(W * H, 0);
+         for (UINT y = 0; y < H; y++)
+            for (UINT x = 0; x < W; x++)
+               sky_mask[y * W + x] = ((const float*)((const uint8_t*)mapped.pData + y * mapped.RowPitch))[x] <= 0.f;
+         context->Unmap(depth_staging, 0);
+      }
+      // Into the interop's depth (what DrawRTAO does)
+      ID3D11RenderTargetView* rtv = interop.GetDepthRTV();
+      context->OMSetRenderTargets(1, &rtv, nullptr);
+      context->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP);
+      context->IASetInputLayout(nullptr);
+      context->VSSetShader(copy_vs, nullptr, 0);
+      context->PSSetShader(depth_ps, nullptr, 0);
+      context->PSSetShaderResources(0, 1, &depth_srv);
+      context->Draw(4, 0);
+      ID3D11ShaderResourceView* null_srv = nullptr;
+      context->PSSetShaderResources(0, 1, &null_srv);
+      ID3D11RenderTargetView* null_rtv = nullptr;
+      context->OMSetRenderTargets(1, &null_rtv, nullptr);
+      rtv->Release();
+   };
+
+   RTAO::Retirer retirer;
+   RTAO::BlasCache blases;
+   RTAO::TlasBuilder tlas;
+   RTAO::AOPass pass;
+   RTAO::GpuTimer timer;
+   CHECK(pass.Init(interop.GetDevice(), error), "AOPass::Init: %s", error.c_str());
+   CHECK(timer.Init(interop.GetDevice(), interop.GetTimestampFrequency(), error), "GpuTimer::Init: %s", error.c_str());
+   uint32_t tlas_count = 0;
+   // One frame: TLAS (all instances re-added, like the capture's readback), AO pass. Spans: BLAS, TLAS, trace, filter.
+   auto run = [&](const Camera& cam, RTAO::PassSettings settings) {
+      std::memcpy(settings.view_proj, cam.view_proj.m, sizeof(settings.view_proj));
+      std::memcpy(settings.inv_view_proj, cam.inv_view_proj.m, sizeof(settings.inv_view_proj));
+      settings.cam_pos[0] = cam.eye.x; settings.cam_pos[1] = cam.eye.y; settings.cam_pos[2] = cam.eye.z;
+      settings.cam_fwd[0] = cam.fwd.x; settings.cam_fwd[1] = cam.fwd.y; settings.cam_fwd[2] = cam.fwd.z;
+      settings.reversed_z = true;
+      CHECK(interop.Run(context, [&](ID3D12GraphicsCommandList4* list, const RTAO::RecordInfo& info, std::string& err) {
+         retirer.Collect(info.completed_fence_value);
+         timer.Collect(info.frame_slot);
+         timer.Begin(list, info.frame_slot);
+         const RTAO::BuildContext ctx = { info.device, list, &retirer, info.submit_fence_value };
+         for (uint32_t m = 0; m < meshes.size(); m++)
+         {
+            RTAO::CpuMesh mesh = { meshes[m].positions.data(), uint32_t(meshes[m].positions.size() / 3), 12, meshes[m].indices.data(), uint32_t(meshes[m].indices.size()) };
+            if (!blases.BuildFromCpu(ctx, m, mesh, err))
+               return false;
+         }
+         blases.FlushBarrier(list);
+         timer.Mark(list, info.frame_slot);
+         tlas.BeginFrame();
+         for (size_t i = 0; i < instances.size(); i++)
+            tlas.AddInstance(i, instances[i].mesh, instances[i].xform, instances[i].cutout ? RTAO::kInstanceMaskCutout : RTAO::kInstanceMaskOpaque);
+         D3D12_GPU_VIRTUAL_ADDRESS top = 0;
+         if (!tlas.Build(ctx, blases, info.frame_slot, top, tlas_count, err))
+            return false;
+         timer.Mark(list, info.frame_slot);
+         if (!pass.Record(list, info, top, settings, retirer, err, &timer))
+            return false;
+         timer.End(list, info.frame_slot);
+         return true;
+      }, error), "Run (bench): %s", error.c_str());
+   };
+   auto read_ao = [&]() {
+      ID3D11ShaderResourceView* ao_srv = interop.GetAOSRV();
+      UINT w = 0, h = 0;
+      std::vector<float> ao = ReadAO(device, context, ao_srv, w, h);
+      ao_srv->Release();
+      return ao;
+   };
+   auto mae = [&](const std::vector<float>& a, const std::vector<float>& b) {
+      double sum = 0;
+      size_t count = 0;
+      for (size_t i = 0; i < a.size(); i++)
+         if (!sky_mask[i])
+         {
+            sum += std::fabs(a[i] - b[i]);
+            count++;
+         }
+      return count ? sum / count : 0.0;
+   };
+
+   // References: 128 rays, no denoiser, at the static pose and at the end of the camera move
+   const int kMoveFrames = 24;
+   const Camera cam_static = make_camera(0.f), cam_moved = make_camera(float(kMoveFrames));
+   RTAO::PassSettings reference_settings;
+   reference_settings.ray_count = 128;
+   reference_settings.filter_mode = RTAO::FilterMode::Off;
+   reference_settings.strength = 1.f;
+   std::vector<float> reference[2];
+   for (int pose = 0; pose < 2; pose++)
+   {
+      rasterize(pose ? cam_moved : cam_static, true);
+      run(pose ? cam_moved : cam_static, reference_settings);
+      reference[pose] = read_ao();
+   }
+   size_t sky = 0;
+   for (uint8_t s : sky_mask)
+      sky += s;
+   printf("bench: TLAS %u instances, %.1f%% sky\n", tlas_count, 100.0 * sky / sky_mask.size());
+   if (image_dir)
+   {
+      char path[512];
+      snprintf(path, sizeof(path), "%s\\reference.pgm", image_dir);
+      WritePgm(path, reference[1], W, H, 0, 0, W, H);
+      snprintf(path, sizeof(path), "%s\\reference_static.pgm", image_dir);
+      WritePgm(path, reference[0], W, H, 0, 0, W, H);
+   }
+
+   const char* filter = getenv("RTAO_BENCH_FILTER"); // Only the configurations whose name contains it
+   for (const BenchConfig& config : configs)
+   {
+      if (filter && !strstr(config.name, filter))
+         continue;
+      RTAO::PassSettings settings = config.settings;
+      settings.strength = 1.f;
+      settings.reset_history = true;
+      // Static camera: converge, time, measure flicker and error
+      rasterize(cam_static, true);
+      // Medians over the timed frames (other GPU work on the machine makes single frames noisy)
+      std::vector<double> span_samples[RTAO::GpuTimer::kMaxMarks + 2];
+      const int kWarmup = 40, kTimed = 60;
+      std::vector<float> previous, current;
+      double flicker = 0;
+      for (int frame = 0; frame < kWarmup + kTimed; frame++)
+      {
+         run(cam_static, settings);
+         settings.reset_history = false;
+         if (frame >= kWarmup)
+         {
+            for (uint32_t s = 0; s < RTAO::GpuTimer::kMaxMarks + 1; s++)
+               span_samples[s].push_back(timer.LastSpanMs(s));
+            span_samples[RTAO::GpuTimer::kMaxMarks + 1].push_back(timer.LastMs());
+         }
+         if (frame >= kWarmup + kTimed - 4)
+         {
+            previous.swap(current);
+            current = read_ao();
+            if (!previous.empty())
+               flicker += mae(current, previous) / 3.0;
+         }
+      }
+      const double static_error = mae(current, reference[0]);
+      if (image_dir)
+      {
+         char path[512];
+         snprintf(path, sizeof(path), "%s\\%s_static.pgm", image_dir, config.name);
+         WritePgm(path, current, W, H, 0, 0, W, H);
+      }
+      // Moving camera: from a converged history, kMoveFrames frames of motion, error at the last pose
+      for (int frame = 1; frame <= kMoveFrames; frame++)
+      {
+         const Camera cam = make_camera(float(frame));
+         rasterize(cam, frame == kMoveFrames);
+         run(cam, settings);
+      }
+      const std::vector<float> moved = read_ao();
+      const double moving_error = mae(moved, reference[1]);
+      auto median = [&](uint32_t s) {
+         std::vector<double>& v = span_samples[s];
+         std::sort(v.begin(), v.end());
+         return v.empty() ? 0.0 : v[v.size() / 2];
+      };
+      printf("%-34s GPU %.3f ms (BLAS %.3f, TLAS %.3f, trace %.3f, filter %.3f) | error static %.4f moving %.4f, flicker %.4f\n", config.name, median(RTAO::GpuTimer::kMaxMarks + 1), median(0), median(1), median(2), median(3),
+         static_error, moving_error, flicker);
+      if (image_dir)
+      {
+         char path[512];
+         snprintf(path, sizeof(path), "%s\\%s.pgm", image_dir, config.name);
+         WritePgm(path, moved, W, H, 0, 0, W, H);
+      }
+   }
+
+   CHECK(interop.WaitForIdle(5000), "WaitForIdle");
+   retirer.ReleaseAll();
+   timer.Shutdown();
+   pass.Shutdown(nullptr, 0);
+   tlas.Clear(nullptr, 0);
+   blases.Clear(nullptr, 0);
+   for (IUnknown* p : std::initializer_list<IUnknown*>{ world_vb, bench_vs, layout, depth_texture, dsv, depth_srv, ds_state, rs_state, vp_cb, depth_staging })
+      p->Release();
+}
+
+static std::vector<BenchConfig> BenchConfigs()
+{
+   std::vector<BenchConfig> configs;
+   RTAO::PassSettings base;
+   configs.push_back({ "high_4rays_opacity0.5", base });
+   RTAO::PassSettings s = base;
+   s.cutout_opacity = 1.f;
+   configs.push_back({ "high_4rays_opacity1", s });
+   s.cutout_opacity = 0.f;
+   configs.push_back({ "high_4rays_opacity0", s });
+   s = base;
+   s.ray_count = 2;
+   configs.push_back({ "medium_2rays", s });
+   s.ray_count = 1;
+   configs.push_back({ "1ray", s });
+   s = base;
+   s.cutout_mode = 1;
+   configs.push_back({ "high_4rays_perray", s });
+   s.cutout_mode = 2;
+   configs.push_back({ "high_4rays_perray_sq", s });
+   s = base;
+   s.half_res = true;
+   configs.push_back({ "low_half_4rays", s });
+   s.ray_count = 2;
+   configs.push_back({ "low_half_2rays", s });
+   s.ray_count = 4;
+   s.cutout_mode = 2;
+   configs.push_back({ "low_half_4rays_fastcutouts", s });
+   s = base;
+   s.ray_count = 2;
+   s.cutout_mode = 2;
+   configs.push_back({ "medium_2rays_perray_sq", s });
+   return configs;
+}
+
+int main(int argc, char** argv)
 {
    setvbuf(stdout, nullptr, _IONBF, 0);
+   const bool bench = argc > 1 && strcmp(argv[1], "bench") == 0;
+   const char* image_dir = bench && argc > 2 ? argv[2] : nullptr;
    // RTAO_D3D12_DEBUG=1: D3D12 debug layer + GPU based validation (messages go to the debugger output)
    if (GetEnvironmentVariableA("RTAO_D3D12_DEBUG", nullptr, 0) != 0)
    {
@@ -1692,6 +2271,14 @@ int main()
          CHECK(std::fabs(at(40, 40) - 0.35f) < 0.01f, "cell (1,1) should be 0.35");
          CHECK(at(5, 5) < 0.01f, "bar should be 0");
       }
+   }
+
+   if (bench)
+   {
+      RunBenchmark(device, context, interop, vs, ps, BenchConfigs(), image_dir);
+      interop.Shutdown();
+      printf(g_failures ? "FAILED (%d)\n" : "PASSED\n", g_failures);
+      return g_failures ? 1 : 0;
    }
 
    TestTlasRetention();

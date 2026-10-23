@@ -1007,6 +1007,7 @@ namespace RTAO
       meshes.clear();
       context_records.clear();
       list_records.clear();
+      frame_identities.clear();
       executed.clear();
       for (auto& r : readback_records)
          r.clear();
@@ -1088,8 +1089,30 @@ namespace RTAO
       key = HashCombine(key, index_start);
       key = HashCombine(key, (uint64_t(draw.index_count) << 32) | uint64_t(draw.index_format));
 
+      // Per frame identity: the mesh plus everything that selects its instances' data. A second draw of it in the same
+      // frame (another pass) would capture the same instances again (or another per frame BLAS of the same pose).
+      uint64_t identity = 0;
+      if (dedup_enabled.load(std::memory_order_relaxed))
+      {
+         identity = HashCombine(key, uint64_t(uintptr_t(draw.instance_cb)));
+         identity = HashCombine(identity, (uint64_t(draw.instance_cb_first_constant) << 32) | draw.instance_cb_num_constants);
+         identity = HashCombine(identity, uint64_t(uintptr_t(draw.instance_buffer)));
+         identity = HashCombine(identity, uint64_t(uintptr_t(draw.instance_index)));
+         identity = HashCombine(identity, uint64_t(uintptr_t(draw.per_view_cb)) ^ (uint64_t(draw.per_view_cb_first_constant) << 44));
+         identity = HashCombine(identity, uint64_t(uintptr_t(draw.bones)));
+         identity = HashCombine(identity, uint64_t(draw.instance_count) | (uint64_t(draw.cutout) << 32) | (uint64_t(frame_mesh) << 33));
+         identity = HashCombine(identity, draw.binding_version);
+         identity |= 1; // Never 0
+         const std::lock_guard lock(mutex);
+         if (frame_identities.count(identity))
+         {
+            (frame_mesh ? stats.dedup_frame_meshes : stats.dedup_draws)++;
+            return true; // Its instances are in this frame's records already
+         }
+      }
+
       if (frame_mesh)
-         return CaptureFrameDraw(context, draw, key, index_start, index_size, dynamic_vertices);
+         return CaptureFrameDraw(context, draw, key, identity, index_start, index_size, dynamic_vertices);
 
       std::vector<Rec> local;
       uint32_t dst_slot;
@@ -1151,6 +1174,8 @@ namespace RTAO
          record.first_slot = dst_slot;
          record.count = draw.instance_count;
          local.push_back(record);
+         if (identity)
+            frame_identities.insert(identity);
          stats.draws_captured++;
          stats.instances_captured += draw.instance_count;
          if (draw.vs->wind)
@@ -1186,7 +1211,7 @@ namespace RTAO
       }
    }
 
-   bool GeometryCapture::CaptureFrameDraw(ID3D11DeviceContext* context, const DrawInfo& draw, uint64_t key, uint64_t index_start, uint32_t index_size, bool dynamic_vertices)
+   bool GeometryCapture::CaptureFrameDraw(ID3D11DeviceContext* context, const DrawInfo& draw, uint64_t key, uint64_t identity, uint64_t index_start, uint32_t index_size, bool dynamic_vertices)
    {
       const bool skinned = draw.vs->skinned;
       auto skip = [&](CaptureSkip reason) {
@@ -1401,6 +1426,8 @@ namespace RTAO
          record.index_count = index_count;
          record.index_format = soup ? DXGI_FORMAT_UNKNOWN : draw.index_format;
          local.push_back(record);
+         if (identity)
+            frame_identities.insert(identity);
          stats.draws_captured++;
          stats.instances_captured++;
          (skinned ? stats.skinned_captured : stats.dynamic_captured)++;
@@ -1486,6 +1513,7 @@ namespace RTAO
       const std::lock_guard lock(mutex);
       frame++;
       after_ao_pass = false;
+      frame_identities.clear();
       // Command lists the game finished but never executed (or released)
       for (auto it = list_records.begin(); it != list_records.end();)
       {

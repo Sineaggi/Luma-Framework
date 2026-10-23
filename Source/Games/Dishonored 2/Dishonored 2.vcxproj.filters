@@ -3,5 +3,9 @@
   <ItemGroup>
     <ClCompile Include="main.cpp" />
     <ClCompile Include="..\..\Core\unity_build.cpp" />
+    <ClCompile Include="rtao_interop.cpp" />
+  </ItemGroup>
+  <ItemGroup>
+    <ClInclude Include="rtao_interop.h" />
   </ItemGroup>
 </Project>

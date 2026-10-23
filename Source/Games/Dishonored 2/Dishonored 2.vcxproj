@@ -299,6 +299,10 @@
   <ItemGroup>
     <ClCompile Include="..\..\Core\unity_build.cpp" />
     <ClCompile Include="main.cpp" />
+    <ClCompile Include="rtao_interop.cpp" />
+  </ItemGroup>
+  <ItemGroup>
+    <ClInclude Include="rtao_interop.h" />
   </ItemGroup>
   <!-- Apply feature settings after the final per-configuration properties. -->
   <Import Project="..\Luma.DXP.props" Condition="Exists('..\Luma.DXP.props')" />

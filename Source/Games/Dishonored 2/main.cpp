@@ -11,6 +11,8 @@
 #include "../../../Shaders/Dishonored 2/Includes/GameCBuffers.hlsl"
 #include "..\..\Core\core.hpp"
 
+#include "rtao_interop.h"
+
 struct CBPerViewGlobals
 {
    float4 cb_alwaystweak;
@@ -60,7 +62,42 @@ namespace
 
    // XeGTAO
    constexpr size_t XE_GTAO_DEPTH_MIP_LEVELS = 5;
-   bool g_xegtao_enable = true;
+
+   // Ambient occlusion mode. This is the single AO setting (config key "AOMode"): set it from anywhere
+   // (UI, config, an exported setter) and the SSAO draw picks it up on the next frame.
+   // XeGTAO and RTAO both replace the game's SSAO draw, so they are mutually exclusive by construction.
+   enum AOMode : int
+   {
+      AO_MODE_OFF = 0, // Game behaviour (vanilla SSAO, or HBAO+ if enabled in the game)
+      AO_MODE_XEGTAO = 1,
+      AO_MODE_RTAO = 2, // Ray traced AO on a side D3D12 device (milestone M0: interop smoke test only)
+      AO_MODE_COUNT
+   };
+   std::atomic<int> g_ao_mode = AO_MODE_XEGTAO;
+   // Set once if the D3D12/DXR 1.1 interop can't be created; RTAO then runs as XeGTAO
+   std::atomic<bool> g_rtao_unavailable = false;
+   std::mutex g_rtao_status_mutex;
+   std::string g_rtao_status; // Last RTAO init result or error, shown in the UI
+   // What the M0 D3D12 kernel writes (0 depth based test AO, 1 test pattern). Not saved.
+   int g_rtao_debug_mode = 0;
+   float g_rtao_strength = 1.f;
+
+   int GetEffectiveAOMode()
+   {
+      int mode = g_ao_mode.load();
+      if (mode < AO_MODE_OFF || mode >= AO_MODE_COUNT)
+         mode = AO_MODE_XEGTAO;
+      if (mode == AO_MODE_RTAO && g_rtao_unavailable)
+         mode = AO_MODE_XEGTAO;
+      return mode;
+   }
+
+   void SetRTAOStatus(std::string status, bool error)
+   {
+      reshade::log::message(error ? reshade::log::level::error : reshade::log::level::info, ("RTAO: " + status).c_str());
+      const std::lock_guard lock(g_rtao_status_mutex);
+      g_rtao_status = std::move(status);
+   }
 
 #if DEVELOPMENT
    std::thread::id global_cbuffer_thread_id;
@@ -122,6 +159,27 @@ struct GameDeviceDataDishonored2 final : public GameDeviceData
    std::atomic<bool> prey_taa_active = false; // Instant version of "taa_detected".
    // Index 0 is one frame ago, index 1 is two frames ago
    bool previous_prey_taa_active[2] = { false, false };
+
+   // RTAO
+   RTAO::Interop rtao;
+   // When the SSAO draw is recorded on a deferred context, the D3D11<->D3D12 fence Signal/Wait can't be recorded
+   // (ID3D11DeviceContext4::Signal/Wait are immediate context only). So the deferred context is split there:
+   // everything up to (and including) our depth copy is finished into "prefix", and when the game executes the
+   // remainder on the immediate context we execute the prefix, run the D3D12 pass, and let the remainder (which
+   // starts with our AO composite draw) run after the GPU wait.
+   struct RTAOPendingSplit
+   {
+      ID3D11DeviceContext* deferred_context = nullptr; // Identity only
+      ComPtr<ID3D11CommandList> prefix;
+      void* remainder_command_list = nullptr; // Identity only, set when the game calls FinishCommandList()
+      RTAO::Constants constants = {};
+      uint32_t frame = 0;
+   };
+   std::mutex rtao_pending_mutex;
+   std::vector<RTAOPendingSplit> rtao_pending;
+   uint32_t rtao_frame = 0;
+   std::atomic<bool> rtao_logged_context_type = false;
+   std::atomic<bool> rtao_logged_run_error = false;
 };
 
 //TODOFT: Building shaders menu (apply gamma?)
@@ -162,6 +220,9 @@ public:
 
       native_shaders_definitions.emplace(CompileTimeStringHash("DS2 XeGTAO Prefilter Depths CS"), ShaderDefinition{ "Luma_XeGTAO", reshade::api::pipeline_subobject_type::compute_shader, nullptr, "prefilter_depths16x16_cs" });
       native_shaders_definitions.emplace(CompileTimeStringHash("DS2 XeGTAO Main Pass PS"), ShaderDefinition{ "Luma_XeGTAO", reshade::api::pipeline_subobject_type::pixel_shader, nullptr, "main_pass_ps" });
+      native_shaders_definitions.emplace(CompileTimeStringHash("DS2 RTAO Depth Copy PS"), ShaderDefinition{ "Luma_RTAO", reshade::api::pipeline_subobject_type::pixel_shader, nullptr, "depth_copy_ps" });
+      native_shaders_definitions.emplace(CompileTimeStringHash("DS2 RTAO Depth Pack PS"), ShaderDefinition{ "Luma_RTAO", reshade::api::pipeline_subobject_type::pixel_shader, nullptr, "depth_pack_ps" });
+      native_shaders_definitions.emplace(CompileTimeStringHash("DS2 RTAO Composite PS"), ShaderDefinition{ "Luma_RTAO", reshade::api::pipeline_subobject_type::pixel_shader, nullptr, "composite_ps" });
       native_shaders_definitions.emplace(CompileTimeStringHash("DS2 Pre DLSS CS"), ShaderDefinition{ "Luma_PreDLSS_CS", reshade::api::pipeline_subobject_type::compute_shader });
       native_shaders_definitions.emplace(CompileTimeStringHash("DS2 Post DLSS CS"), ShaderDefinition{ "Luma_PostDLSS_CS", reshade::api::pipeline_subobject_type::compute_shader });
    }
@@ -170,6 +231,206 @@ public:
    void OnCreateDevice(ID3D11Device* native_device, DeviceData& device_data) override
    {
       device_data.game = new GameDeviceDataDishonored2;
+   }
+
+   // "GameDeviceData" has no virtual destructor, so delete it as our type (releases its resources and the D3D12 device)
+   void OnDestroyDeviceData(DeviceData& device_data) override
+   {
+      delete static_cast<GameDeviceDataDishonored2*>(device_data.game);
+      device_data.game = nullptr;
+   }
+
+   // Replaces the game's SSAO draw with the RTAO result. Returns false to let the draw run as usual (vanilla SSAO this frame).
+   bool DrawRTAO(ID3D11Device* native_device, ID3D11DeviceContext* native_device_context, DeviceData& device_data, GameDeviceDataDishonored2& game_device_data, std::function<void()>* original_draw_dispatch_func)
+   {
+      auto& rtao = game_device_data.rtao;
+      std::string error;
+      if (!rtao.IsInitialized())
+      {
+         if (!rtao.Init(native_device, error))
+         {
+            g_rtao_unavailable = true;
+            SetRTAOStatus("unavailable, using XeGTAO instead: " + error, true);
+            return false;
+         }
+         SetRTAOStatus("D3D12 interop ready, " + rtao.GetDescription(), false);
+      }
+
+      const auto copy_vs = device_data.native_vertex_shaders.find(CompileTimeStringHash("Copy VS"));
+      const auto depth_copy_ps = device_data.native_pixel_shaders.find(CompileTimeStringHash("DS2 RTAO Depth Copy PS"));
+      const auto depth_pack_ps = device_data.native_pixel_shaders.find(CompileTimeStringHash("DS2 RTAO Depth Pack PS"));
+      const auto composite_ps = device_data.native_pixel_shaders.find(CompileTimeStringHash("DS2 RTAO Composite PS"));
+      if (copy_vs == device_data.native_vertex_shaders.end() || !copy_vs->second || depth_copy_ps == device_data.native_pixel_shaders.end() || !depth_copy_ps->second || depth_pack_ps == device_data.native_pixel_shaders.end() || !depth_pack_ps->second || composite_ps == device_data.native_pixel_shaders.end() || !composite_ps->second)
+      {
+         return false; // Shaders not compiled (yet)
+      }
+
+      com_ptr<ID3D11ShaderResourceView> depth_srv;
+      native_device_context->PSGetShaderResources(0, 1, &depth_srv);
+      com_ptr<ID3D11RenderTargetView> ao_rtv;
+      native_device_context->OMGetRenderTargets(1, &ao_rtv, nullptr);
+      if (!depth_srv || !ao_rtv)
+      {
+         return false;
+      }
+      com_ptr<ID3D11Resource> depth_resource;
+      depth_srv->GetResource(&depth_resource);
+      com_ptr<ID3D11Resource> ao_resource;
+      ao_rtv->GetResource(&ao_resource);
+      com_ptr<ID3D11Texture2D> depth_texture;
+      com_ptr<ID3D11Texture2D> ao_texture;
+      if (FAILED(depth_resource->QueryInterface(&depth_texture)) || FAILED(ao_resource->QueryInterface(&ao_texture)))
+      {
+         return false;
+      }
+      D3D11_TEXTURE2D_DESC depth_desc;
+      depth_texture->GetDesc(&depth_desc);
+      D3D11_TEXTURE2D_DESC ao_desc;
+      ao_texture->GetDesc(&ao_desc);
+
+      if (!rtao.EnsureTargets(native_device, depth_desc.Width, depth_desc.Height, ao_desc.Width, ao_desc.Height, error))
+      {
+         g_rtao_unavailable = true;
+         SetRTAOStatus("shared textures failed, using XeGTAO instead: " + error, true);
+         return false;
+      }
+
+      const bool immediate = native_device_context->GetType() == D3D11_DEVICE_CONTEXT_IMMEDIATE;
+      if (!game_device_data.rtao_logged_context_type.exchange(true))
+      {
+         SetRTAOStatus(std::string("SSAO draw is on the ") + (immediate ? "immediate context, D3D12 pass runs inline" : "deferred context, D3D12 pass runs when the game executes it on the immediate context") + ", " + rtao.GetDescription(), false);
+      }
+      if (!immediate)
+      {
+         // Only one split per deferred context can be pending at once
+         const std::lock_guard lock(game_device_data.rtao_pending_mutex);
+         for (const auto& pending : game_device_data.rtao_pending)
+         {
+            if (pending.deferred_context == native_device_context && pending.remainder_command_list == nullptr)
+               return false;
+         }
+      }
+
+      // 1) Copy the depth into the texture shared with D3D12
+      {
+         DrawStateStack<DrawStateStackType::FullGraphics> draw_state_stack;
+         draw_state_stack.Cache(native_device_context, device_data.uav_max_count);
+         ID3D11RenderTargetView* depth_rtv = rtao.GetDepthRTV();
+         ID3D11PixelShader* ps = rtao.IsDepthPacked() ? depth_pack_ps->second.get() : depth_copy_ps->second.get();
+         DrawCustomPixelShader(native_device_context, device_data.default_depth_stencil_state.get(), device_data.default_blend_state.get(), nullptr, copy_vs->second.get(), ps, depth_srv.get(), depth_rtv, depth_desc.Width, depth_desc.Height);
+         if (depth_rtv)
+            depth_rtv->Release();
+         draw_state_stack.Restore(native_device_context);
+      }
+
+      RTAO::Constants constants = {};
+      static_assert(sizeof(constants.inv_projection) == sizeof(cb_per_view_global.cb_inverseprojectionmatrix));
+      std::memcpy(constants.inv_projection, &cb_per_view_global.cb_inverseprojectionmatrix, sizeof(constants.inv_projection));
+      constants.debug_mode = uint32_t(g_rtao_debug_mode);
+      constants.strength = g_rtao_strength;
+      constants.frame = cb_luma_global_settings.FrameIndex;
+
+      // 2) D3D11 -> D3D12 -> D3D11
+      if (immediate)
+      {
+         if (!rtao.Run(native_device_context, constants, error))
+         {
+            if (!game_device_data.rtao_logged_run_error.exchange(true))
+            {
+               SetRTAOStatus("D3D12 pass failed: " + error, true);
+            }
+            return false;
+         }
+      }
+      else
+      {
+         GameDeviceDataDishonored2::RTAOPendingSplit pending;
+         pending.deferred_context = native_device_context;
+         pending.constants = constants;
+         pending.frame = game_device_data.rtao_frame;
+         if (FAILED(native_device_context->FinishCommandList(TRUE, pending.prefix.put())) || !pending.prefix)
+         {
+            return false;
+         }
+         const std::lock_guard lock(game_device_data.rtao_pending_mutex);
+         game_device_data.rtao_pending.push_back(std::move(pending));
+      }
+
+      // 3) Write the shared AO into the game's AO render target, reusing the game's own fullscreen draw state
+      com_ptr<ID3D11PixelShader> original_ps;
+      native_device_context->PSGetShader(&original_ps, nullptr, nullptr);
+      ID3D11ShaderResourceView* ao_srv = rtao.GetAOSRV();
+      native_device_context->PSSetShader(composite_ps->second.get(), nullptr, 0);
+      native_device_context->PSSetShaderResources(0, 1, &ao_srv);
+      if (original_draw_dispatch_func && *original_draw_dispatch_func)
+         (*original_draw_dispatch_func)();
+      else
+         native_device_context->Draw(3, 0); // Same assumption as the XeGTAO path
+      ID3D11ShaderResourceView* const original_srv = depth_srv.get();
+      native_device_context->PSSetShaderResources(0, 1, &original_srv);
+      native_device_context->PSSetShader(original_ps.get(), nullptr, 0);
+      if (ao_srv)
+         ao_srv->Release();
+      return true;
+   }
+
+   // Deferred SSAO only: map the game's FinishCommandList() to our pending split, and run the D3D12 pass right before
+   // the game executes that command list on the immediate context.
+   static void HandleRTAOCommandList(reshade::api::command_list* cmd_list, reshade::api::command_list* secondary_cmd_list)
+   {
+      auto& device_data = *cmd_list->get_device()->get_private_data<DeviceData>();
+      if (!device_data.game)
+         return;
+      auto& game_device_data = GetGameDeviceData(device_data);
+      {
+         const std::lock_guard lock(game_device_data.rtao_pending_mutex);
+         if (game_device_data.rtao_pending.empty())
+            return;
+      }
+
+      ID3D11DeviceChild* first = (ID3D11DeviceChild*)(cmd_list->get_native());
+      ID3D11DeviceChild* second = (ID3D11DeviceChild*)(secondary_cmd_list->get_native());
+      com_ptr<ID3D11DeviceContext> context;
+      com_ptr<ID3D11CommandList> command_list;
+
+      // ExecuteCommandList(): (immediate context, command list)
+      if (SUCCEEDED(first->QueryInterface(&context)) && SUCCEEDED(second->QueryInterface(&command_list)))
+      {
+         if (context->GetType() != D3D11_DEVICE_CONTEXT_IMMEDIATE)
+            return;
+         GameDeviceDataDishonored2::RTAOPendingSplit pending;
+         {
+            const std::lock_guard lock(game_device_data.rtao_pending_mutex);
+            auto it = std::find_if(game_device_data.rtao_pending.begin(), game_device_data.rtao_pending.end(), [&](const auto& p) { return p.remainder_command_list == command_list.get(); });
+            if (it == game_device_data.rtao_pending.end())
+               return;
+            pending = std::move(*it);
+            game_device_data.rtao_pending.erase(it);
+         }
+         context->ExecuteCommandList(pending.prefix.get(), TRUE);
+         std::string error;
+         if (!game_device_data.rtao.Run(context.get(), pending.constants, error) && !game_device_data.rtao_logged_run_error.exchange(true))
+         {
+            SetRTAOStatus("D3D12 pass failed (deferred): " + error, true); // The composite then reads the previous AO
+         }
+         return;
+      }
+
+      // FinishCommandList(): (command list, deferred context)
+      context.reset();
+      command_list.reset();
+      if (SUCCEEDED(first->QueryInterface(&command_list)) && SUCCEEDED(second->QueryInterface(&context)))
+      {
+         const std::lock_guard lock(game_device_data.rtao_pending_mutex);
+         for (auto& pending : game_device_data.rtao_pending)
+         {
+            if (pending.deferred_context == context.get() && pending.remainder_command_list == nullptr)
+            {
+               pending.remainder_command_list = command_list.get();
+               break;
+            }
+         }
+      }
    }
 
    //TODOFT: delete?
@@ -413,6 +674,13 @@ public:
       device_data.taa_detected = true;
       device_data.has_drawn_sr = false;
       game_device_data.found_per_view_globals = false;
+
+      // Drop deferred RTAO splits the game never executed (e.g. discarded command lists)
+      game_device_data.rtao_frame++;
+      {
+         const std::lock_guard lock(game_device_data.rtao_pending_mutex);
+         std::erase_if(game_device_data.rtao_pending, [&](const auto& p) { return game_device_data.rtao_frame - p.frame > 3; });
+      }
    }
    
    DrawOrDispatchOverrideType OnDrawOrDispatch(ID3D11Device* native_device, ID3D11DeviceContext* native_device_context, CommandListData& cmd_list_data, DeviceData& device_data, reshade::api::shader_stage stages, const ShaderHashesList<OneShaderPerPipeline>& original_shader_hashes, bool is_custom_pass, bool& updated_cbuffers, std::function<void()>* original_draw_dispatch_func) override
@@ -471,8 +739,21 @@ public:
 
       if (original_shader_hashes.Contains(shader_hashes_SSAO))
       {
-         if (g_xegtao_enable)
-         {  
+         // Depth SRV is PS t0, the per view cbuffer PS b1, the AO render target RT0.
+         int ao_mode = GetEffectiveAOMode();
+         if (ao_mode == AO_MODE_RTAO)
+         {
+            if (DrawRTAO(native_device, native_device_context, device_data, game_device_data, original_draw_dispatch_func))
+            {
+               return DrawOrDispatchOverrideType::Replaced;
+            }
+            // RTAO became unavailable: fall back to XeGTAO this same frame. Transient failures draw vanilla SSAO.
+            if (g_rtao_unavailable)
+               ao_mode = GetEffectiveAOMode();
+         }
+
+         if (ao_mode == AO_MODE_XEGTAO)
+         {
             ComPtr<ID3D11ShaderResourceView> srv_original;
             native_device_context->PSGetShaderResources(0, 1, srv_original.put());
             ComPtr<ID3D11Buffer> cb_original;
@@ -913,6 +1194,9 @@ public:
 
    static void OnExecuteSecondaryCommandList(reshade::api::command_list* cmd_list, reshade::api::command_list* secondary_cmd_list)
    {
+      // First, so a deferred RTAO prefix executes before the SR prefix that was split later from the same context
+      HandleRTAOCommandList(cmd_list, secondary_cmd_list);
+
 #if ENABLE_SR
       com_ptr<ID3D11DeviceContext> native_device_context;
       com_ptr<ID3D11CommandList> native_command_list;
@@ -1118,7 +1402,15 @@ public:
    {
       reshade::api::effect_runtime* runtime = nullptr;
 
-      reshade::get_config_value(runtime, NAME, "XeGTAOEnable", g_xegtao_enable);
+      int ao_mode = AO_MODE_XEGTAO;
+      if (!reshade::get_config_value(runtime, NAME, "AOMode", ao_mode))
+      {
+         // Migrate the old boolean setting
+         bool xegtao_enable = true;
+         if (reshade::get_config_value(runtime, NAME, "XeGTAOEnable", xegtao_enable))
+            ao_mode = xegtao_enable ? AO_MODE_XEGTAO : AO_MODE_OFF;
+      }
+      g_ao_mode = (ao_mode >= AO_MODE_OFF && ao_mode < AO_MODE_COUNT) ? ao_mode : AO_MODE_XEGTAO;
 
       auto& game_settings = cb_luma_global_settings.GameSettings;
       reshade::get_config_value(runtime, NAME, "BloomStrength", game_settings.BloomStrength);
@@ -1172,13 +1464,30 @@ public:
 
       ImGui::SeparatorText("Ambient Occlusion");
 
-      if (ImGui::Checkbox("XeGTAO Enable", &g_xegtao_enable))
+      static const char* ao_mode_names[AO_MODE_COUNT] = { "Off (game)", "XeGTAO", "RTAO (experimental)" };
+      int ao_mode = g_ao_mode.load();
+      if (ao_mode < AO_MODE_OFF || ao_mode >= AO_MODE_COUNT)
+         ao_mode = AO_MODE_XEGTAO;
+      if (ImGui::Combo("Ambient Occlusion", &ao_mode, ao_mode_names, AO_MODE_COUNT))
       {
-         reshade::set_config_value(runtime, NAME, "XeGTAOEnable", g_xegtao_enable);
+         g_ao_mode = ao_mode;
+         reshade::set_config_value(runtime, NAME, "AOMode", ao_mode);
       }
       if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
       {
-         ImGui::SetTooltip("Replaces SSAO if enabled, HBAO+ has to be disabled in game.");
+         ImGui::SetTooltip("Replaces the game's SSAO, HBAO+ has to be disabled in game.\nOff: the game's own SSAO.\nXeGTAO: Intel's ground truth AO.\nRTAO: ray traced AO on a side D3D12 device (work in progress: currently an interop test, needs DXR 1.1). Falls back to XeGTAO if unavailable.");
+      }
+      if (ao_mode == AO_MODE_RTAO)
+      {
+         std::string status;
+         {
+            const std::lock_guard lock(g_rtao_status_mutex);
+            status = g_rtao_status;
+         }
+         ImGui::TextWrapped("RTAO status: %s", status.empty() ? "waiting for the SSAO pass" : status.c_str());
+         static const char* rtao_debug_mode_names[] = { "Depth test AO", "Test pattern" };
+         ImGui::Combo("RTAO Test Output", &g_rtao_debug_mode, rtao_debug_mode_names, IM_ARRAYSIZE(rtao_debug_mode_names));
+         ImGui::SliderFloat("RTAO Test Strength", &g_rtao_strength, 0.f, 4.f);
       }
    }
 

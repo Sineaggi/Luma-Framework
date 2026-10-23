@@ -97,3 +97,81 @@ exist in the main view (DEVELOPMENT build, Luma's draw call list).
   - a D3D11 buffer with the legacy `D3D11_RESOURCE_MISC_SHARED` + `IDXGIResource::GetSharedHandle`, opened with
     `ID3D12Device::OpenSharedHandle`, works. The test copies data through it and builds a BLAS straight from it
     (`Interop::CreateSharedBuffer`, `BlasCache::BuildFromGpu`).
+
+## Wind (vertex animated vegetation)
+
+66 of the dumped vertex shaders animate vertices (none of them skinned), in two algorithms. Both displace the vertex in model
+space, then transform it with an ordinary family 1/2/3 matrix, so capture treats them like their base family and
+ignores the displacement: the BLAS is the rest pose (`VertexShaderInfo::wind`, UI "RTAO: wind meshes").
+
+1. Vegetation bending (CryEngine style), 59 shaders with `cb_vegetanim_*` in PerInstanceCB: 11 read the wind from
+   `StructuredBuffer ro_windbuffer` (stride 32: `previousWind` at 0, `wind` at 16; index `SV_InstanceID +
+   cb_windbufferoffset`, so per instance), the other 48 a constant wind (e.g. 0x09B3E8ED: `(0, 0.01)` in xy, strength 0). From
+   0x65471A10 (indexed family), with `c` = VERTEX_COLOR, `n` = VERTEX_NORMAL.xy, `p` = VERTEX_POSITION,
+   `T` = cb_localtime.x, model z is up:
+   - wind into model space: `w = (dot(normalize(row0.xyz), wind.xyz), dot(normalize(row1.xyz), wind.xyz)) * wind.w`
+     (rows of the instance's world matrix), strength `s = wind.w`.
+   - detail bending: `phase = dot(p, c.y + 1)`; `v = ((phase, phase, c.y, c.y) + T) * (1.975, 0.793, 0.375, 0.193)`;
+     `u = frac((frac(v) * 2 - 1) * leaffreq + 0.5) * 2 - 1` (triangle wave), `t = u*u*(3 - 2*abs(u))` (smoothed);
+     `leaf = t.x + t.y - 1`, `branch = t.z + t.w`. `p.x += leaf * n.x * A`, `p.z += leaf * n.y * A`,
+     `p.y += branch * c.x * branchamplitude`, with `A = max(s, leafminwindstrength) * leafamplitude * c.z`.
+   - main bending: `b = sin(mainbendingfreq * T) * mainbendingvar + mainbendingamplitude`; `f = p.z * b + 1;
+     f = f^4 - f^2`; `p.xy += w * f`; then `p` is rescaled to its pre-bend length (no stretching).
+   Per instance (own wind vector and rotation) and per frame (time), amplitude scaled by the vertex colors.
+2. Spline wind, 7 shaders with `ro_splineinfos` (stride 24: `m_position`, `m_direction`) + `ro_windbuffer` at
+   `cb_windbufferoffset` (per draw): the vertex is rotated around a pivot on a spline segment
+   (`m_position + m_direction * TEXCOORD1.x`), about the horizontal axis perpendicular to the wind, by an angle
+   `wind.w * (TEXCOORD1.y * pi/800 - color.x * pi/1600 * (0.5 + 0.5 * cos(10 * color.z * uv.y + 0.05 * (20 *
+   color.w - 10) * wind.w * T)))`: small swings of hanging things (cloth, ropes, signs).
+
+Replaying it (not implemented): the displacement differs per instance and per frame, so every animated instance
+would need its own BLAS, refit every frame (`ALLOW_UPDATE` + `PERFORM_UPDATE`), from a compute pass that applies
+the formula above to the arena vertices (it also needs VERTEX_COLOR/NORMAL/TEXCOORD offsets from the input layout,
+the wind buffer entry, per-draw cb values and the instance rows: the capture ring has room for the 16 bytes of
+`wind` next to each matrix). D3D11 side at the draw (the wind buffer is a game resource) or D3D12 side from
+copies; the matrices arrive 3 frames late, so a per-instance BLAS has to be keyed by the instance identity, budgeted
+to the nearest N instances (forests are thousands of instances). Leaf/branch sway is a few cm, main bending grows
+with height^4; for AO with a 1.5 m radius and a temporal denoiser, the rest pose is a close match except at tree
+tops in strong wind, where a ray from the swaying (depth) surface can start inside or behind the rest pose leaves.
+Leaves are cutouts (below), which halves that self occlusion at the default opacity.
+
+## Alpha tested geometry (cutouts)
+
+D3D11 has no alpha test state: the game's pixel shaders `discard`. 5171 of the 8367 dumped pixel shaders have a
+`discard` (3043 of them are FX shaders, `cb_fx_clipplane`), for different reasons:
+- alpha test: the diffuse map's alpha against `cb_defaultalphatest` or `cb_hairalphatest`, or against a hardcoded
+  0.5 in the 60 vegetation shaders (no alpha test constant at all, so a constant name check misses foliage);
+- LOD cross fade dithering (`cb_ditheringdistance`, from the pixel position), the dissolve and immolation effects
+  (noise textures against a threshold): opaque meshes that must stay opaque.
+
+So `ReflectPixelShader` (rtao_capture.cpp, at init_pipeline) scans the SHEX tokens for `discard` and, if present,
+runs a small forward data flow pass over the bytecode: which temp register components derive from a read (`sample*`,
+`ld`, `gather4*`) of a texture whose name contains "diffuse", "opacity" or "alpha", and whether a discard's
+condition (or an enclosing `if`) does. Over the dump: 1683 non FX shaders alpha tested, 445 discard for other
+reasons only, all 60 vegetation shaders with a discard alpha tested. (The operand decoder parses every instruction
+of the 8367 shaders to its exact length.) Main view draws whose bound pixel shader is alpha tested are captured as
+cutouts (UI "RTAO: alpha tested cutouts").
+
+Cutouts in the trace: their TLAS instances get `kInstanceMaskCutout`, `INSTANCE_FLAG_FORCE_NON_OPAQUE` and
+`kInstanceIdCutoutBit` in their InstanceID; every other instance stays `FORCE_OPAQUE` (the BLAS is shared with
+opaque draws of the same mesh, built OPAQUE; the instance flag overrides it). The AO ray accepts a candidate cutout
+triangle with probability "RTAO Cutout Opacity" (default 0.5), from a hash of (pixel, ray, frame, instance,
+primitive): a stochastic stand-in for the texture's coverage that the temporal denoiser averages like the rest of
+the ray noise. Opacity 1 traces with `RAY_FLAG_FORCE_OPAQUE` (no candidates: the plain opaque trace), opacity 0 masks
+cutouts out. Standalone test (320x180, RTX 4090): ground AO next to a cutout box 0.987 / 0.801 / 0.667 at opacity
+0 / 0.5 / 1, RT pass 0.144 / 0.152 / 0.144 ms; opaque geometry never produces candidates, so its cost is unchanged.
+
+Texture exact path (not implemented): the coverage the game really uses is `diffuse.a` (times
+`lerp(1, VERTEX_COLOR.a, cb)` in some shaders) at `uv * cb_layer0_scalebias.xy + .zw`, against the reference.
+- Masks: per alpha tested material (key: the bound diffuse texture), a D3D11 pass renders its alpha (with the
+  shader's uv scale/bias and reference baked in as 0/1, or the raw alpha + reference per instance) into a shared
+  R8_UNORM strip (shared textures from D3D12 open in D3D11 only as render targets, R8/R16/RGBA8/RGB10A2 UNORM),
+  and D3D12 copies the strip into a slice of a private Texture2DArray (f4-mods rtcore/alpha_atlas.h: N strips per
+  frame, slices keyed by texture pointer, a counted cap). BC textures can't cross directly, hence the render pass.
+- UVs: VERTEX_TEXCOORD0 offset/format from the input layout, read from the vertex arena (already shared); per
+  geometry a small record (arena offsets, strides, index format, slice, uv scale/bias, reference) in a structured
+  buffer indexed by InstanceID (the low 23 bits are free).
+- Trace: on a cutout candidate, fetch the 3 indices and UVs, interpolate with `CandidateTriangleBarycentrics()`,
+  sample the slice (point/bilinear, LOD 0 or a ray cone LOD), `CommitNonOpaqueTriangleHit()` if alpha >= reference.
+  Cost: a few dependent loads per candidate; the stochastic version stays as the fallback for materials without a
+  slice.

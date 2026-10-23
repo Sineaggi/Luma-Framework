@@ -177,6 +177,14 @@ namespace
    std::mutex g_rtao_skip_reason_mutex;
    std::unordered_map<const char*, uint64_t> g_rtao_skip_reasons;
 
+   // RTAO foliage: wind (vertex animated vegetation, captured in rest pose) and alpha tested (cutout) geometry
+   bool g_rtao_wind_meshes = true; // Capture wind meshes (config "RTAOWindMeshes")
+   bool g_rtao_cutouts = true; // Capture alpha tested draws, as cutouts (config "RTAOCutouts")
+   float g_rtao_cutout_opacity = 0.5f; // Chance a ray crossing a cutout triangle stops there (config "RTAOCutoutOpacity")
+   std::unordered_set<uint64_t> g_rtao_alpha_tested_ps; // Alpha tested pixel shaders, by native object pointer (under g_rtao_shader_mutex)
+   std::atomic<uint64_t> g_rtao_ps_reflected = 0, g_rtao_ps_discard = 0, g_rtao_ps_alpha_tested = 0;
+   std::atomic<uint64_t> g_rtao_draws_alpha_tested = 0; // Main view draws with an alpha tested pixel shader
+
    int GetEffectiveAOMode()
    {
       int mode = g_ao_mode.load();
@@ -302,6 +310,7 @@ struct GameDeviceDataDishonored2 final : public GameDeviceData
    // Snapshots for the UI (written by the recorder)
    std::atomic<uint64_t> rtao_blas_count = 0, rtao_blas_bytes = 0;
    std::atomic<uint32_t> rtao_tlas_instances = 0, rtao_gpu_us = 0;
+   std::atomic<uint32_t> rtao_tlas_cutouts = 0;
 };
 
 //TODOFT: Building shaders menu (apply gamma?)
@@ -686,6 +695,7 @@ public:
       settings.filter_mode = (output == RTAO_OUTPUT_AO) ? RTAO::FilterMode::Temporal : RTAO::FilterMode::Off;
       settings.debug_mode = output == RTAO_OUTPUT_COVERAGE ? 3 : 0;
       settings.strength = g_rtao_strength;
+      settings.cutout_opacity = std::clamp(g_rtao_cutout_opacity, 0.f, 1.f);
       return settings;
    }
 
@@ -709,6 +719,7 @@ public:
          g.rtao_blas_count = g.rtao_blases.Count();
          g.rtao_blas_bytes = g.rtao_blases.ResultBytes();
          g.rtao_tlas_instances = instances;
+         g.rtao_tlas_cutouts = g.rtao_tlas.LastCutoutCount();
          g.rtao_gpu_us = uint32_t(g.rtao_timer.LastMs() * 1000.0);
          return true;
       };
@@ -1115,6 +1126,12 @@ public:
                ", capture skips: format " + std::to_string(stats.skipped[RTAO::kSkipFormat]) + ", dynamic buffer " + std::to_string(stats.skipped[RTAO::kSkipBuffer]) + ", binding " + std::to_string(stats.skipped[RTAO::kSkipBinding]) +
                ", other " + std::to_string(stats.skipped[RTAO::kSkipOther]) + ", drawn after the AO pass " + std::to_string(stats.after_ao_records);
             reshade::log::message(reshade::log::level::info, reasons.c_str());
+            char foliage[384];
+            snprintf(foliage, sizeof(foliage), "RTAO: foliage: wind draws captured %llu (%llu instances), alpha tested draws %llu (captured %llu, %llu instances), cutouts in the TLAS %u, pixel shaders alpha tested %llu of %llu with discard (%llu reflected)",
+               (unsigned long long)stats.wind_draws, (unsigned long long)stats.wind_instances, (unsigned long long)g_rtao_draws_alpha_tested.load(), (unsigned long long)stats.cutout_draws,
+               (unsigned long long)stats.cutout_instances, game_device_data.rtao_tlas_cutouts.load(), (unsigned long long)g_rtao_ps_alpha_tested.load(), (unsigned long long)g_rtao_ps_discard.load(),
+               (unsigned long long)g_rtao_ps_reflected.load());
+            reshade::log::message(reshade::log::level::info, foliage);
          }
       }
    }
@@ -1612,6 +1629,23 @@ public:
             const std::unique_lock lock(g_rtao_shader_mutex);
             g_rtao_vertex_shaders[pipeline.handle] = info;
          }
+         else if (subobject.type == reshade::api::pipeline_subobject_type::pixel_shader && subobject.data)
+         {
+            // Alpha tested pixel shaders make their draws cutouts (RTAO_NOTES.md "Alpha tested geometry")
+            const auto* desc = static_cast<const reshade::api::shader_desc*>(subobject.data);
+            if (!desc->code || desc->code_size == 0)
+               continue;
+            RTAO::PixelShaderInfo info;
+            RTAO::ReflectPixelShader(desc->code, desc->code_size, info);
+            g_rtao_ps_reflected++;
+            g_rtao_ps_discard += info.discard;
+            g_rtao_ps_alpha_tested += info.alpha_tested;
+            if (info.alpha_tested)
+            {
+               const std::unique_lock lock(g_rtao_shader_mutex);
+               g_rtao_alpha_tested_ps.insert(pipeline.handle);
+            }
+         }
          else if (subobject.type == reshade::api::pipeline_subobject_type::input_layout && subobject.data)
          {
             const auto* elements = static_cast<const reshade::api::input_element*>(subobject.data);
@@ -1640,6 +1674,7 @@ public:
       const std::unique_lock lock(g_rtao_shader_mutex);
       g_rtao_vertex_shaders.erase(pipeline.handle);
       g_rtao_input_layouts.erase(pipeline.handle);
+      g_rtao_alpha_tested_ps.erase(pipeline.handle);
    }
 
    // Is the bound depth target the main view's, with depth writes on? (Shadow maps and other views use other targets.)
@@ -1694,8 +1729,11 @@ public:
       context->VSGetShader(&vs, nullptr, nullptr);
       com_ptr<ID3D11InputLayout> layout;
       context->IAGetInputLayout(&layout);
+      com_ptr<ID3D11PixelShader> ps;
+      context->PSGetShader(&ps, nullptr, nullptr);
       RTAO::VertexShaderInfo vs_info;
       RTAO::InputLayoutInfo layout_info;
+      bool alpha_tested = false;
       {
          const std::shared_lock lock(g_rtao_shader_mutex);
          auto vs_it = g_rtao_vertex_shaders.find(uint64_t(uintptr_t(vs.get())));
@@ -1708,6 +1746,15 @@ public:
          auto layout_it = g_rtao_input_layouts.find(uint64_t(uintptr_t(layout.get())));
          if (layout_it != g_rtao_input_layouts.end())
             layout_info = layout_it->second;
+         alpha_tested = ps && g_rtao_alpha_tested_ps.count(uint64_t(uintptr_t(ps.get()))) != 0;
+      }
+      g_rtao_draws_alpha_tested += alpha_tested;
+      // Foliage family toggles (UI): left out of the scene when off
+      if ((vs_info.wind && !g_rtao_wind_meshes) || (alpha_tested && !g_rtao_cutouts))
+      {
+         const std::lock_guard lock(g_rtao_skip_reason_mutex);
+         g_rtao_skip_reasons[(vs_info.wind && !g_rtao_wind_meshes) ? "wind (off in the UI)" : "alpha tested (off in the UI)"]++;
+         return false;
       }
       g_rtao_draws_by_source[(std::min)(uint32_t(vs_info.source), 4u)]++;
       if (vs_info.source == RTAO::MatrixSource::None)
@@ -1774,6 +1821,7 @@ public:
       draw.instance_buffer = instance_buffer.get();
       draw.instance_index = instance_index.get();
       draw.per_view_cb = per_view_cb.get();
+      draw.cutout = alpha_tested;
 
       auto& device_data = *device->get_private_data<DeviceData>();
       if (device_data.game)
@@ -2096,6 +2144,10 @@ public:
       g_rtao_radius = std::clamp(g_rtao_radius, 0.05f, 50.f);
       g_rtao_rays = std::clamp(g_rtao_rays, 1, 64);
       g_rtao_capture_pass = std::clamp(g_rtao_capture_pass, 0, 1);
+      reshade::get_config_value(runtime, NAME, "RTAOWindMeshes", g_rtao_wind_meshes);
+      reshade::get_config_value(runtime, NAME, "RTAOCutouts", g_rtao_cutouts);
+      reshade::get_config_value(runtime, NAME, "RTAOCutoutOpacity", g_rtao_cutout_opacity);
+      g_rtao_cutout_opacity = std::clamp(g_rtao_cutout_opacity, 0.f, 1.f);
 
       auto& game_settings = cb_luma_global_settings.GameSettings;
       reshade::get_config_value(runtime, NAME, "BloomStrength", game_settings.BloomStrength);
@@ -2209,6 +2261,21 @@ public:
          if (ImGui::IsItemHovered())
             ImGui::SetTooltip("Deepens (> 1) or lightens (< 1) the ray traced AO: a power curve on the result. 1 = as traced.");
          DrawResetButton(g_rtao_strength, 1.f, "RTAOStrength");
+         if (ImGui::Checkbox("RTAO: wind meshes", &g_rtao_wind_meshes))
+            reshade::set_config_value(runtime, NAME, "RTAOWindMeshes", g_rtao_wind_meshes);
+         if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("Vertex animated vegetation (plants, trees, hanging things) in the ray tracing scene, in its rest pose (the wind sway is not replayed).\nChanges apply to newly captured geometry; what is already in the scene ages out within a few seconds.");
+         if (ImGui::Checkbox("RTAO: alpha tested cutouts", &g_rtao_cutouts))
+            reshade::set_config_value(runtime, NAME, "RTAOCutouts", g_rtao_cutouts);
+         if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("Alpha tested geometry (leaves, grates, fences, hair cards) in the ray tracing scene, as partially occluding cutouts (see the opacity below).\nChanges apply to newly captured geometry; what is already in the scene ages out within a few seconds.");
+         if (ImGui::SliderFloat("RTAO Cutout Opacity", &g_rtao_cutout_opacity, 0.f, 1.f, "%.2f"))
+            g_rtao_cutout_opacity = std::clamp(g_rtao_cutout_opacity, 0.f, 1.f);
+         if (ImGui::IsItemDeactivatedAfterEdit())
+            reshade::set_config_value(runtime, NAME, "RTAOCutoutOpacity", g_rtao_cutout_opacity);
+         if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("How much alpha tested surfaces occlude: the chance that a ray crossing one stops there (their texture's holes are not traced).\n0 = left out, 1 = as solid as the rest (cheapest).");
+         DrawResetButton(g_rtao_cutout_opacity, 0.5f, "RTAOCutoutOpacity");
 
          auto& game_device_data = GetGameDeviceData(device_data);
          if (game_device_data.rtao_capture.IsInitialized() && ImGui::TreeNode("RTAO stats"))
@@ -2228,6 +2295,10 @@ public:
             ImGui::Text("TLAS instances %u, instances read back last frame %llu, view model instances %llu, draws after the AO pass (left out) %llu", game_device_data.rtao_tlas_instances.load(), (unsigned long long)stats.frame_instances, (unsigned long long)stats.view_model_instances, (unsigned long long)stats.after_ao_records);
             ImGui::Text("Vertex shaders reflected: none %llu, direct %llu, indexed %llu, cbuffer %llu, MVP %llu", (unsigned long long)g_rtao_vs_by_source[0].load(), (unsigned long long)g_rtao_vs_by_source[1].load(),
                (unsigned long long)g_rtao_vs_by_source[2].load(), (unsigned long long)g_rtao_vs_by_source[3].load(), (unsigned long long)g_rtao_vs_by_source[4].load());
+            ImGui::Text("Foliage: wind draws captured %llu (%llu instances), alpha tested draws %llu (captured %llu, %llu instances), cutouts read back last frame %llu, in the TLAS %u",
+               (unsigned long long)stats.wind_draws, (unsigned long long)stats.wind_instances, (unsigned long long)g_rtao_draws_alpha_tested.load(), (unsigned long long)stats.cutout_draws,
+               (unsigned long long)stats.cutout_instances, (unsigned long long)stats.frame_cutout_instances, game_device_data.rtao_tlas_cutouts.load());
+            ImGui::Text("Pixel shaders reflected %llu: with discard %llu, alpha tested %llu", (unsigned long long)g_rtao_ps_reflected.load(), (unsigned long long)g_rtao_ps_discard.load(), (unsigned long long)g_rtao_ps_alpha_tested.load());
             ImGui::TreePop();
          }
       }

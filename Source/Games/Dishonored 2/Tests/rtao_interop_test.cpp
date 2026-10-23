@@ -157,7 +157,9 @@ static const Box kBoxes[] = {
    { { 3, 0, 2 }, { 4, 3, 3 } },
    { { -4.5f, 0.6f, -1 }, { -3.5f, 1.6f, 0 } }, // 0.6 above the ground, inside the 1.5 AO radius
    { { 4.5f, 0, -4 }, { 5.5f, 1, -3 } }, // Captured through the MVP-only family
+   { { -2.5f, 0, -4.5f }, { -1.5f, 1.5f, -3.5f } }, // Captured as an alpha tested (cutout) wind mesh; opaque elsewhere
 };
+static constexpr int kCutoutBox = 5;
 static constexpr int kBoxCount = int(sizeof(kBoxes) / sizeof(kBoxes[0]));
 
 // Unit cube [0,1]^3
@@ -550,35 +552,76 @@ static void TestReflection()
       const char* file;
       RTAO::MatrixSource source;
       const char* skip;
+      bool wind;
    };
    const Case cases[] = {
-      { "0x004D8839.vs_5_0.cso", RTAO::MatrixSource::DirectInstanceBuffer, nullptr }, // G-buffer, direct instance buffer
-      { "0x00603116.vs_5_0.cso", RTAO::MatrixSource::DirectInstanceBuffer, nullptr }, // depth only, direct instance buffer
-      { "0x000209DB.vs_5_0.cso", RTAO::MatrixSource::IndexedInstanceBuffer, nullptr },
-      { "0x0008106B.vs_5_0.cso", RTAO::MatrixSource::ConstantBuffer, nullptr },
-      { "0x0236F519.vs_5_0.cso", RTAO::MatrixSource::None, "skinned" },
-      { "0x0275C69D.vs_5_0.cso", RTAO::MatrixSource::MvpConstantBuffer, nullptr }, // MVP only, declares PerViewCB
-      { "0x00E0ECFF.vs_5_0.cso", RTAO::MatrixSource::MvpConstantBuffer, nullptr }, // MVP only, PerViewCB assumed at b1
+      { "0x004D8839.vs_5_0.cso", RTAO::MatrixSource::DirectInstanceBuffer, nullptr, false }, // G-buffer, direct instance buffer
+      { "0x00603116.vs_5_0.cso", RTAO::MatrixSource::DirectInstanceBuffer, nullptr, false }, // depth only, direct instance buffer
+      { "0x000209DB.vs_5_0.cso", RTAO::MatrixSource::IndexedInstanceBuffer, nullptr, false },
+      { "0x0008106B.vs_5_0.cso", RTAO::MatrixSource::ConstantBuffer, nullptr, false },
+      { "0x0236F519.vs_5_0.cso", RTAO::MatrixSource::None, "skinned", false },
+      { "0x0275C69D.vs_5_0.cso", RTAO::MatrixSource::MvpConstantBuffer, nullptr, false }, // MVP only, declares PerViewCB
+      { "0x00E0ECFF.vs_5_0.cso", RTAO::MatrixSource::MvpConstantBuffer, nullptr, false }, // MVP only, PerViewCB assumed at b1
+      { "0x65471A10.vs_5_0.cso", RTAO::MatrixSource::IndexedInstanceBuffer, nullptr, true }, // vegetation bending, ro_windbuffer
+      { "0x24159CF5.vs_5_0.cso", RTAO::MatrixSource::IndexedInstanceBuffer, nullptr, true }, // spline wind (ro_splineinfos)
+      { "0x09B3E8ED.vs_5_0.cso", RTAO::MatrixSource::IndexedInstanceBuffer, nullptr, true }, // vegetation bending, constant wind
+      { "0x0E19777D.vs_5_0.cso", RTAO::MatrixSource::DirectInstanceBuffer, nullptr, true }, // vegetation bending, direct family
    };
-   int tested = 0;
-   for (const Case& c : cases)
-   {
-      const std::string path = std::string(dump) + c.file;
+   auto load = [&](const char* file, std::vector<uint8_t>& code) {
+      const std::string path = std::string(dump) + file;
       FILE* f = fopen(path.c_str(), "rb");
       if (!f)
-         continue;
-      std::vector<uint8_t> code;
+         return false;
       fseek(f, 0, SEEK_END);
       code.resize(size_t(ftell(f)));
       fseek(f, 0, SEEK_SET);
       fread(code.data(), 1, code.size(), f);
       fclose(f);
+      return true;
+   };
+   int tested = 0;
+   for (const Case& c : cases)
+   {
+      std::vector<uint8_t> code;
+      if (!load(c.file, code))
+         continue;
       RTAO::VertexShaderInfo info;
       RTAO::ReflectVertexShader(code.data(), code.size(), info);
-      printf("reflect %s: source %u, skip %s, PerInstanceCB b%d, instance offset @%d, rows @%d/%d/%d, depth hack @%d, instance t%d (stride %u), index t%d\n", c.file, unsigned(info.source), info.skip_reason ? info.skip_reason : "-",
-         int(info.instance_cb_slot), int(info.instance_offset_cb), int(info.row_cb[0]), int(info.row_cb[1]), int(info.row_cb[2]), int(info.depth_hack_cb), int(info.instance_buffer_slot), info.instance_buffer_stride, int(info.instance_index_slot));
+      printf("reflect %s: source %u, skip %s, wind %d, PerInstanceCB b%d, instance offset @%d, rows @%d/%d/%d, depth hack @%d, instance t%d (stride %u), index t%d\n", c.file, unsigned(info.source), info.skip_reason ? info.skip_reason : "-",
+         int(info.wind), int(info.instance_cb_slot), int(info.instance_offset_cb), int(info.row_cb[0]), int(info.row_cb[1]), int(info.row_cb[2]), int(info.depth_hack_cb), int(info.instance_buffer_slot), info.instance_buffer_stride, int(info.instance_index_slot));
       CHECK(info.source == c.source, "%s: wrong matrix source", c.file);
       CHECK(!c.skip || (info.skip_reason && strcmp(info.skip_reason, c.skip) == 0), "%s: wrong skip reason", c.file);
+      CHECK(info.wind == c.wind, "%s: wind %d expected", c.file, int(c.wind));
+      tested++;
+   }
+
+   // Alpha test detection on the game's pixel shaders
+   struct PsCase
+   {
+      const char* file;
+      bool discard;
+      bool alpha_tested;
+   };
+   const PsCase ps_cases[] = {
+      { "0x048591C8.ps_5_0.cso", true, true }, // depth only: diffuse alpha vs cb_defaultalphatest
+      { "0x00376C8C.ps_5_0.cso", true, true }, // forward lit, cb_defaultalphatest
+      { "0x009040D6.ps_5_0.cso", true, true }, // vegetation (cb_vegetanim_*): diffuse alpha vs a hardcoded 0.5
+      { "0x00C30E15.ps_5_0.cso", true, true }, // vegetation depth only: alpha test 0.5, then LOD dithering
+      { "0x116EF527.ps_5_0.cso", true, true }, // hair (cb_hairalphatest)
+      { "0x013962FA.ps_5_0.cso", true, false }, // LOD dithering only (pixel position): opaque
+      { "0x008D47EA.ps_5_0.cso", true, false }, // discard on a DOF blur map: not a material alpha
+      { "0x0293C36F.ps_5_0.cso", true, false }, // dissolve effect only (noise textures vs threshold): opaque
+      { "0x0001F8D9.ps_5_0.cso", false, false }, // no discard
+   };
+   for (const PsCase& c : ps_cases)
+   {
+      std::vector<uint8_t> code;
+      if (!load(c.file, code))
+         continue;
+      RTAO::PixelShaderInfo info;
+      RTAO::ReflectPixelShader(code.data(), code.size(), info);
+      printf("reflect %s: discard %d, alpha tested %d\n", c.file, int(info.discard), int(info.alpha_tested));
+      CHECK(info.discard == c.discard && info.alpha_tested == c.alpha_tested, "%s: expected discard %d, alpha tested %d", c.file, int(c.discard), int(c.alpha_tested));
       tested++;
    }
    if (tested == 0)
@@ -720,6 +763,7 @@ static void TestGeometryCapture(ID3D11Device* device, ID3D11DeviceContext* conte
       return MakeBuffer(device, D3D11_BIND_CONSTANT_BUFFER, cb.data(), 480);
    };
    ID3D11Buffer* model_cb = make_cb_family(kBoxes[3], 1.f);
+   ID3D11Buffer* cutout_cb = make_cb_family(kBoxes[kCutoutBox], 1.f);
 
    // Family 4: MVP only (cb_mvpmatrixz @16, y @32, x @48, w @64, as in the game's skinned shaders; depth hack @84),
    // with the draw's PerViewCB holding cb_viewprojectionmatrix @32
@@ -816,6 +860,13 @@ static void TestGeometryCapture(ID3D11Device* device, ID3D11DeviceContext* conte
    draw_mvp.vs = &mvp_vs;
    draw_mvp.instance_cb = mvp_cb;
    draw_mvp.per_view_cb = per_view_cb;
+   // A wind animated, alpha tested plant: captured in rest pose, as a cutout
+   RTAO::VertexShaderInfo wind_vs = cb_vs;
+   wind_vs.wind = true;
+   RTAO::DrawInfo draw_cutout = base_draw();
+   draw_cutout.vs = &wind_vs;
+   draw_cutout.instance_cb = cutout_cb;
+   draw_cutout.cutout = true;
 
    ID3DBlob* cs_code = Compile(L"..\\..\\..\\..\\Shaders\\Dishonored 2\\Luma_RTAO.hlsl", "capture_instances_cs", "cs_5_0");
    ID3D11ComputeShader* capture_cs = nullptr;
@@ -841,11 +892,13 @@ static void TestGeometryCapture(ID3D11Device* device, ID3D11DeviceContext* conte
    settings.cam_pos[0] = eye.x; settings.cam_pos[1] = eye.y; settings.cam_pos[2] = eye.z;
    settings.cam_fwd[0] = f.x; settings.cam_fwd[1] = f.y; settings.cam_fwd[2] = f.z;
 
+   uint32_t last_tlas_cutouts = 0;
    auto run_frame = [&](RTAO::FilterMode filter_mode, uint32_t debug_mode) {
       // The "game" draws: two families on the immediate context, the third (and the view model) on a deferred one
       CHECK(capture.CaptureDraw(context, draw_direct), "capture (direct)");
       CHECK(capture.CaptureDraw(context, draw_indexed), "capture (indexed)");
       CHECK(capture.CaptureDraw(context, draw_mvp), "capture (MVP only)");
+      CHECK(capture.CaptureDraw(context, draw_cutout), "capture (cutout, wind)");
       CHECK(capture.CaptureDraw(deferred, draw_cb), "capture (cbuffer)");
       CHECK(capture.CaptureDraw(deferred, draw_view_model), "capture (view model)");
       ID3D11CommandList* command_list = nullptr;
@@ -881,6 +934,7 @@ static void TestGeometryCapture(ID3D11Device* device, ID3D11DeviceContext* conte
          uint32_t count = 0;
          if (!tlas.Build(ctx, blases, info.frame_slot, top, count, err))
             return false;
+         last_tlas_cutouts = tlas.LastCutoutCount();
          if (!pass.Record(list, info, top, settings, retirer, err))
             return false;
          timer.End(list, info.frame_slot);
@@ -905,6 +959,10 @@ static void TestGeometryCapture(ID3D11Device* device, ID3D11DeviceContext* conte
    CHECK(stats.buffers_copied == 2, "the vertex and index buffers are copied once");
    CHECK(stats.tlas_instances == kBoxCount, "%d boxes in the TLAS (the view model left out), got %llu", kBoxCount, (unsigned long long)stats.tlas_instances);
    CHECK(stats.view_model_instances == 1, "the view model draw must be flagged");
+   printf("foliage: wind draws %llu (%llu instances), cutout draws %llu (%llu instances), cutouts read back last frame %llu, in the TLAS %u\n", (unsigned long long)stats.wind_draws,
+      (unsigned long long)stats.wind_instances, (unsigned long long)stats.cutout_draws, (unsigned long long)stats.cutout_instances, (unsigned long long)stats.frame_cutout_instances, last_tlas_cutouts);
+   CHECK(stats.wind_draws == 6 && stats.cutout_draws == 6, "one wind/cutout draw per frame must be counted");
+   CHECK(stats.frame_cutout_instances == 1 && last_tlas_cutouts == 1, "the cutout box must be in the TLAS as a cutout");
 
    auto average = [&](const std::vector<float>& ao, auto predicate, int& count) {
       double sum = 0;
@@ -958,6 +1016,36 @@ static void TestGeometryCapture(ID3D11Device* device, ID3D11DeviceContext* conte
    printf("BLAS coverage: %d of %d geometry pixels match the depth (%.1f%%), RT pass GPU time %.3f ms\n", matched, hits, 100.0 * matched / std::max(hits, 1), timer.LastMs());
    CHECK(matched > hits * 0.98, "captured geometry must line up with the depth");
 
+   // Cutouts: the ground next to the alpha tested box at opacity 0 (as if the box weren't there), 0.5 and 1 (solid).
+   // Averaged over frames (the per crossing coin flip changes every frame, like the ray directions).
+   auto is_near_cutout = [&](UINT i) { return hit_id[i] == 0 && BoxDistance(hit_pos[i], kBoxes[kCutoutBox]) < 0.15f; };
+   const float opacities[3] = { 0.f, 0.5f, 1.f };
+   float near_cutout[3] = {}, gpu_ms[3] = {};
+   for (int o = 0; o < 3; o++)
+   {
+      settings.cutout_opacity = opacities[o];
+      double sum = 0, ms = 0;
+      int count = 0, timed = 0;
+      for (int frame = 0; frame < 16; frame++)
+      {
+         std::vector<float> ao = run_frame(RTAO::FilterMode::Off, 0);
+         sum += average(ao, is_near_cutout, count);
+         if (frame >= 4) // The timer reads back a few frames late
+         {
+            ms += timer.LastMs();
+            timed++;
+         }
+      }
+      near_cutout[o] = float(sum / 16);
+      gpu_ms[o] = float(ms / timed);
+      CHECK(count > 5, "pixels next to the cutout box (%d)", count);
+   }
+   settings.cutout_opacity = 0.5f;
+   printf("next to the cutout box (raw AO, 16 frames): opacity 0 %.3f, 0.5 %.3f, 1 %.3f; RT pass GPU time %.3f / %.3f / %.3f ms\n", near_cutout[0], near_cutout[1], near_cutout[2], gpu_ms[0], gpu_ms[1], gpu_ms[2]);
+   CHECK(near_cutout[0] > 0.97f, "opacity 0 must leave the cutout box out");
+   CHECK(near_cutout[2] < 0.8f, "opacity 1 must make the cutout box solid");
+   CHECK(near_cutout[1] < near_cutout[0] - 0.03f && near_cutout[1] > near_cutout[2] + 0.03f, "opacity 0.5 must occlude between no box and a solid box");
+
    CHECK(interop.WaitForIdle(5000), "WaitForIdle");
    retirer.ReleaseAll();
    timer.Shutdown();
@@ -966,7 +1054,7 @@ static void TestGeometryCapture(ID3D11Device* device, ID3D11DeviceContext* conte
    blases.Clear(nullptr, 0);
    capture.Shutdown();
    deferred->Release();
-   for (IUnknown* p : std::initializer_list<IUnknown*>{ vb, ib, direct_buffer, direct_srv, direct_cb_buffer, indexed_buffer, indexed_srv, index_buffer, index_srv, indexed_cb_buffer, model_cb, view_model_cb, mvp_cb, per_view_cb, depth_srv, depth_texture })
+   for (IUnknown* p : std::initializer_list<IUnknown*>{ vb, ib, direct_buffer, direct_srv, direct_cb_buffer, indexed_buffer, indexed_srv, index_buffer, index_srv, indexed_cb_buffer, model_cb, cutout_cb, view_model_cb, mvp_cb, per_view_cb, depth_srv, depth_texture })
       p->Release();
 }
 

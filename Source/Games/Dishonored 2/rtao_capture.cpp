@@ -8,6 +8,7 @@
 #include <cmath>
 #include <cstdio>
 #include <cstring>
+#include <functional>
 
 namespace RTAO
 {
@@ -152,7 +153,7 @@ namespace RTAO
          if (!bind.Name)
             continue;
          if (strstr(bind.Name, "windbuffer") || strstr(bind.Name, "splineinfos"))
-            out.skip_reason = "wind";
+            out.wind = true; // Captured in rest pose, through its matrix family (RTAO_NOTES.md "Wind")
          else if (strstr(bind.Name, "particle"))
             out.skip_reason = "particles";
          else if (strstr(bind.Name, "ocean") || strstr(bind.Name, "fftwaves"))
@@ -210,6 +211,8 @@ namespace RTAO
                if (FAILED(cb->GetVariableByIndex(v)->GetDesc(&var)) || !var.Name)
                   continue;
                const bool used = (var.uFlags & D3D_SVF_USED) != 0;
+               if (used && strncmp(var.Name, "cb_vegetanim_", 13) == 0)
+                  out.wind = true; // Vegetation bending with a constant wind (no ro_windbuffer)
                if (strcmp(var.Name, "cb_instancebufferoffset") == 0)
                   out.instance_offset_cb = var.StartOffset;
                else if (strcmp(var.Name, "cb_modeldepthhack") == 0)
@@ -345,6 +348,281 @@ namespace RTAO
       default:
          return DXGI_FORMAT_UNKNOWN;
       }
+   }
+
+   // ---- Pixel shaders: alpha test detection
+
+   bool DxbcHasDiscard(const void* code, size_t code_size)
+   {
+      // DXBC container: "DXBC", 16 byte checksum, version, total size, chunk count, chunk offsets. Each chunk: fourcc,
+      // size, data. The shader program chunk (SHEX, or SHDR for SM4) holds the version token, the length in tokens,
+      // then instructions: opcode in bits 0..10, instruction length in tokens in bits 24..30 (customdata, opcode 53,
+      // stores its length in the next token instead).
+      const auto* bytes = static_cast<const uint8_t*>(code);
+      auto u32 = [&](size_t offset) {
+         uint32_t v;
+         std::memcpy(&v, bytes + offset, 4);
+         return v;
+      };
+      if (!code || code_size < 32 || std::memcmp(bytes, "DXBC", 4) != 0)
+         return false;
+      const uint32_t chunk_count = u32(28);
+      if (chunk_count > 64 || 32 + size_t(chunk_count) * 4 > code_size)
+         return false;
+      for (uint32_t c = 0; c < chunk_count; c++)
+      {
+         const size_t chunk = u32(32 + c * 4);
+         if (chunk + 8 > code_size)
+            continue;
+         if (std::memcmp(bytes + chunk, "SHEX", 4) != 0 && std::memcmp(bytes + chunk, "SHDR", 4) != 0)
+            continue;
+         const size_t data = chunk + 8;
+         const size_t data_size = (std::min)(size_t(u32(chunk + 4)), code_size - data);
+         if (data_size < 8)
+            return false;
+         const size_t tokens = (std::min)(size_t(u32(data + 4)), data_size / 4);
+         constexpr uint32_t kOpcodeDiscard = 13; // D3D10_SB_OPCODE_DISCARD
+         constexpr uint32_t kOpcodeCustomData = 53; // D3D10_SB_OPCODE_CUSTOMDATA
+         for (size_t i = 2; i < tokens;)
+         {
+            const uint32_t token = u32(data + i * 4);
+            const uint32_t opcode = token & 0x7FF;
+            uint32_t length = (token >> 24) & 0x7F;
+            if (opcode == kOpcodeCustomData)
+               length = i + 1 < tokens ? u32(data + (i + 1) * 4) : 0;
+            if (opcode == kOpcodeDiscard)
+               return true;
+            if (length == 0)
+               return false; // Malformed
+            i += length;
+         }
+         return false;
+      }
+      return false;
+   }
+
+   namespace
+   {
+      // Forward data flow over the shader program: which temp register components hold a value derived from a read of
+      // one of the "alpha_slots" textures, and whether a discard's condition (or an enclosing if) is such a value.
+      // Per component for temps (r#), one flag per indexable temp array (x#). Conservative where it doesn't matter
+      // (all components a source operand selects taint every written component).
+      bool DiscardReadsTextures(const uint8_t* bytes, size_t code_size, const bool (&alpha_slots)[128])
+      {
+         auto u32 = [&](size_t offset) {
+            uint32_t v;
+            std::memcpy(&v, bytes + offset, 4);
+            return v;
+         };
+         if (code_size < 32 || std::memcmp(bytes, "DXBC", 4) != 0)
+            return false;
+         const uint32_t chunk_count = u32(28);
+         if (chunk_count > 64 || 32 + size_t(chunk_count) * 4 > code_size)
+            return false;
+         size_t data = 0, tokens = 0;
+         for (uint32_t c = 0; c < chunk_count && !data; c++)
+         {
+            const size_t chunk = u32(32 + c * 4);
+            if (chunk + 16 > code_size || (std::memcmp(bytes + chunk, "SHEX", 4) != 0 && std::memcmp(bytes + chunk, "SHDR", 4) != 0))
+               continue;
+            data = chunk + 8;
+            tokens = (std::min)(size_t(u32(data + 4)), (std::min)(size_t(u32(chunk + 4)), code_size - data) / 4);
+         }
+         if (!data)
+            return false;
+         auto token = [&](size_t i) { return u32(data + i * 4); };
+
+         enum : uint32_t
+         {
+            kTemp = 0, kIndexableTemp = 3, kImmediate32 = 4, kImmediate64 = 5, kResource = 7,
+         };
+         struct Operand
+         {
+            uint32_t type;
+            uint32_t index; // First index (register number), if any
+            uint32_t components; // Bit mask: write mask (dest) or components read (source)
+         };
+         // Decodes one operand at "i" (advanced past it). False if malformed.
+         std::function<bool(size_t&, size_t, Operand&)> parse = [&](size_t& i, size_t end, Operand& op) -> bool {
+            if (i >= end)
+               return false;
+            const uint32_t t = token(i++);
+            for (uint32_t ext = t >> 31; ext;)
+            {
+               if (i >= end)
+                  return false;
+               ext = token(i++) >> 31;
+            }
+            const uint32_t num_components = t & 3, selection = (t >> 2) & 3;
+            op = { (t >> 12) & 0xFF, 0, 0 };
+            if (num_components == 2)
+            {
+               if (selection == 0)
+                  op.components = (t >> 4) & 0xF;
+               else if (selection == 1)
+                  for (uint32_t c = 0; c < 4; c++)
+                     op.components |= 1u << ((t >> (4 + 2 * c)) & 3);
+               else
+                  op.components = 1u << ((t >> 4) & 3);
+            }
+            else if (num_components == 1)
+            {
+               op.components = 1;
+            }
+            if (op.type == kImmediate32 || op.type == kImmediate64)
+            {
+               const size_t count = num_components == 1 ? 1 : (num_components == 2 ? 4 : 0);
+               i += count * (op.type == kImmediate64 ? 2 : 1);
+               return i <= end;
+            }
+            const uint32_t index_dimension = (t >> 20) & 3;
+            for (uint32_t d = 0; d < index_dimension; d++)
+            {
+               const uint32_t representation = (t >> (22 + 3 * d)) & 7;
+               if (representation == 0 || representation == 3) // Immediate32 (+ relative)
+               {
+                  if (i >= end)
+                     return false;
+                  if (d == 0)
+                     op.index = token(i);
+                  i++;
+               }
+               else if (representation == 1 || representation == 4) // Immediate64 (+ relative)
+               {
+                  i += 2;
+               }
+               if (representation == 2 || representation == 3 || representation == 4) // Relative: an operand follows
+               {
+                  Operand relative;
+                  if (!parse(i, end, relative))
+                     return false;
+               }
+            }
+            return i <= end;
+         };
+
+         std::vector<uint8_t> temps; // 4 bits per temp register: tainted components
+         std::vector<uint8_t> indexable; // Per x# array
+         std::vector<bool> if_stack;
+         auto taint_of = [&](const Operand& op) -> bool {
+            if (op.type == kTemp)
+               return op.index < temps.size() && (temps[op.index] & op.components) != 0;
+            if (op.type == kIndexableTemp)
+               return op.index < indexable.size() && indexable[op.index] != 0;
+            return false;
+         };
+         constexpr uint32_t kOpDiscard = 13, kOpIf = 31, kOpEndIf = 21, kOpCustomData = 53;
+         auto is_declaration = [](uint32_t op) { return (op >= 88 && op <= 106) || (op >= 143 && op <= 162) || (op >= 113 && op <= 116); };
+         auto dest_count = [](uint32_t op) -> uint32_t {
+            switch (op)
+            {
+            // No destination: flow control, discard, emit, stores
+            case 2: case 3: case 4: case 5: case 6: case 7: case 8: case 9: case 10: case 13: case 18: case 19: case 20: case 21: case 22:
+            case 23: case 31: case 44: case 48: case 58: case 62: case 63: case 76: case 117: case 118: case 119: case 164: case 166: case 168:
+            case 169: case 170: case 171: case 172: case 173: case 174: case 175: case 176: case 177:
+               return 0;
+            // Two destinations: imul, sincos, udiv, umul, uaddc, usubb, swapc
+            case 38: case 77: case 78: case 81: case 132: case 133: case 142:
+               return 2;
+            default:
+               return 1;
+            }
+         };
+         auto reads_texture = [](uint32_t op) {
+            // ld, ld_ms, sample (all variants), gather4 (all variants)
+            return op == 45 || op == 46 || (op >= 69 && op <= 74) || op == 109 || (op >= 126 && op <= 128);
+         };
+
+         for (size_t i = 2; i < tokens;)
+         {
+            const uint32_t t = token(i);
+            const uint32_t op = t & 0x7FF;
+            const size_t length = op == kOpCustomData ? (i + 1 < tokens ? token(i + 1) : 0) : ((t >> 24) & 0x7F);
+            if (length == 0 || i + length > tokens)
+               return false; // Malformed
+            const size_t end = i + length;
+            if (op == kOpCustomData || is_declaration(op))
+            {
+               i = end;
+               continue;
+            }
+            size_t j = i + 1;
+            for (uint32_t ext = t >> 31; ext && j < end;)
+               ext = token(j++) >> 31;
+            Operand operands[8];
+            uint32_t count = 0;
+            while (j < end && count < 8)
+               if (!parse(j, end, operands[count++]))
+                  return false;
+            const uint32_t dests = (std::min)(dest_count(op), count);
+            bool tainted = false;
+            for (uint32_t k = dests; k < count; k++)
+            {
+               tainted = tainted || taint_of(operands[k]);
+               if (reads_texture(op) && operands[k].type == kResource && operands[k].index < 128 && alpha_slots[operands[k].index])
+                  tainted = true;
+            }
+            for (uint32_t k = 0; k < dests; k++)
+            {
+               const Operand& d = operands[k];
+               if (d.type == kTemp && d.index < 4096)
+               {
+                  if (d.index >= temps.size())
+                     temps.resize(d.index + 1, 0);
+                  temps[d.index] = uint8_t(tainted ? (temps[d.index] | d.components) : (temps[d.index] & ~d.components));
+               }
+               else if (d.type == kIndexableTemp && d.index < 4096)
+               {
+                  if (d.index >= indexable.size())
+                     indexable.resize(d.index + 1, 0);
+                  indexable[d.index] |= tainted ? 1 : 0;
+               }
+            }
+            if (op == kOpIf)
+               if_stack.push_back(tainted);
+            else if (op == kOpEndIf && !if_stack.empty())
+               if_stack.pop_back();
+            else if (op == kOpDiscard && (tainted || std::find(if_stack.begin(), if_stack.end(), true) != if_stack.end()))
+               return true;
+            i = end;
+         }
+         return false;
+      }
+   }
+
+   bool ReflectPixelShader(const void* code, size_t code_size, PixelShaderInfo& out)
+   {
+      out = {};
+      out.discard = DxbcHasDiscard(code, code_size);
+      if (!out.discard)
+         return true;
+      // The game discards for several reasons: alpha test (diffuse alpha against cb_defaultalphatest, cb_hairalphatest,
+      // or a hardcoded 0.5 in the vegetation shaders), but also LOD dithering (cb_ditheringdistance, from the pixel
+      // position) and the dissolve/immolation effects (noise textures against a threshold), which leave opaque meshes
+      // opaque. So a shader is a cutout if a discard depends on a read of its diffuse/opacity/alpha texture.
+      auto reflect = GetD3DReflect();
+      if (!reflect)
+         return false;
+      ID3D11ShaderReflection* reflection = nullptr;
+      if (FAILED(reflect(code, code_size, kIID_ID3D11ShaderReflection, reinterpret_cast<void**>(&reflection))) || !reflection)
+         return false;
+      D3D11_SHADER_DESC desc = {};
+      reflection->GetDesc(&desc);
+      bool alpha_slots[128] = {};
+      bool any = false;
+      for (UINT r = 0; r < desc.BoundResources; r++)
+      {
+         D3D11_SHADER_INPUT_BIND_DESC bind = {};
+         if (FAILED(reflection->GetResourceBindingDesc(r, &bind)) || !bind.Name || bind.Type != D3D_SIT_TEXTURE)
+            continue;
+         if (!strstr(bind.Name, "diffuse") && !strstr(bind.Name, "opacity") && !strstr(bind.Name, "alpha"))
+            continue;
+         for (UINT k = 0; k < (std::max)(bind.BindCount, 1u) && bind.BindPoint + k < 128; k++)
+            alpha_slots[bind.BindPoint + k] = any = true;
+      }
+      reflection->Release();
+      out.alpha_tested = any && DiscardReadsTextures(static_cast<const uint8_t*>(code), code_size, alpha_slots);
+      return true;
    }
 
    // ---- GeometryCapture
@@ -650,12 +928,23 @@ namespace RTAO
       {
          Rec record = {};
          record.type = Rec::Instances;
+         record.mask = draw.cutout ? kInstanceMaskCutout : kInstanceMaskOpaque;
          record.mesh_key = key;
          record.first_slot = dst_slot;
          record.count = draw.instance_count;
          local.push_back(record);
          stats.draws_captured++;
          stats.instances_captured += draw.instance_count;
+         if (draw.vs->wind)
+         {
+            stats.wind_draws++;
+            stats.wind_instances += draw.instance_count;
+         }
+         if (draw.cutout)
+         {
+            stats.cutout_draws++;
+            stats.cutout_instances += draw.instance_count;
+         }
       }
       else
       {
@@ -842,12 +1131,12 @@ namespace RTAO
 
       // 1) Matrices captured 3 frames ago (this slot's last use has completed: Interop waited for its allocator)
       tlas.BeginFrame();
-      uint64_t frame_instances = 0, view_model = 0;
+      uint64_t frame_instances = 0, view_model = 0, frame_cutouts = 0;
       if (!readback_records[slot].empty())
       {
          uint64_t total = 0;
          for (const auto& r : readback_records[slot])
-            total += r.second;
+            total += r.count;
          const uint8_t* data = nullptr;
          D3D12_RANGE range = { 0, SIZE_T(total * 64) };
          if (SUCCEEDED(readback[slot]->Map(0, &range, (void**)&data)) && data)
@@ -855,7 +1144,7 @@ namespace RTAO
             uint64_t index = 0;
             for (const auto& r : readback_records[slot])
             {
-               for (uint32_t i = 0; i < r.second; i++, index++)
+               for (uint32_t i = 0; i < r.count; i++, index++)
                {
                   const float* rows = reinterpret_cast<const float*>(data + index * 64);
                   const uint32_t flags = *reinterpret_cast<const uint32_t*>(data + index * 64 + 48);
@@ -872,7 +1161,7 @@ namespace RTAO
                   if (!finite || (rows[0] == 0.f && rows[1] == 0.f && rows[2] == 0.f))
                      continue;
                   // Identity: mesh + transform quantized to ~1 cm / 1e-3 (instance buffers carry no stable id)
-                  uint64_t key = r.first;
+                  uint64_t key = r.mesh_key;
                   for (int k = 0; k < 12; k++)
                   {
                      const bool translation = (k % 4) == 3;
@@ -880,8 +1169,9 @@ namespace RTAO
                   }
                   float transform[3][4];
                   std::memcpy(transform, rows, sizeof(transform));
-                  tlas.AddInstance(key, r.first, transform);
+                  tlas.AddInstance(key, r.mesh_key, transform, r.mask);
                   frame_instances++;
+                  frame_cutouts += (r.mask & kInstanceMaskCutout) != 0;
                }
             }
             D3D12_RANGE written = { 0, 0 };
@@ -929,7 +1219,7 @@ namespace RTAO
                remaining -= len;
                src = (src + len) % kRingSlots;
             }
-            readback_records[slot].emplace_back(record.mesh_key, record.count);
+            readback_records[slot].push_back({ record.mesh_key, record.count, record.mask });
          }
          flush();
          Transition(list, ring12, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_COMMON);
@@ -976,6 +1266,7 @@ namespace RTAO
       stats.blas_failed += failed;
       stats.blas_evicted += evict.size();
       stats.frame_instances = frame_instances;
+      stats.frame_cutout_instances = frame_cutouts;
       stats.view_model_instances = view_model;
       stats.readback_overflow += overflow;
       stats.tlas_instances = tlas.RetainedCount();

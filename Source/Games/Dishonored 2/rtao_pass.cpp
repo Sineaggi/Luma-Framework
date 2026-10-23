@@ -301,6 +301,7 @@ namespace RTAO
       constants.bias = settings.bias;
       constants.debug_mode = settings.debug_mode;
       constants.strength = settings.strength;
+      constants.cutout_opacity = settings.cutout_opacity;
       const uint32_t slot = info.frame_slot % kSlots;
       std::memcpy(constants_mapped + slot * kConstantsStride, &constants, sizeof(constants));
 

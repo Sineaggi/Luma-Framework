@@ -35,8 +35,10 @@ namespace RTAO
       float bias;
       uint32_t debug_mode;
       float strength;
+      float cutout_opacity;
+      uint32_t cutout_pad[3];
    };
-   static_assert(sizeof(PassConstants) == 240);
+   static_assert(sizeof(PassConstants) == 256);
 
    enum class FilterMode : uint32_t
    {
@@ -64,6 +66,9 @@ namespace RTAO
       float clamp_k = 1.f / 16.f;
       uint32_t debug_mode = 0; // 1 reconstructed normal Y (raw), 2 history rejection (filtered), 3 BLAS coverage (raw)
       float strength = 1.f; // Power curve on the denoised AO (> 1 deepens it)
+      // Chance that a ray crossing an alpha tested (cutout) triangle is stopped by it: approximates partial coverage
+      // (leaves, grates). 0 = cutouts are left out, 1 = as solid as the rest.
+      float cutout_opacity = 0.5f;
       bool reset_history = false;
    };
 

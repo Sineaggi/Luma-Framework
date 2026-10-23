@@ -23,6 +23,13 @@
 
 namespace RTAO
 {
+   // TLAS instance masks (the ray's mask selects what it can hit). Every instance is forced opaque, except cutouts
+   // (alpha tested geometry: leaves, grates, fences), which are forced non opaque and get kInstanceIdCutoutBit in their
+   // InstanceID, so the trace can resolve them in its candidate loop (see Shaders/rtao_trace.hlsl).
+   constexpr uint8_t kInstanceMaskOpaque = 0x01;
+   constexpr uint8_t kInstanceMaskCutout = 0x02;
+   constexpr uint32_t kInstanceIdCutoutBit = 1u << 23;
+
    class Retirer
    {
    public:
@@ -117,7 +124,8 @@ namespace RTAO
       // Advances the frame and prunes instances not seen for more than "retain_frames"
       void BeginFrame();
       // Thread safe. "object_to_world" is a row major 3x4 (the D3D12 instance transform layout).
-      void AddInstance(uint64_t instance_key, uint64_t blas_key, const float object_to_world[3][4], uint8_t mask = 0xFF);
+      // "mask": kInstanceMaskOpaque, or kInstanceMaskCutout for alpha tested geometry (non opaque in the TLAS).
+      void AddInstance(uint64_t instance_key, uint64_t blas_key, const float object_to_world[3][4], uint8_t mask = kInstanceMaskOpaque);
       void RemoveInstance(uint64_t instance_key);
       size_t RetainedCount();
 
@@ -126,6 +134,7 @@ namespace RTAO
       bool Build(const BuildContext& ctx, const BlasCache& blases, uint32_t frame_slot, D3D12_GPU_VIRTUAL_ADDRESS& out, uint32_t& instance_count, std::string& error);
 
       void Clear(Retirer* retirer, uint64_t fence_value);
+      uint32_t LastCutoutCount() const { return last_cutout_count; } // Cutout instances in the last Build
       uint32_t retain_frames = kRetainFrames;
       uint32_t promote_frames = kPromoteFrames;
       uint32_t young_retain_frames = kYoungRetainFrames;
@@ -142,6 +151,7 @@ namespace RTAO
       std::mutex mutex;
       std::unordered_map<uint64_t, Instance> instances;
       uint32_t frame = 0;
+      uint32_t last_cutout_count = 0;
 
       static constexpr uint32_t kSlots = 3; // Matches Interop's frames in flight
       ID3D12Resource* instance_upload[kSlots] = {};

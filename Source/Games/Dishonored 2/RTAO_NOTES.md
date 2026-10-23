@@ -187,3 +187,97 @@ Texture exact path (not implemented): the coverage the game really uses is `diff
   sample the slice (point/bilinear, LOD 0 or a ray cone LOD), `CommitNonOpaqueTriangleHit()` if alpha >= reference.
   Cost: a few dependent loads per candidate; the stochastic version stays as the fallback for materials without a
   slice.
+
+## RT sun shadows
+
+Offline analysis of the same dump (8367 PS, 48 CS, RDEF of every shader, `fxc /dumpbin` of the key ones) plus the
+strings of Dishonored2.exe (Steam 1.77.9.0). Not verified in game yet.
+
+### How the game shades and shadows the sun/moon
+
+The world is lit by a tiled FORWARD renderer ("tlf" = tiled light forward: CS `0x32EF950D`/`0x7576F9BC` cull
+`ro_tlf_lights_sb` into per tile linked lists `ro_tlf_ll_heads`/`ro_tlf_ll_pool`), not a deferred lighting pass. The
+directional light ("parallel light": sun or moon) is shaded in every forward pixel shader (3731 of them use
+`cb_parallellightdir`). Its shadow is NOT computed there for opaque world geometry: it comes from a screen space
+shadow mask computed before the forward pass.
+
+1. Screen shadows pass, fullscreen PS `0xF324B47B` ("screenShadowsNoJitter.material", inputs: INTERP0 uv only) or
+   `0x6C8C2397` ("screenShadows.material": same, plus SV_POSITION for a 4x4 Bayer dither that moves the shadow lookup
+   toward the camera by `cb_screenshadows_stepsize * bayer / 64`). Bindings: t0 `ro_lightdepthcomparemap`
+   (Texture2DArray, the cascaded shadow map, one slice per cascade), t1 `ro_env_atm_sky_cloudshadow`, t2
+   `ro_screenshadows_depthbuffer` (device depth, sampled at `uv * cb_resolutionscale`, point clamp), s0
+   `smp_shadowhardwarepcfsampler` (comparison), b1 PerViewCB, b2 PerInstanceCB (400 bytes):
+   `cb_parallellightslicefars` @0, `cb_shadowprojections[5]` (float4x4) @16, `cb_atm_sky_sundirection` @336,
+   `cb_env_atm_sky_cloudaltitude` @348, `cb_shadow_bias` @352, `cb_screenshadows_stepsize` @356,
+   `cb_modeldepthhack` @360, cloud tiling/speed/rotation/density @364..384.
+   - world position from depth: `cb_inverseviewprojectionmatrix` applied to (ndc.xy, depth * cb_modeldepthhack, 1).
+   - cascade = number of `cb_parallellightslicefars` components <= view depth (view depth from `cb_viewmatrix`
+     column z).
+   - light space = `x * M[0] + y * M[1] + z * M[2] + M[3]` with `M = cb_shadowprojections[cascade]` (row vector
+     convention, rows at cb2[1 + 4c .. 4 + 4c]); uv = `ls.xy * cb_parallelshadowmapslicedimensions.xy + 0.5`,
+     reference = `ls.z - cb_shadow_bias`.
+   - PCF: 4 bilinear `SampleCmpLevelZero` taps with tent weights, `/ 16` (a 3x3 tent over 4x4 texels).
+   - cloud shadow: a ray from the point along `cb_atm_sky_sundirection` (world space, toward the light, z up) to a
+     sphere at the cloud altitude, sample `ro_env_atm_sky_cloudshadow` there, `min(exp(-density * c), 1)`.
+   - output: `cloud * pcf` into all 4 channels.
+2. Separable bilateral blur, PS `0x9A8C5E06` / `0x9B5682FF` ("screenShadows/bilateralBlur/blurX/Y"): reads `.y` of
+   `ro_screenshadows_bilateralblur_sourceimage` with linearized depth weights, writes all channels.
+3. The result is `ro_texscreenshadows` (string "texScreenshadows"). The exe also has "ssaoScreenShadows" and
+   "_SSAO_ScreenShadows_%p": the game's SSAO and the screen shadows share one render target, x = AO (the SSAO pass and
+   the DWAO blur `0x4CD2BE39`, i.e. the target RTAO's composite writes `(ao, 1, 0, 0)` into), y = sun shadow. The
+   screen shadows and its blur must then write y only (blend/write mask), which matches the forward shaders' use of
+   x and y. To confirm in game (the "View AO only" path reads x; the y channel after the blur is the sun term).
+4. Forward pass, opaque world shaders (1726 variants with `ro_texscreenshadows` and no cascade code; and 997 that
+   also have the cascades): `ld ro_texscreenshadows[SV_POSITION.xy]`; `.y` > 0 gates the whole sun term
+   (`cb_parallellightcolor * y * BRDF(N, L = cb_parallellightdir.xyz, V)`), `.x` (AO) is min'ed into the specular
+   occlusion. `cb_parallellightdir` is world space, pointing TOWARD the light (it is used as L in N.L and in the half
+   vector), in PerInstanceCB at a per shader offset (64 in `0x0009E597`, 736 in `0x0002C598`).
+5. Shaders that compute the cascades themselves (same PCF code inline, with `ro_lightdepthcomparemap`): skin (SSS,
+   `ro_translucency_mask`, ~900 variants, which also need the shadow map depth for translucency), hair (~450),
+   translucent/alpha lit and FX (~600), water/ocean (~30). They read `ro_texscreenshadows.x` (AO) at most, so a
+   change to the screen shadow mask does not reach them: characters' skin/hair and transparent surfaces keep the
+   game's shadow maps.
+
+Frame order, from the render pass enum strings in the exe (`ARK_RENDERPASS_*`, in enum order): DEPTHPASS,
+DEPTHMINMAX, SSAO, SHADOWS_WORLD, SHADOWS_DYNAMIC, INDIRECT_LIGHTING_*, SCREENSHADOWS, TLFLIGHTCULL, FORWARD_WORLD,
+FORWARD_DYNAMIC, ... So the SSAO draw (where RTAO already runs its D3D12 submission) comes before the shadow maps
+and the screen shadows pass. The game records passes on several deferred contexts, but executes them in this order
+(the enum order is an inference, check it in game: the RT sun stats show how old the visibility was).
+
+### Injection
+
+The screen shadows pass is the single point where the opaque world's sun visibility is made, as a fullscreen draw,
+with the shadow map term isolated (`pcf`) from the clouds (`cloud`). Replacing its two pixel shaders gives full
+control without touching any of the ~3700 forward shader permutations:
+- `Shaders/Dishonored 2/ScreenShadows_0xF324B47B_0x6C8C2397.ps_5_0.hlsl`: an HLSL port of both (the dither variant
+  under `SV_POSITION`), which reads the traced visibility at t3 (a free slot) and combines it according to the mode
+  in LumaGameSettings: Off = the game's `cloud * pcf` (bit for bit the same math), RT = `cloud * rt`, RT x game =
+  `cloud * pcf * rt`. Without a bound visibility texture (RT not ready this frame, other AO modes) it is the game's.
+- the game's bilateral blur still runs over the result (a little extra softening, also over the traced penumbra).
+- the trace runs in the same D3D12 submission as RTAO, right after the AO, from the same depth and TLAS, into a
+  second texture shared with D3D11 (owned by the sun pass, copied inside the recorder: Interop is unchanged).
+
+### Light direction
+
+`cb_parallellightdir` lives in the forward shaders (per shader offsets), after the trace; `cb_atm_sky_sundirection`
+is the atmosphere's sun (it may stay the sun at night while the shadow casting light is the moon). The direction
+that matches the shadow maps exactly is the cascades' depth axis: the gradient of light space z,
+`(M[0].z, M[1].z, M[2].z)` of `cb_shadowprojections[0]` (orthographic, so it is parallel to the light direction).
+Its sign (toward or away from the light) depends on the shadow map's depth convention, so the light is taken as the
+side above the horizon (world z up; a light below the horizon lights nothing), and `cb_atm_sky_sundirection` is
+reported next to it. Both come from the screen shadows draw's PerInstanceCB, copied (D3D11 CopySubresourceRegion,
+honouring `PSSetConstantBuffers1` offsets) into a staging ring and read back a few frames later without stalling:
+the trace uses the direction from a few frames ago, which is fine for a light that moves slowly if at all.
+
+### Local lights (not implemented)
+
+Point/spot/area lights are in `tlf_light_tCB.co_tlf_lights[]` (float3 mWorldPosition, mRadiusFalloff, mColor,
+mRadiusCutoff, mSpotDir, mDecay, ..., mAreaLightX, mShadowSetup, mFlags; 112 bytes, also `ro_tlf_lights_sb` for the
+culling CS), with their shadows from `tlf_shadow_tCB.co_tlf_shadows[]` (mWorldToShadowMat, mShadowToWorldMat, mInfo)
+sampling `ro_shadowmapatlas` (Texture2DArray atlas) inside every forward shader's per tile light loop. A ray traced
+version would need: the light list on the D3D12 side (copy `ro_tlf_lights_sb` into a shared buffer at the cull CS,
+or the cbuffer at the forward draws), a per pixel per light shadow ray (bounded by a per tile light count), and a
+place to inject a per light visibility. There is no screen space mask per light: injection would mean patching the
+atlas lookup in every forward shader (thousands of permutations: a generic DXBC patch of the `ro_shadowmapatlas`
+sample in the style of the F4 RtShadows light_inject.h, keyed on the light index register), or a visibility buffer
+of N packed lights per pixel read by that patch. Feasible but a project of its own; the sun mask is the cheap case.

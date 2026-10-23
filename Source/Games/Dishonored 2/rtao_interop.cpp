@@ -264,7 +264,7 @@ void main(uint3 id : SV_DispatchThreadID)
          if (FAILED(hr))
             return fail(HResultString("CreateCommandAllocator", hr));
       }
-      hr = device12->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, allocators[0], nullptr, IID_PPV_ARGS(&command_list));
+      hr = device12->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, allocators[0], nullptr, IID_PPV_ARGS(&command_list)); // ID3D12GraphicsCommandList4: DXR builds
       if (FAILED(hr))
          return fail(HResultString("CreateCommandList", hr));
       command_list->Close();
@@ -558,6 +558,7 @@ void main(uint3 id : SV_DispatchThreadID)
       uav_desc.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2D;
       device12->CreateUnorderedAccessView(ao_private12, nullptr, &uav_desc, cpu_handle);
 
+      targets_generation++;
       depth_width = new_depth_width;
       depth_height = new_depth_height;
       ao_width = new_ao_width;
@@ -583,6 +584,25 @@ void main(uint3 id : SV_DispatchThreadID)
 
    bool Interop::Run(ID3D11DeviceContext* immediate_context, Constants constants, std::string& error)
    {
+      // The M0 test kernel, as a recorder (runs under the interop lock, so members are safe to read)
+      return Run(immediate_context, [this, constants](ID3D12GraphicsCommandList4* list, const RecordInfo& info, std::string&) mutable {
+         constants.ao_width = info.ao_width;
+         constants.ao_height = info.ao_height;
+         constants.depth_width = info.depth_width;
+         constants.depth_height = info.depth_height;
+         constants.depth_packed = info.depth_packed ? 1 : 0;
+         list->SetPipelineState(pipeline_state);
+         list->SetComputeRootSignature(root_signature);
+         list->SetDescriptorHeaps(1, &descriptor_heap);
+         list->SetComputeRoot32BitConstants(0, sizeof(Constants) / 4, &constants, 0);
+         list->SetComputeRootDescriptorTable(1, descriptor_heap->GetGPUDescriptorHandleForHeapStart());
+         list->Dispatch((info.ao_width + 7) / 8, (info.ao_height + 7) / 8, 1);
+         return true;
+      }, error);
+   }
+
+   bool Interop::Run(ID3D11DeviceContext* immediate_context, const Recorder& recorder, std::string& error)
+   {
       const std::lock_guard lock(mutex);
       if (!device12 || !ao_private12 || !depth_shared12)
       {
@@ -604,7 +624,6 @@ void main(uint3 id : SV_DispatchThreadID)
 
       // Recycle the oldest allocator (3 deep, so normally this never waits)
       const uint32_t index = allocator_index;
-      allocator_index = (allocator_index + 1) % frames_in_flight;
       if (own_fence->GetCompletedValue() < allocator_fence_values[index])
       {
          own_fence->SetEventOnCompletion(allocator_fence_values[index], own_fence_event);
@@ -615,25 +634,38 @@ void main(uint3 id : SV_DispatchThreadID)
             return false;
          }
       }
+      allocator_index = (allocator_index + 1) % frames_in_flight;
       ID3D12CommandAllocator* allocator = allocators[index];
       allocator->Reset();
-      command_list->Reset(allocator, pipeline_state);
-
-      constants.ao_width = ao_width;
-      constants.ao_height = ao_height;
-      constants.depth_width = depth_width;
-      constants.depth_height = depth_height;
-      constants.depth_packed = depth_packed ? 1 : 0;
+      command_list->Reset(allocator, nullptr);
 
       D3D12_RESOURCE_BARRIER barriers[2];
       Transition(command_list, depth_shared12, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, barriers[0]);
       command_list->ResourceBarrier(1, barriers);
 
-      command_list->SetComputeRootSignature(root_signature);
-      command_list->SetDescriptorHeaps(1, &descriptor_heap);
-      command_list->SetComputeRoot32BitConstants(0, sizeof(Constants) / 4, &constants, 0);
-      command_list->SetComputeRootDescriptorTable(1, descriptor_heap->GetGPUDescriptorHandleForHeapStart());
-      command_list->Dispatch((ao_width + 7) / 8, (ao_height + 7) / 8, 1);
+      RecordInfo info = {};
+      info.device = device12;
+      info.depth = depth_shared12;
+      info.depth_format = depth_format;
+      info.depth_packed = depth_packed;
+      info.depth_width = depth_width;
+      info.depth_height = depth_height;
+      info.ao = ao_private12;
+      info.ao_format = ao_format;
+      info.ao_width = ao_width;
+      info.ao_height = ao_height;
+      info.targets_generation = targets_generation;
+      info.frame_slot = index;
+      info.submit_fence_value = own_fence_value + 1;
+      info.completed_fence_value = own_fence->GetCompletedValue();
+      if (!recorder(command_list, info, error))
+      {
+         command_list->Close(); // Discarded, never executed
+         context4->Release();
+         if (error.empty())
+            error = "recorder failed";
+         return false;
+      }
 
       Transition(command_list, ao_private12, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE, barriers[0]);
       Transition(command_list, ao_shared12, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_DEST, barriers[1]);
@@ -671,7 +703,7 @@ void main(uint3 id : SV_DispatchThreadID)
       // D3D12 -> D3D11
       const uint64_t ao_ready_value = ++shared_fence_value;
       queue->Signal(shared_fence12, ao_ready_value);
-      allocator_fence_values[index] = ++own_fence_value;
+      allocator_fence_values[index] = ++own_fence_value; // == info.submit_fence_value
       queue->Signal(own_fence, own_fence_value);
       hr = context4->Wait(shared_fence11, ao_ready_value);
       context4->Release();
@@ -681,6 +713,67 @@ void main(uint3 id : SV_DispatchThreadID)
          return false;
       }
       return true;
+   }
+
+   bool Interop::CreateSharedBuffer(ID3D11Device* device11, uint64_t size, ID3D12Resource*& out12, ID3D11Buffer*& out11, std::string& error)
+   {
+      // Measured on an RTX 4090 (Tests/rtao_interop_test.cpp history): a D3D12 buffer created with
+      // D3D12_HEAP_FLAG_SHARED does not open in D3D11 (OpenSharedResource1: E_INVALIDARG, any resource flags), and
+      // D3D11 buffers refuse D3D11_RESOURCE_MISC_SHARED_NTHANDLE (E_INVALIDARG). What works is the other direction
+      // with a legacy (KMT) handle: a D3D11 buffer with D3D11_RESOURCE_MISC_SHARED, opened by
+      // ID3D12Device::OpenSharedHandle.
+      const std::lock_guard lock(mutex);
+      out12 = nullptr;
+      out11 = nullptr;
+      if (!device12)
+      {
+         error = "not initialized";
+         return false;
+      }
+      if (size == 0 || size > UINT32_MAX)
+      {
+         error = "invalid shared buffer size";
+         return false;
+      }
+      D3D11_BUFFER_DESC desc = {};
+      desc.ByteWidth = UINT((size + 15) & ~uint64_t(15));
+      desc.Usage = D3D11_USAGE_DEFAULT;
+      desc.BindFlags = D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_UNORDERED_ACCESS;
+      desc.MiscFlags = D3D11_RESOURCE_MISC_SHARED | D3D11_RESOURCE_MISC_BUFFER_ALLOW_RAW_VIEWS;
+      HRESULT hr = device11->CreateBuffer(&desc, nullptr, &out11);
+      if (FAILED(hr))
+      {
+         error = HResultString("ID3D11Device::CreateBuffer (shared)", hr);
+         return false;
+      }
+      IDXGIResource* dxgi_resource = nullptr;
+      HANDLE handle = nullptr;
+      hr = out11->QueryInterface(IID_PPV_ARGS(&dxgi_resource));
+      if (SUCCEEDED(hr))
+      {
+         hr = dxgi_resource->GetSharedHandle(&handle); // KMT handle: not closed
+         dxgi_resource->Release();
+      }
+      if (FAILED(hr) || !handle)
+      {
+         error = HResultString("IDXGIResource::GetSharedHandle (buffer)", hr);
+         SafeRelease(out11);
+         return false;
+      }
+      hr = device12->OpenSharedHandle(handle, IID_PPV_ARGS(&out12));
+      if (FAILED(hr))
+      {
+         error = HResultString("ID3D12Device::OpenSharedHandle (buffer)", hr);
+         SafeRelease(out11);
+         return false;
+      }
+      return true;
+   }
+
+   bool Interop::WaitForIdle(uint32_t timeout_ms)
+   {
+      const std::lock_guard lock(mutex);
+      return WaitForGPUIdle(timeout_ms);
    }
 
    std::string Interop::GetDescription()

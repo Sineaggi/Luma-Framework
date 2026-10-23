@@ -20,6 +20,7 @@
 #include <d3d12.h>
 #include <dxgi1_4.h>
 #include <cstdint>
+#include <functional>
 #include <mutex>
 #include <string>
 
@@ -39,6 +40,27 @@ namespace RTAO
       uint32_t frame;
    };
    static_assert(sizeof(Constants) % 4 == 0);
+
+   // What a custom D3D12 pass gets to record against (see Interop::Run with a recorder)
+   struct RecordInfo
+   {
+      ID3D12Device5* device;
+      // In NON_PIXEL_SHADER_RESOURCE state during the recorder. Packed: R8G8B8A8_UNORM holding the R32 bits.
+      ID3D12Resource* depth;
+      DXGI_FORMAT depth_format;
+      bool depth_packed;
+      uint32_t depth_width, depth_height;
+      // Private AO texture, in UNORDERED_ACCESS state on entry and it must be left so. Copied to the shared
+      // texture after the recorder returns.
+      ID3D12Resource* ao;
+      DXGI_FORMAT ao_format;
+      uint32_t ao_width, ao_height;
+      uint32_t targets_generation; // Changes whenever the targets above were re-created
+      uint32_t frame_slot; // 0..frames_in_flight-1, the command allocator in use
+      uint64_t submit_fence_value; // Own-fence value signalled when this submission completes (for deferred releases)
+      uint64_t completed_fence_value; // Own-fence value already reached by the GPU
+   };
+   using Recorder = std::function<bool(ID3D12GraphicsCommandList4* list, const RecordInfo& info, std::string& error)>;
 
    class Interop
    {
@@ -67,6 +89,20 @@ namespace RTAO
       // MUST be called on the IMMEDIATE context (ID3D11DeviceContext4::Signal/Wait don't exist on deferred ones).
       // On return the immediate context has a GPU wait queued, so anything recorded after can read GetAOSRV().
       bool Run(ID3D11DeviceContext* immediate_context, Constants constants, std::string& error);
+      // Same, but "recorder" records the D3D12 work (it must write the whole AO texture). Runs under the interop lock.
+      bool Run(ID3D11DeviceContext* immediate_context, const Recorder& recorder, std::string& error);
+
+      // Creates a buffer both APIs can access (for D3D11 CopySubresourceRegion of game vertex/index data into memory
+      // D3D12 can read): a D3D11 buffer with D3D11_RESOURCE_MISC_SHARED (also SRV/UAV raw views), opened in D3D12.
+      // The D3D12 side starts in COMMON state. Size is rounded up to 16 bytes.
+      bool CreateSharedBuffer(ID3D11Device* device11, uint64_t size, ID3D12Resource*& out12, ID3D11Buffer*& out11, std::string& error);
+
+      // Valid after Init. Not reference counted: don't keep past Shutdown.
+      ID3D12Device5* GetDevice() const { return device12; }
+      static constexpr uint32_t GetFramesInFlight() { return frames_in_flight; }
+
+      // Blocks until the D3D12 queue has finished everything submitted so far.
+      bool WaitForIdle(uint32_t timeout_ms);
 
       // Log friendly description (adapter, formats).
       std::string GetDescription();
@@ -85,7 +121,7 @@ namespace RTAO
       ID3D12CommandAllocator* allocators[frames_in_flight] = {};
       uint64_t allocator_fence_values[frames_in_flight] = {};
       uint32_t allocator_index = 0;
-      ID3D12GraphicsCommandList* command_list = nullptr;
+      ID3D12GraphicsCommandList4* command_list = nullptr;
 
       // Shared fence: D3D11 signals odd steps, D3D12 the even ones. Monotonic.
       ID3D12Fence* shared_fence12 = nullptr;
@@ -114,6 +150,7 @@ namespace RTAO
       ID3D11Texture2D* ao_shared11 = nullptr;
       ID3D11ShaderResourceView* ao_srv11 = nullptr;
 
+      uint32_t targets_generation = 0;
       std::string adapter_name;
    };
 }

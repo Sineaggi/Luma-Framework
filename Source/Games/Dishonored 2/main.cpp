@@ -165,6 +165,11 @@ namespace
    int g_rtao_capture_pass = 1; // 0: depth only draws (no render target bound), 1: every depth writing draw (config "RTAOCapturePass")
    bool g_rtao_skinned = true; // Skinned characters in the ray tracing scene (config "RTAOSkinned")
    bool g_rtao_dynamic = true; // Meshes with a DYNAMIC vertex buffer (movable objects) in the ray tracing scene (config "RTAODynamic")
+   // Also capture the game's shadow map draws (config "RTAOShadowCasters"): the casters behind and beside the camera,
+   // which the main view never draws but the sun needs (RTAO::DrawInfo::shadow_view)
+   bool g_rtao_shadow_casters = true;
+   std::atomic<uint64_t> g_rtao_shadow_view_draws = 0; // Indexed draws into shadow maps seen (captured or not)
+   std::atomic<uint32_t> g_rtao_shadow_view_width = 0, g_rtao_shadow_view_height = 0, g_rtao_shadow_view_slices = 0; // The last shadow map seen
 
    bool RTAOOutputIsRayTraced(int output)
    {
@@ -1402,6 +1407,11 @@ public:
                (unsigned long long)stats.cutout_instances, game_device_data.rtao_tlas_cutouts.load(), (unsigned long long)g_rtao_ps_alpha_tested.load(), (unsigned long long)g_rtao_ps_discard.load(),
                (unsigned long long)g_rtao_ps_reflected.load());
             reshade::log::message(reshade::log::level::info, foliage);
+            snprintf(foliage, sizeof(foliage), "RTAO: shadow map casters %s: shadow map draws %llu (last map %ux%u, %u slices), captured %llu (%llu instances, %llu per frame meshes), skipped (characters) %llu, MVP instances rejected %llu, readback overflow %llu",
+               g_rtao_shadow_casters ? "on" : "off", (unsigned long long)g_rtao_shadow_view_draws.load(), g_rtao_shadow_view_width.load(), g_rtao_shadow_view_height.load(), g_rtao_shadow_view_slices.load(),
+               (unsigned long long)stats.shadow_draws, (unsigned long long)stats.shadow_instances, (unsigned long long)stats.shadow_frame_meshes, (unsigned long long)stats.shadow_skipped,
+               (unsigned long long)stats.shadow_rejected, (unsigned long long)stats.readback_overflow);
+            reshade::log::message(reshade::log::level::info, foliage);
             static const char* quality_names[RTAO_QUALITY_COUNT] = { "low", "medium", "high" };
             snprintf(buffer, sizeof(buffer), "RTAO: GPU last frame %.2f ms: capture %.2f, TLAS %.2f, trace %.2f, denoise %.2f (quality %s, %d rays, fast cutouts %d); per frame duplicates skipped: %llu draws, %llu per frame meshes",
                game_device_data.rtao_gpu_us.load() / 1000.0, game_device_data.rtao_gpu_capture_us.load() / 1000.0, game_device_data.rtao_gpu_tlas_us.load() / 1000.0,
@@ -2013,6 +2023,40 @@ public:
       return true;
    }
 
+   // A shadow map draw: depth only (no render target) with depth writes on, into a depth texture array (the sun's
+   // cascades, the local lights' atlas) that isn't the main view's depth. Whatever is drawn there is world geometry.
+   static bool IsShadowViewDepthWrite(ID3D11DeviceContext* context)
+   {
+      com_ptr<ID3D11RenderTargetView> rtv;
+      com_ptr<ID3D11DepthStencilView> dsv;
+      context->OMGetRenderTargets(1, &rtv, &dsv);
+      if (!dsv || rtv)
+         return false;
+      com_ptr<ID3D11Resource> resource;
+      dsv->GetResource(&resource);
+      com_ptr<ID3D11Texture2D> texture;
+      if (!resource || FAILED(resource->QueryInterface(&texture)))
+         return false;
+      D3D11_TEXTURE2D_DESC desc;
+      texture->GetDesc(&desc);
+      if (desc.ArraySize < 2 || (desc.Width == g_rtao_main_depth_width.load(std::memory_order_relaxed) && desc.Height == g_rtao_main_depth_height.load(std::memory_order_relaxed)))
+         return false;
+      com_ptr<ID3D11DepthStencilState> state;
+      UINT stencil_ref = 0;
+      context->OMGetDepthStencilState(&state, &stencil_ref);
+      if (state)
+      {
+         D3D11_DEPTH_STENCIL_DESC state_desc;
+         state->GetDesc(&state_desc);
+         if (!state_desc.DepthEnable || state_desc.DepthWriteMask != D3D11_DEPTH_WRITE_MASK_ALL)
+            return false;
+      }
+      g_rtao_shadow_view_width.store(desc.Width, std::memory_order_relaxed);
+      g_rtao_shadow_view_height.store(desc.Height, std::memory_order_relaxed);
+      g_rtao_shadow_view_slices.store(desc.ArraySize, std::memory_order_relaxed);
+      return true;
+   }
+
    // Logs an uncaptured main view draw once per (vertex shader, reason), so the log names what is missing
    static void LogRTAOUncaptured(ID3D11DeviceContext* context, const char* reason, const char* detail = nullptr)
    {
@@ -2046,10 +2090,19 @@ public:
       if (device->get_api() != reshade::api::device_api::d3d11)
          return false;
       auto* context = reinterpret_cast<ID3D11DeviceContext*>(cmd_list->get_native());
+      // Main view draws, or shadow map draws (sun casters out of view). Shadow map draws feed no main view diagnostics.
+      bool shadow_view = false;
       if (!IsMainViewDepthWrite(context, g_rtao_capture_pass == 0))
-         return false;
+      {
+         if (!g_rtao_shadow_casters || !IsShadowViewDepthWrite(context))
+            return false;
+         shadow_view = true;
+         g_rtao_shadow_view_draws++;
+      }
       D3D11_PRIMITIVE_TOPOLOGY topology;
       context->IAGetPrimitiveTopology(&topology);
+      if (shadow_view && topology != D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST)
+         return false;
       if (topology != D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST)
       {
          g_rtao_draws_not_triangle_list++;
@@ -2074,7 +2127,8 @@ public:
          auto vs_it = g_rtao_vertex_shaders.find(uint64_t(uintptr_t(vs.get())));
          if (vs_it == g_rtao_vertex_shaders.end())
          {
-            g_rtao_draws_unknown_shader++;
+            if (!shadow_view)
+               g_rtao_draws_unknown_shader++;
             return false;
          }
          vs_info = vs_it->second;
@@ -2091,48 +2145,60 @@ public:
             }
          }
       }
-      g_rtao_draws_alpha_tested += alpha_tested;
-      // Foliage family toggles (UI): left out of the scene when off
-      if ((vs_info.wind && !g_rtao_wind_meshes) || (alpha_tested && !g_rtao_cutouts))
+      if (shadow_view)
       {
-         const std::lock_guard lock(g_rtao_skip_reason_mutex);
-         g_rtao_skip_reasons[(vs_info.wind && !g_rtao_wind_meshes) ? "wind (off in the UI)" : "alpha tested (off in the UI)"]++;
-         return false;
+         // Same family toggles as the main view, no diagnostics. Skinned draws are left out (see DrawInfo::shadow_view).
+         if ((vs_info.wind && !g_rtao_wind_meshes) || (alpha_tested && !g_rtao_cutouts) || vs_info.source == RTAO::MatrixSource::None || vs_info.skinned)
+            return false;
+         if (!layout_info.has_position || layout_info.position_per_instance)
+            return false;
       }
-      g_rtao_draws_by_source[(std::min)(uint32_t(vs_info.source), 4u)]++;
-      if (vs_info.skinned)
-         g_rtao_draws_skinned++;
-      if (vs_info.source == RTAO::MatrixSource::None || (vs_info.skinned && !g_rtao_skinned))
+      else
       {
-         const char* reason = vs_info.source == RTAO::MatrixSource::None ? (vs_info.skip_reason ? vs_info.skip_reason : "unknown") : "skinned (off)";
+         g_rtao_draws_alpha_tested += alpha_tested;
+         // Foliage family toggles (UI): left out of the scene when off
+         if ((vs_info.wind && !g_rtao_wind_meshes) || (alpha_tested && !g_rtao_cutouts))
          {
             const std::lock_guard lock(g_rtao_skip_reason_mutex);
-            g_rtao_skip_reasons[reason]++;
+            g_rtao_skip_reasons[(vs_info.wind && !g_rtao_wind_meshes) ? "wind (off in the UI)" : "alpha tested (off in the UI)"]++;
+            return false;
          }
-         LogRTAOUncaptured(context, reason);
-         return false;
-      }
-      if (!layout_info.has_position || layout_info.position_per_instance)
-      {
-         g_rtao_draws_unusable_layout++;
-         return false;
-      }
-      if (vs_info.skinned)
-      {
-         for (uint32_t set = 0; set < vs_info.skin_sets; set++)
+         g_rtao_draws_by_source[(std::min)(uint32_t(vs_info.source), 4u)]++;
+         if (vs_info.skinned)
+            g_rtao_draws_skinned++;
+         if (vs_info.source == RTAO::MatrixSource::None || (vs_info.skinned && !g_rtao_skinned))
          {
-            const auto& indices = layout_info.skin_indices[set];
-            const auto& weights = layout_info.skin_weights[set];
-            if (!indices.present || !weights.present || indices.per_instance || weights.per_instance)
+            const char* reason = vs_info.source == RTAO::MatrixSource::None ? (vs_info.skip_reason ? vs_info.skip_reason : "unknown") : "skinned (off)";
             {
-               g_rtao_draws_unusable_layout++;
-               return false;
+               const std::lock_guard lock(g_rtao_skip_reason_mutex);
+               g_rtao_skip_reasons[reason]++;
+            }
+            LogRTAOUncaptured(context, reason);
+            return false;
+         }
+         if (!layout_info.has_position || layout_info.position_per_instance)
+         {
+            g_rtao_draws_unusable_layout++;
+            return false;
+         }
+         if (vs_info.skinned)
+         {
+            for (uint32_t set = 0; set < vs_info.skin_sets; set++)
+            {
+               const auto& indices = layout_info.skin_indices[set];
+               const auto& weights = layout_info.skin_weights[set];
+               if (!indices.present || !weights.present || indices.per_instance || weights.per_instance)
+               {
+                  g_rtao_draws_unusable_layout++;
+                  return false;
+               }
             }
          }
       }
 
       RTAO::DrawInfo draw;
       draw.vs = &vs_info;
+      draw.shadow_view = shadow_view;
       draw.position_format = layout_info.position_format;
       draw.position_offset = layout_info.position_offset;
       draw.index_count = index_count;
@@ -2252,7 +2318,7 @@ public:
       }
 
       auto& device_data = *device->get_private_data<DeviceData>();
-      if (device_data.game && !GetGameDeviceData(device_data).rtao_capture.CaptureDraw(context, draw))
+      if (device_data.game && !GetGameDeviceData(device_data).rtao_capture.CaptureDraw(context, draw) && !shadow_view)
       {
          D3D11_BUFFER_DESC vb_desc = {}, ib_desc = {};
          if (vertex_buffer)
@@ -2584,6 +2650,7 @@ public:
       reshade::get_config_value(runtime, NAME, "RTAOCapturePass", g_rtao_capture_pass);
       reshade::get_config_value(runtime, NAME, "RTAOSkinned", g_rtao_skinned);
       reshade::get_config_value(runtime, NAME, "RTAODynamic", g_rtao_dynamic);
+      reshade::get_config_value(runtime, NAME, "RTAOShadowCasters", g_rtao_shadow_casters);
       reshade::get_config_value(runtime, NAME, "RTAOStrength", g_rtao_strength);
       g_rtao_strength = std::clamp(g_rtao_strength, 0.25f, 4.f);
       g_rtao_radius = std::clamp(g_rtao_radius, 0.05f, 50.f);
@@ -2727,6 +2794,10 @@ public:
             reshade::set_config_value(runtime, NAME, "RTAODynamic", g_rtao_dynamic);
          if (ImGui::IsItemHovered())
             ImGui::SetTooltip("Movable objects whose vertices the game rewrites every frame (openable doors, windows, cabinets):\ncopied at each draw and built into a per frame BLAS.");
+         if (ImGui::Checkbox("RTAO: shadow map casters", &g_rtao_shadow_casters))
+            reshade::set_config_value(runtime, NAME, "RTAOShadowCasters", g_rtao_shadow_casters);
+         if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("Also captures what the game draws into its shadow maps: walls, roofs and window frames behind or beside the camera,\nwhich the camera never draws but which cast the sun's shadows into view (RT sun shadows). Characters are not taken from there.\nChanges apply to newly captured geometry; what is already in the scene ages out within a few seconds.");
          if (ImGui::SliderFloat("RTAO Strength", &g_rtao_strength, 0.25f, 4.f, "%.2f"))
             g_rtao_strength = std::clamp(g_rtao_strength, 0.25f, 4.f);
          if (ImGui::IsItemDeactivatedAfterEdit())
@@ -2770,6 +2841,9 @@ public:
                game_device_data.rtao_gpu_capture_us.load() / 1000.0, game_device_data.rtao_gpu_tlas_us.load() / 1000.0, game_device_data.rtao_gpu_trace_us.load() / 1000.0, game_device_data.rtao_gpu_filter_us.load() / 1000.0);
             ImGui::Text("Draws seen %llu, captured %llu (%llu instances), repeated in the frame (skipped) %llu + %llu per frame meshes", (unsigned long long)stats.draws_seen, (unsigned long long)stats.draws_captured,
                (unsigned long long)stats.instances_captured, (unsigned long long)stats.dedup_draws, (unsigned long long)stats.dedup_frame_meshes);
+            ImGui::Text("Shadow map draws %llu (last map %ux%u, %u slices): captured %llu (%llu instances, %llu per frame meshes), skipped (characters) %llu, MVP instances rejected %llu",
+               (unsigned long long)g_rtao_shadow_view_draws.load(), g_rtao_shadow_view_width.load(), g_rtao_shadow_view_height.load(), g_rtao_shadow_view_slices.load(), (unsigned long long)stats.shadow_draws,
+               (unsigned long long)stats.shadow_instances, (unsigned long long)stats.shadow_frame_meshes, (unsigned long long)stats.shadow_skipped, (unsigned long long)stats.shadow_rejected);
             ImGui::Text("Main view draws by matrix source: none %llu, direct %llu, indexed %llu, cbuffer %llu, MVP %llu",
                (unsigned long long)g_rtao_draws_by_source[0].load(), (unsigned long long)g_rtao_draws_by_source[1].load(), (unsigned long long)g_rtao_draws_by_source[2].load(), (unsigned long long)g_rtao_draws_by_source[3].load(), (unsigned long long)g_rtao_draws_by_source[4].load());
             ImGui::Text("Unknown vertex shader %llu, unusable input layout %llu, GPU culled (indirect, not captured) %llu",

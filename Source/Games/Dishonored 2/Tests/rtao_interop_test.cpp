@@ -2875,6 +2875,20 @@ int main(int argc, char** argv)
          printf("D3D12 debug layer on\n");
       }
    }
+   // Shadow map casters: MVP derived matrices must be rotation x scale + translation (RTAO::IsRigidTransform)
+   {
+      const float identity[12] = { 1, 0, 0, 5, 0, 1, 0, -3, 0, 0, 1, 100 };
+      const float c = 0.8f, s = 0.6f; // Rotation about z, then non uniform scale (2, 0.5, 3)
+      const float rotated_scaled[12] = { c * 2, -s * 0.5f, 0, 10, s * 2, c * 0.5f, 0, 20, 0, 0, 3, 30 };
+      const float skewed[12] = { 1, 0.4f, 0, 0, 0, 1, 0, 0, 0, 0.3f, 1, 0 }; // A view's skew left in (wrong VP)
+      const float flat[12] = { 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0 }; // A projection's collapsed axis
+      CHECK(RTAO::IsRigidTransform(identity), "rigid check: identity rejected");
+      CHECK(RTAO::IsRigidTransform(rotated_scaled), "rigid check: rotation x scale rejected");
+      CHECK(!RTAO::IsRigidTransform(skewed), "rigid check: skewed matrix accepted");
+      CHECK(!RTAO::IsRigidTransform(flat), "rigid check: flat matrix accepted");
+      printf("rigid transform check: ok\n");
+   }
+
    ID3D11Device* device = nullptr;
    ID3D11DeviceContext* context = nullptr;
    D3D_FEATURE_LEVEL level = D3D_FEATURE_LEVEL_11_1;

@@ -89,6 +89,39 @@ namespace RTAO
          return sign ? -value : value;
       }
 
+   }
+
+   // A 3x4 row major object to world matrix that is a rotation times a (possibly non uniform) scale, plus a translation:
+   // its three columns (the model axes in world space) are perpendicular and of sane lengths. An MVP derived matrix
+   // computed with the wrong view projection (MVP x inverse(another view's VP)) carries that view's skew and fails.
+   bool IsRigidTransform(const float rows[12])
+   {
+      float axis[3][3];
+      float length[3];
+      for (int c = 0; c < 3; c++)
+      {
+         for (int r = 0; r < 3; r++)
+            axis[c][r] = rows[r * 4 + c];
+         length[c] = std::sqrt(axis[c][0] * axis[c][0] + axis[c][1] * axis[c][1] + axis[c][2] * axis[c][2]);
+         if (!(length[c] > 1e-4f && length[c] < 1e4f))
+            return false;
+      }
+      const float shortest = (std::min)(length[0], (std::min)(length[1], length[2]));
+      const float longest = (std::max)(length[0], (std::max)(length[1], length[2]));
+      if (longest > shortest * 1000.f)
+         return false;
+      for (int a = 0; a < 3; a++)
+         for (int b = a + 1; b < 3; b++)
+         {
+            const float cosine = (axis[a][0] * axis[b][0] + axis[a][1] * axis[b][1] + axis[a][2] * axis[b][2]) / (length[a] * length[b]);
+            if (std::fabs(cosine) > 0.02f)
+               return false;
+         }
+      return true;
+   }
+
+   namespace
+   {
       void Transition(ID3D12GraphicsCommandList* list, ID3D12Resource* resource, D3D12_RESOURCE_STATES before, D3D12_RESOURCE_STATES after)
       {
          D3D12_RESOURCE_BARRIER barrier = {};
@@ -1303,6 +1336,14 @@ namespace RTAO
          dynamic_vertices = vb_desc.Usage == D3D11_USAGE_DYNAMIC;
       }
       const bool frame_mesh = draw.vs->skinned || dynamic_vertices;
+      // Shadow map draws: no skinned meshes (once per cascade, the most expensive capture), no MVP per frame meshes
+      // (world space vertices, nothing to check on the CPU), see DrawInfo::shadow_view
+      if (draw.shadow_view && (draw.vs->skinned || (frame_mesh && draw.vs->source == MatrixSource::MvpConstantBuffer)))
+      {
+         const std::lock_guard lock(mutex);
+         stats.shadow_skipped++;
+         return false;
+      }
       // Per frame vertices are decoded by our shader (any VertexFormatCode format), the others go to DXR as they are
       const DXGI_FORMAT vertex_format = frame_mesh ? (VertexFormatCode(draw.position_format) ? draw.position_format : DXGI_FORMAT_UNKNOWN) : DxrVertexFormat(draw.position_format);
       const uint32_t index_size = draw.index_format == DXGI_FORMAT_R16_UINT ? 2 : (draw.index_format == DXGI_FORMAT_R32_UINT ? 4 : 0);
@@ -1466,11 +1507,18 @@ namespace RTAO
          record.count = draw.instance_count;
          record.material = draw.cutout ? material : 0;
          record.geometry = geometry;
+         record.shadow_view = draw.shadow_view;
+         record.check_rigid = draw.shadow_view && source == MatrixSource::MvpConstantBuffer;
          local.push_back(record);
          if (identity)
             frame_identities.insert(identity);
          stats.draws_captured++;
          stats.instances_captured += draw.instance_count;
+         if (draw.shadow_view)
+         {
+            stats.shadow_draws++;
+            stats.shadow_instances += draw.instance_count;
+         }
          if (draw.vs->wind)
          {
             stats.wind_draws++;
@@ -1719,11 +1767,13 @@ namespace RTAO
          record.index_arena_offset = index_arena_offset;
          record.index_count = index_count;
          record.index_format = soup ? DXGI_FORMAT_UNKNOWN : draw.index_format;
+         record.shadow_view = draw.shadow_view;
          local.push_back(record);
          if (identity)
             frame_identities.insert(identity);
          stats.draws_captured++;
          stats.instances_captured++;
+         stats.shadow_frame_meshes += draw.shadow_view;
          (skinned ? stats.skinned_captured : stats.dynamic_captured)++;
       }
       else
@@ -1748,7 +1798,7 @@ namespace RTAO
          {
             cutouts.OnStripExecuted(record.mesh_key, record.first_slot); // Copied at the next D3D12 pass, whenever drawn
          }
-         else if (after_ao_pass)
+         else if (after_ao_pass && !record.shadow_view) // Shadow maps are drawn after the AO, and are opaque casters
          {
             stats.after_ao_records++; // Drawn after the AO took its depth: not in that depth, so not an occluder
          }
@@ -1917,7 +1967,7 @@ namespace RTAO
 
       // 1) Matrices captured 3 frames ago (this slot's last use has completed: Interop waited for its allocator)
       tlas.BeginFrame();
-      uint64_t frame_instances = 0, view_model = 0, frame_cutouts = 0;
+      uint64_t frame_instances = 0, view_model = 0, frame_cutouts = 0, shadow_rejected = 0;
       if (!readback_records[slot].empty())
       {
          uint64_t total = 0;
@@ -1962,6 +2012,11 @@ namespace RTAO
                      finite = finite && std::isfinite(rows[k]) && std::fabs(rows[k]) < 1e7f;
                   if (!finite || (rows[0] == 0.f && rows[1] == 0.f && rows[2] == 0.f))
                      continue;
+                  if (r.check_rigid && !IsRigidTransform(rows))
+                  {
+                     shadow_rejected++;
+                     continue;
+                  }
                   // Identity: mesh + transform quantized to ~1 cm / 1e-3 (instance buffers carry no stable id)
                   uint64_t key = r.mesh_key;
                   for (int k = 0; k < 12; k++)
@@ -2021,7 +2076,7 @@ namespace RTAO
                remaining -= len;
                src = (src + len) % kRingSlots;
             }
-            readback_records[slot].push_back({ record.mesh_key, record.count, record.mask, record.material, record.geometry });
+            readback_records[slot].push_back({ record.mesh_key, record.count, record.mask, record.material, record.geometry, record.shadow_view, record.check_rigid });
          }
          flush();
          Transition(list, ring12, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_COMMON);
@@ -2147,6 +2202,7 @@ namespace RTAO
       stats.frame_instances = frame_instances;
       stats.frame_cutout_instances = frame_cutouts;
       stats.view_model_instances = view_model;
+      stats.shadow_rejected += shadow_rejected;
       stats.readback_overflow += overflow;
       stats.tlas_instances = tlas.RetainedCount();
       return true;

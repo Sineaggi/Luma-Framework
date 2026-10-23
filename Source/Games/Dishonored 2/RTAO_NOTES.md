@@ -436,6 +436,24 @@ map shadows must overlap); the y channel claim (the forward pass must darken whe
 only" = RT sun visibility vs the image); the AO target size (if the SSAO target is half resolution the sun mask is
 too, and the game's blur upsamples it).
 
+### Shadow map casters (in game finding, then fix)
+
+First in game test (indoor mission, sun through a window, RT vs Off screenshots): the window's patch of light was
+right but its mullions were missing, and a hallway the game kept dark was lit. Both casters were behind or beside the
+camera: the TLAS only held what the main view drew (plus retention), and openable windows (DYNAMIC vertex buffers) are
+current-frame-only instances, so they vanished as soon as they left the view. Fix: the draw hook also captures shadow
+map draws (`IsShadowViewDepthWrite`: depth only, depth writes on, a depth texture array that isn't the main view's
+size; config "RTAOShadowCasters", default on), which hold exactly the sun's casters around the camera:
+- they come after the SSAO draw (SHADOWS_WORLD/DYNAMIC follow SSAO), so their records skip the "drawn after the AO
+  pass" drop and reach the TLAS at the next pass (static instances through the usual retention, per frame meshes one
+  frame late);
+- skinned draws are left out (they would be skinned once per cascade); per frame meshes with an MVP-only matrix too;
+- MVP-only static instances use world = MVP x inverse(the bound PerViewCB VP), right only if the game binds the light's
+  view there: each such instance must pass `IsRigidTransform` (perpendicular axes, sane scale) at readback, the
+  others are counted as "MVP instances rejected" (log line "RTAO: shadow map casters ...", RTAO stats).
+To check in game: shadow map draws > 0 (else the shadow maps aren't depth arrays); rejected stays small; and the
+log line shows whether the shadow maps are redrawn every frame (captured draws growing steadily) or cached.
+
 ### Local lights (not implemented)
 
 Point/spot/area lights are in `tlf_light_tCB.co_tlf_lights[]` (float3 mWorldPosition, mRadiusFalloff, mColor,

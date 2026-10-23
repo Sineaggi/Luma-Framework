@@ -177,6 +177,9 @@ namespace RTAO
    };
    static_assert(sizeof(CaptureParams) == 208);
 
+   // True if a 3x4 row major object to world matrix has perpendicular axes of sane lengths (rotation x scale + translation)
+   bool IsRigidTransform(const float rows[12]);
+
    // Vertex element decoding for skin_vertices_cs: kind | component count << 4 | bits per component << 8, 0 if the
    // shader can't decode it. Must match DecodeElement() in Luma_RTAO.hlsl.
    uint32_t VertexFormatCode(DXGI_FORMAT format);
@@ -226,6 +229,13 @@ namespace RTAO
       // Changes whenever the game rewrote (Map DISCARD, on the recording thread) a buffer behind the draw's per instance
       // bindings, so a draw only counts as a duplicate of an earlier one if its data can't have changed in between
       uint64_t binding_version = 0;
+      // A shadow map draw (depth only, into a shadow map array), not the main view: the casters the sun needs that the
+      // camera never draws (behind or beside it). These are drawn after the AO pass, so they are kept anyway (and reach
+      // the TLAS one pass later). Skinned draws are skipped (cost: once per cascade), and so are per frame meshes whose
+      // matrix would come from the MVP (no CPU check possible). MVP derived static instances must pass a rigid
+      // transform check at readback: world = MVP x inverse(the bound PerViewCB view projection) is only right if the
+      // game bound the light's view in PerViewCB.
+      bool shadow_view = false;
    };
 
    struct CaptureStats
@@ -256,6 +266,9 @@ namespace RTAO
       // Skipped as duplicates of a draw captured earlier in the frame (same mesh and per instance bindings, e.g. the depth
       // prepass and the G-buffer pass drawing the same objects): static draws, per frame (skinned/dynamic) meshes
       uint64_t dedup_draws = 0, dedup_frame_meshes = 0;
+      // Shadow map draws (DrawInfo::shadow_view): captured draws / instances / per frame meshes, skipped (skinned, MVP
+      // per frame meshes), instances rejected at readback (MVP derived, not a rigid transform)
+      uint64_t shadow_draws = 0, shadow_instances = 0, shadow_frame_meshes = 0, shadow_skipped = 0, shadow_rejected = 0;
    };
    enum CaptureSkip
    {
@@ -312,7 +325,7 @@ namespace RTAO
       CaptureStats GetStats();
 
       static constexpr uint32_t kRingSlots = 1u << 18; // 64 bytes each: 16 MB
-      static constexpr uint32_t kReadbackSlots = 1u << 16; // Instances per frame read back: 4 MB per frame slot
+      static constexpr uint32_t kReadbackSlots = 1u << 17; // Instances per frame read back: 8 MB per frame slot (main view + shadow maps)
       static constexpr uint32_t kFrameSlots = 3;
       // Skinned vertices (world space float3): ring capacity, and how many may be handed out between two D3D12 passes.
       // The budget stays well under the capacity so a draw recorded for a later frame can't wrap over vertices a pass
@@ -365,6 +378,8 @@ namespace RTAO
          // Instances of a texture exact cutout draw: its material (0: none) and where its triangles/uvs are in the arena
          uint64_t material;
          CutoutGeometry geometry;
+         bool shadow_view = false; // Instances, FrameMesh: from a shadow map draw (kept after the AO pass)
+         bool check_rigid = false; // Instances: MVP derived in a shadow map draw (see DrawInfo::shadow_view)
       };
 
       bool EnsureBufferCopy(ID3D11DeviceContext* context, ID3D11Buffer* buffer, bool vertex, std::vector<Rec>& records);
@@ -425,6 +440,8 @@ namespace RTAO
          uint8_t mask;
          uint64_t material; // Cutouts: see Rec
          CutoutGeometry geometry;
+         bool shadow_view;
+         bool check_rigid;
       };
       std::vector<ReadbackRecord> readback_records[kFrameSlots];
       CaptureStats stats;

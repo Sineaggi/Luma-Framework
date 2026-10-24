@@ -567,6 +567,64 @@ namespace RTAO
             }
       }
 
+      // Textured windows are kept for good (static world), so a pane that comes back from another mesh (a LOD, or the same
+      // pane uploaded to another place of the vertex buffer) would leave its old version in place: two layers of glass at
+      // the same spot, which squares its light. Instances at the same transform drawn in the same frame are parts of one
+      // window (siblings, all kept, even while one is culled); one never drawn together with the latest drawn copies is
+      // an old version: dropped.
+      if (shadow_mode == 0)
+      {
+         auto transform_hash = [](const float t[3][4]) {
+            uint64_t h = 0xcbf29ce484222325ull;
+            for (int r = 0; r < 3; r++)
+               for (int c = 0; c < 4; c++)
+               {
+                  const float scale = c == 3 ? 1000.f : 4096.f; // 1 mm, rotation/scale to 1/4096
+                  const int64_t q = int64_t(std::llround(double(t[r][c]) * scale));
+                  h = (h ^ uint64_t(q)) * 0x100000001b3ull;
+               }
+            return h;
+         };
+         std::unordered_map<uint64_t, std::vector<uint64_t>> groups;
+         for (const auto& [key, instance] : instances)
+            if (instance.sources & kInstanceFlagWindow)
+               groups[transform_hash(instance.transform)].push_back(key);
+         for (auto& [hash, keys] : groups)
+         {
+            if (keys.size() < 2)
+               continue;
+            uint32_t latest = 0;
+            for (uint64_t k : keys)
+               latest = (std::max)(latest, instances[k].last_frame);
+            // Drawn together in the last frame: siblings
+            for (uint64_t k : keys)
+            {
+               Instance& a = instances[k];
+               if (a.last_frame != frame - 1)
+                  continue;
+               for (uint64_t o : keys)
+                  if (o != k && instances[o].last_frame == frame - 1 && std::find(a.window_siblings.begin(), a.window_siblings.end(), o) == a.window_siblings.end())
+                     a.window_siblings.push_back(o);
+            }
+            for (uint64_t k : keys)
+            {
+               Instance& a = instances[k];
+               if (a.last_frame == latest || a.moved)
+                  continue;
+               bool sibling_of_latest = false;
+               for (uint64_t o : keys)
+                  if (instances[o].last_frame == latest && std::find(a.window_siblings.begin(), a.window_siblings.end(), o) != a.window_siblings.end())
+                     sibling_of_latest = true;
+               if (!sibling_of_latest)
+               {
+                  a.moved = true; // Dropped below
+                  windows_superseded++;
+               }
+            }
+         }
+         s.windows_superseded = windows_superseded;
+      }
+
       size_t shadow_static_count = 0;
       // Dynamic meshes keep only the copies of their latest draw (a mover's last pose, the particles of one frame)
       std::unordered_map<uint64_t, uint32_t> dynamic_latest;

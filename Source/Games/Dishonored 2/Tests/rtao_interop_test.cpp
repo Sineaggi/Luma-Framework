@@ -367,6 +367,59 @@ static void TestTlasRetention()
          windows.BeginFrame();
       CHECK(windows.RetainedCount() == 1, "a textured window out of view must be kept (retained %zu)", windows.RetainedCount());
    }
+   // Two parts of one window (same transform, drawn together) stay when one is culled; a pane that comes back from
+   // another mesh replaces its old version (never drawn together), also when it switches back
+   {
+      RTAO::TlasBuilder windows;
+      const float pane[3][4] = { { 1, 0, 0, 5 }, { 0, 1, 0, 0 }, { 0, 0, 1, 0 } };
+      const uint8_t window_source = uint8_t(RTAO::kInstanceSourceMain | RTAO::kInstanceFlagWindow);
+      for (int i = 0; i < 5; i++)
+      {
+         windows.BeginFrame();
+         windows.AddInstance(1, 10, pane, RTAO::kInstanceMaskCutout, 0, window_source); // Glass
+         windows.AddInstance(2, 11, pane, RTAO::kInstanceMaskCutout, 0, window_source); // Lead
+      }
+      for (int i = 0; i < 50; i++)
+      {
+         windows.BeginFrame();
+         windows.AddInstance(1, 10, pane, RTAO::kInstanceMaskCutout, 0, window_source); // The lead culled
+      }
+      windows.BeginFrame();
+      windows.BeginFrame();
+      CHECK(windows.RetainedCount() == 2, "parts of one window must stay while one is culled (retained %zu)", windows.RetainedCount());
+      // The pane now comes from another mesh (both parts): the old versions go
+      for (int i = 0; i < 3; i++)
+      {
+         windows.BeginFrame();
+         windows.AddInstance(3, 20, pane, RTAO::kInstanceMaskCutout, 0, window_source);
+         windows.AddInstance(4, 21, pane, RTAO::kInstanceMaskCutout, 0, window_source);
+      }
+      windows.BeginFrame();
+      windows.BeginFrame();
+      CHECK(windows.RetainedCount() == 2, "a window's old version must be replaced, not doubled (retained %zu)", windows.RetainedCount());
+      // Back to the first mesh: the second goes
+      for (int i = 0; i < 3; i++)
+      {
+         windows.BeginFrame();
+         windows.AddInstance(1, 10, pane, RTAO::kInstanceMaskCutout, 0, window_source);
+         windows.AddInstance(2, 11, pane, RTAO::kInstanceMaskCutout, 0, window_source);
+      }
+      windows.BeginFrame();
+      windows.BeginFrame();
+      CHECK(windows.RetainedCount() == 2, "switching back must not double the window either (retained %zu)", windows.RetainedCount());
+      // A different window elsewhere is untouched
+      const float other[3][4] = { { 1, 0, 0, 9 }, { 0, 1, 0, 0 }, { 0, 0, 1, 0 } };
+      windows.BeginFrame();
+      windows.AddInstance(5, 30, other, RTAO::kInstanceMaskCutout, 0, window_source);
+      for (int i = 0; i < 5; i++)
+      {
+         windows.BeginFrame();
+         windows.AddInstance(1, 10, pane, RTAO::kInstanceMaskCutout, 0, window_source);
+         windows.AddInstance(2, 11, pane, RTAO::kInstanceMaskCutout, 0, window_source);
+      }
+      CHECK(windows.RetainedCount() == 3, "another window must stay (retained %zu)", windows.RetainedCount());
+      printf("textured windows: parts kept, old versions replaced: ok\n");
+   }
    printf("TLAS retention: ok\n");
 }
 

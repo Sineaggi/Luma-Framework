@@ -1359,8 +1359,8 @@ public:
             float fars[4] = {};
             g.rtsun_light.GetSliceFars(fars);
             add("slice_fars=%.4g,%.4g,%.4g,%.4g\n", fars[0], fars[1], fars[2], fars[3]);
-            add("shadow_bursts=%u\nlast_burst_frame=%u\nlast_burst_size=%u\ndynamic_meshes=%u\ndynamic_dropped=%u\nshadow_static=%u\n", r.bursts, r.last_burst_frame, r.last_burst_size,
-               r.dynamic_meshes, r.dynamic_dropped, r.shadow_static);
+            add("shadow_bursts=%u\nlast_burst_frame=%u\nlast_burst_size=%u\ndynamic_meshes=%u\ndynamic_dropped=%u\nshadow_static=%u\nwindows_superseded=%u\n", r.bursts, r.last_burst_frame, r.last_burst_size,
+               r.dynamic_meshes, r.dynamic_dropped, r.shadow_static, r.windows_superseded);
             // Shadow pass audit since the last capture
             {
                std::map<ShadowAuditKey, uint64_t> audit;

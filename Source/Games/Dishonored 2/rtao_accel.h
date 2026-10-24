@@ -235,6 +235,7 @@ namespace RTAO
       uint32_t capped = 0; // Static shadow map instances dropped by the cap (this BeginFrame)
       uint32_t dynamic_meshes = 0; // Meshes taken as dynamic in the shadow maps (new copies frame after frame: particles)
       uint32_t dynamic_dropped = 0; // Their copies dropped once the game stopped drawing them (this BeginFrame)
+      uint32_t windows_superseded = 0; // Old versions of a window pane dropped (total)
       // Shadow map redraw bursts (a readback bringing >= kShadowBatch new shadow map instances): since start, the last one
       uint32_t bursts = 0, last_burst_frame = 0, last_burst_size = 0;
    };
@@ -336,7 +337,9 @@ namespace RTAO
          uint8_t min_slice; // Lowest shadow map array slice it was drawn in (0xFF: none)
          bool moved; // A shadow map copy left behind by a moving object
          bool batch; // Arrived in a shadow map redraw batch (never taken for a move)
+         std::vector<uint64_t> window_siblings; // Textured windows: instances at the same transform drawn in the same frame
       };
+      uint32_t windows_superseded = 0;
       uint32_t added_new_shadow = 0;
       std::unordered_set<uint64_t> shadow_meshes; // BLAS keys ever drawn into a shadow map (sun casters, any instance)
       std::vector<InstanceInfo> last_build_order;

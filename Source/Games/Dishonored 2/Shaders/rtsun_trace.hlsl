@@ -434,7 +434,10 @@ void main(uint3 id : SV_DispatchThreadID)
             {
                 float alpha_ref;
                 float opacity = CutoutAlphaSample(q.CandidateInstanceID(), q.CandidatePrimitiveIndex(), q.CandidateTriangleBarycentrics(), alpha_ref);
-                transmission *= opacity < 0.0 ? 1.0 : saturate(1.0 - opacity); // No mask yet: clear
+                // The least transmissive layer, not the product: a window is often two meshes at the same place (both
+                // carrying the glass), which a product would count twice (squared light). A ray through two separate
+                // windows is rare (and gets the darker one).
+                transmission = min(transmission, opacity < 0.0 ? 1.0 : saturate(1.0 - opacity)); // No mask yet: clear
                 continue;
             }
             if (CandidateBlocks(q.CandidateInstanceID(), flags, q.CandidateInstanceIndex(), q.CandidatePrimitiveIndex(),

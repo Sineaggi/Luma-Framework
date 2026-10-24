@@ -418,6 +418,14 @@ static void TestTlasRetention()
          windows.AddInstance(2, 11, pane, RTAO::kInstanceMaskCutout, 0, window_source);
       }
       CHECK(windows.RetainedCount() == 3, "another window must stay (retained %zu)", windows.RetainedCount());
+      // Textured windows off: the pane is drawn as plain camera geometry, no longer a window (nor a caster)
+      windows.BeginFrame();
+      windows.AddInstance(1, 10, pane, RTAO::kInstanceMaskCameraOnly, RTAO::kNoCutoutRecord, RTAO::kInstanceSourceMain);
+      bool still_window = false;
+      for (const auto& i : windows.Snapshot())
+         if (i.blas_key == 10)
+            still_window = (i.sources & RTAO::kInstanceFlagWindow) != 0;
+      CHECK(!still_window, "a pane drawn without its window material must lose the window mark");
       printf("textured windows: parts kept, old versions replaced: ok\n");
    }
    printf("TLAS retention: ok\n");
@@ -2186,8 +2194,11 @@ static void TestCutoutTextures(ID3D11Device* device, ID3D11DeviceContext* contex
    sun_settings.casters_only = false; // The scene's instances are added as main view ones (no shadow map)
    bool sun_on = false;
 
+   const RTAO::DrawInfo* extra_draw = nullptr; // A second draw captured each frame (another layer)
    auto run_frame = [&]() {
       CHECK(capture.CaptureDraw(context, draw), "capture (textured cutout)");
+      if (extra_draw)
+         CHECK(capture.CaptureDraw(context, *extra_draw), "capture (second layer)");
       ID3D11RenderTargetView* rtv = interop.GetDepthRTV();
       D3D11_VIEWPORT viewport = { 0, 0, (float)W, (float)H, 0, 1 };
       context->RSSetViewports(1, &viewport);
@@ -2470,6 +2481,30 @@ static void TestCutoutTextures(ID3D11Device* device, ID3D11DeviceContext* contex
          draw = saved;
          printf("RT sun through the stained glass, 1 ray per pixel: %.3f / %.3f\n", l, r);
          CHECK(l > 0.98f && r > 0.47f && r < 0.53f, "one ray must give the glass's transmission without noise (%.3f / %.3f)", l, r);
+         // The same pane twice (a window made of two meshes at the same place, both with the glass): counts once
+         ID3D11Buffer* ib_copy = MakeBuffer(device, D3D11_BIND_INDEX_BUFFER, indices, sizeof(indices));
+         draw.ps = &window_ps;
+         draw.alpha_srv = normal_srv;
+         draw.alpha_srv2 = glass_srv;
+         draw.alpha_param = 0.5f;
+         draw.material_cb = nullptr;
+         draw.window = true;
+         RTAO::DrawInfo layer = draw;
+         layer.index_buffer = ib_copy; // Another mesh key, the same triangles
+         extra_draw = &layer;
+         sun_on = true;
+         sun_settings.ray_count = 1;
+         float l2 = 0.f, r2 = 0.f;
+         measure_sun(l2, r2);
+         sun_settings.ray_count = 4;
+         sun_on = false;
+         extra_draw = nullptr;
+         draw = saved;
+         printf("RT sun through the stained glass drawn twice (two layers at one place): %.3f / %.3f\n", l2, r2);
+         CHECK(l2 > 0.98f && r2 > 0.47f && r2 < 0.53f, "two layers of one window must not square its light (%.3f / %.3f)", l2, r2);
+         // Retire the second layer's mesh (its instance stays kept as a window otherwise)
+         capture.OnDestroyBuffer(ib_copy);
+         ib_copy->Release();
       }
       printf("RT sun through a stained glass window (pattern 8), left (white glass) / right (black glass): density 1 %.3f / %.3f, density 0.5 %.3f / %.3f\n",
          results[0][0], results[0][1], results[1][0], results[1][1]);

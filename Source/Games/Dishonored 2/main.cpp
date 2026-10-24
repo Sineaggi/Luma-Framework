@@ -579,6 +579,7 @@ struct GameDeviceDataDishonored2 final : public GameDeviceData
    RTAO::GeometryCapture rtao_capture;
    RTAO::BlasCache rtao_blases;
    RTAO::TlasBuilder rtao_tlas;
+   bool last_textured_windows = false;
    RTAO::AOPass rtao_pass;
    RTAO::GpuTimer rtao_timer;
    RTAO::Retirer rtao_retirer;
@@ -773,6 +774,12 @@ public:
       game_device_data.rtao_capture.shadow_frame_meshes_enabled = g_rtdbg_shadow_openables;
       game_device_data.rtao_tlas.shadow_mode = g_rtdbg_shadow_young_long ? 1u : 0u;
       game_device_data.rtao_tlas.camera_only_non_opaque = g_rtsun_shadow_consult;
+      // Textured windows toggled: the kept panes go (out of view ones would keep their old state), the next draws re-add them
+      if (game_device_data.last_textured_windows != g_rtsun_textured_windows)
+      {
+         game_device_data.last_textured_windows = g_rtsun_textured_windows;
+         game_device_data.rtao_tlas.drop_window_request = true;
+      }
       game_device_data.rtao_last_draw_frame = game_device_data.rtao_frame;
       g_rtao_main_depth_width = depth_desc.Width;
       g_rtao_main_depth_height = depth_desc.Height;

@@ -319,6 +319,7 @@ namespace RTAO
       // Camera only instances non opaque, so the RT sun's candidate loop sees them (its shadow map check). The AO commits
       // any non opaque non cutout candidate, so it is unaffected.
       bool camera_only_non_opaque = false;
+      std::atomic<bool> drop_window_request = false; // Next BeginFrame drops every textured window instance (the setting changed)
       std::atomic<bool> drop_shadow_request = false; // Next BeginFrame drops every instance a shadow map draw touched (the main view re-adds what it sees)
 
    private:

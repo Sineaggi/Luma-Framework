@@ -482,6 +482,8 @@ namespace RTAO
       RetentionStats s;
       s.added_new = added_new;
       added_new = 0;
+      if (drop_window_request.exchange(false))
+         std::erase_if(instances, [](const auto& pair) { return (pair.second.sources & kInstanceFlagWindow) != 0; });
       if (drop_shadow_request.exchange(false))
          std::erase_if(instances, [](const auto& pair) { return (pair.second.sources & kInstanceSourceShadow) != 0; }); // Also those the main view saw: their slice history goes too
       const bool batch = added_new_shadow >= kShadowBatch; // The last readback brought a shadow map redraw of the world
@@ -745,7 +747,9 @@ namespace RTAO
       }
       else if (instance.last_frame != frame)
          instance.seen_frames++;
-      instance.sources |= source;
+      // Sources accumulate (main view, shadow map), but the window mark is the latest draw's: a pane captured without its
+      // window material (textured windows off) is plain camera geometry again, not a caster
+      instance.sources = uint8_t((instance.sources & ~kInstanceFlagWindow) | source);
       if (source & kInstanceSourceShadow)
          shadow_meshes.insert(blas_key);
       if (shadow_slice < instance.min_slice)

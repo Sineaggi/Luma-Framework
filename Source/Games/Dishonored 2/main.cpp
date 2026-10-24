@@ -364,6 +364,17 @@ namespace
    // Unattended capture (config "RTDiagAutoStartSeconds", 0 off): starts one diagnostic capture this many seconds after the
    // RT sun first traced with a copy of the game's shadow map (e.g. on the main menu's scene)
    int g_rtdiag_auto_seconds = 0;
+   // Opt in (config "RTDiagAutoLevelSeconds", 0 off): one capture this many seconds into the first level of the session.
+   // Tracing runs in stretches separated by loading screens (no RT pass for over kRTDiagLoadGapSeconds): the first
+   // stretch is the main menu, a later one a loaded level. The timer restarts if another load comes first.
+   int g_rtdiag_auto_level_seconds = 0;
+   constexpr double kRTDiagLoadGapSeconds = 2.0;
+   uint32_t g_rtdiag_trace_stretches = 0, g_rtdiag_last_trace_count = 0;
+   std::chrono::steady_clock::time_point g_rtdiag_last_trace_time, g_rtdiag_stretch_start;
+   bool g_rtdiag_auto_level_done = false;
+   // Periodic shadow map reproduction score in the log (every kReproLogFrames frames, outside captures)
+   constexpr uint32_t kReproLogFrames = 600;
+   uint32_t g_repro_logged_trace = 0;
    bool g_rtdiag_auto_armed = false, g_rtdiag_auto_done = false;
    std::chrono::steady_clock::time_point g_rtdiag_auto_at;
 
@@ -918,6 +929,29 @@ public:
       native_device->GetImmediateContext(&context);
       const auto now = std::chrono::steady_clock::now();
 
+      // Tracing stretches (menu, then levels after loading screens)
+      {
+         const uint32_t traces = g.rtsun_pass.TraceCount();
+         if (traces != g_rtdiag_last_trace_count)
+         {
+            if (g_rtdiag_trace_stretches == 0 || std::chrono::duration<double>(now - g_rtdiag_last_trace_time).count() > kRTDiagLoadGapSeconds)
+            {
+               g_rtdiag_trace_stretches++;
+               g_rtdiag_stretch_start = now;
+               reshade::log::message(reshade::log::level::info, ("RT diag: tracing stretch " + std::to_string(g_rtdiag_trace_stretches) + (g_rtdiag_trace_stretches == 1 ? " (main menu)" : " (after a load)")).c_str());
+            }
+            g_rtdiag_last_trace_count = traces;
+            g_rtdiag_last_trace_time = now;
+         }
+         if (g_rtdiag_auto_level_seconds > 0 && !g_rtdiag_auto_level_done && !g_rtdiag.active && g_rtdiag_trace_stretches >= 2 &&
+            std::chrono::duration<double>(now - g_rtdiag_last_trace_time).count() < 0.5 &&
+            std::chrono::duration<double>(now - g_rtdiag_stretch_start).count() >= double(g_rtdiag_auto_level_seconds))
+         {
+            g_rtdiag_auto_level_done = true;
+            g_rtdiag.start_requested = true;
+            reshade::log::message(reshade::log::level::info, "RT diag: level capture starting (RTDiagAutoLevelSeconds)");
+         }
+      }
       if (g_rtdiag_auto_seconds > 0 && !g_rtdiag_auto_done && !g_rtdiag.active && g.rtsun_pass.TraceCount() > 0 && g.rtsun_shadow_copies.load() > 0)
       {
          if (!g_rtdiag_auto_armed)
@@ -1563,7 +1597,7 @@ public:
       out.debug_outputs = g_rtdiag.active;
       {
          const uint32_t copied = game_device_data.rtsun_shadow_copied_frame.load();
-         out.shadow_repro = g_rtdiag.active && copied != UINT32_MAX && game_device_data.rtao_frame - copied <= 2;
+         out.shadow_repro = (g_rtdiag.active || game_device_data.rtao_frame % kReproLogFrames == 0) && copied != UINT32_MAX && game_device_data.rtao_frame - copied <= 2;
       }
       if (!game_device_data.rtsun_pass.EnsureTargets(native_device, width, height, error))
       {
@@ -2135,6 +2169,31 @@ public:
          g_rtao_shadow_frames++;
          g_rtao_shadow_zero_frames += delta == 0;
          g_rtao_shadow_max_per_frame = (std::max)(g_rtao_shadow_max_per_frame, delta);
+         // Shadow map reproduction score (cascades 0 and 1, every instance / shadow map instances only), each new result
+         if (!g_rtdiag.active)
+         {
+            std::vector<uint32_t> repro;
+            uint32_t repro_trace = 0;
+            if (game_device_data.rtsun_pass.GetShadowRepro(repro, repro_trace) && repro_trace != g_repro_logged_trace)
+            {
+               g_repro_logged_trace = repro_trace;
+               const size_t per = size_t(RTSun::kReproGrid) * RTSun::kReproGrid;
+               double all[RTSun::kReproCascades] = {}, only[RTSun::kReproCascades] = {};
+               uint64_t missing0 = 0, extra0 = 0;
+               for (size_t i = 0; i < repro.size(); i++)
+               {
+                  const size_t c = i / per;
+                  all[c] += ((repro[i] >> 2) & 3) == 0;
+                  only[c] += (repro[i] & 3) == 0;
+                  missing0 += c == 0 && ((repro[i] >> 2) & 3) == 1;
+                  extra0 += c == 0 && ((repro[i] >> 2) & 3) == 2;
+               }
+               char text[260];
+               snprintf(text, sizeof(text), "RTAO diag: shadow map reproduction (pass %u): cascade 0 %.2f%% match (missing %llu, extra %llu texels), cascade 1 %.2f%%; shadow map instances only: %.2f%% / %.2f%%",
+                  repro_trace, 100.0 * all[0] / per, (unsigned long long)missing0, (unsigned long long)extra0, 100.0 * all[1] / per, 100.0 * only[0] / per, 100.0 * only[1] / per);
+               reshade::log::message(reshade::log::level::info, text);
+            }
+         }
          // Every shadow map redraw burst (first 200): when the game puts static content into its shadow maps
          if (game_device_data.rtao_capture.IsInitialized())
          {
@@ -3609,6 +3668,7 @@ public:
       reshade::get_config_value(runtime, NAME, "RTSunShadowCastersOnly", g_rtsun_casters_only);
       reshade::get_config_value(runtime, NAME, "RTSunShadowMapCheck", g_rtsun_shadow_consult);
       reshade::get_config_value(runtime, NAME, "RTDiagAutoStartSeconds", g_rtdiag_auto_seconds);
+      reshade::get_config_value(runtime, NAME, "RTDiagAutoLevelSeconds", g_rtdiag_auto_level_seconds);
       reshade::get_config_value(runtime, NAME, "RTSunShadowMapTolerance", g_rtsun_shadow_tolerance);
       reshade::get_config_value(runtime, NAME, "RTAOShadowNearSlices", g_rtao_shadow_near_slices);
       reshade::get_config_value(runtime, NAME, "RTAOShadowNearOnly", g_rtao_shadow_near_only);

@@ -270,6 +270,8 @@ namespace RTAO
       // per frame meshes), instances rejected at readback (MVP derived, not a rigid transform)
       uint64_t shadow_draws = 0, shadow_instances = 0, shadow_frame_meshes = 0, shadow_skipped = 0, shadow_rejected = 0;
       uint64_t shadow_skipped_skinned = 0, shadow_skipped_mvp_frame = 0; // shadow_skipped split
+      // Writes by the game into buffers already copied into the arena (stale geometry), total and distinct buffers
+      uint64_t written_after_copy = 0, written_buffers = 0, written_forgotten = 0;
       // MVP derived instances, last readback: read back, matched to a known instance although their exact key differed
       uint64_t mvp_instances = 0, mvp_rekeyed = 0, fuzzy_entries = 0;
       RetentionStats retention; // The TLAS's retained instances, last readback
@@ -320,6 +322,9 @@ namespace RTAO
       void MarkAOPassDone();
       void OnPresent();
       void OnDestroyBuffer(ID3D11Buffer* buffer);
+      // The game wrote into a buffer (UpdateSubresource, a copy into it). If the capture copied it already, it is counted
+      // and, with "forget", dropped like a destroyed buffer (its meshes' BLASes evicted, copied again at the next draw).
+      void OnBufferWritten(ID3D11Buffer* buffer, bool forget);
       void OnDestroyTexture(ID3D11Resource* texture) { cutouts.OnDestroyTexture(texture); }
 
       // D3D12 side, inside an Interop recorder. Consumes the executed records: reads back 3 frames old matrices into
@@ -384,6 +389,7 @@ namespace RTAO
          CutoutGeometry geometry;
          bool shadow_view = false; // Instances, FrameMesh: from a shadow map draw (kept after the AO pass)
          bool check_rigid = false; // Instances: MVP derived in a shadow map draw (see DrawInfo::shadow_view)
+         bool skinned = false; // FrameMesh: skinned (else a dynamic vertex buffer), debug scene view
          bool mvp = false; // Instances: MVP derived matrix (identity matched with a tolerance, see FuzzyKey)
       };
 
@@ -426,6 +432,7 @@ namespace RTAO
       std::unordered_map<uint64_t, MeshEntry> meshes;
       std::vector<uint64_t> evictions;
       std::unordered_map<ID3D11DeviceContext*, std::vector<Rec>> context_records;
+      std::unordered_set<ID3D11Buffer*> written_seen; // Distinct buffers counted in written_buffers
       std::unordered_set<uint64_t> frame_identities; // Draws captured this frame (dedup), cleared at OnPresent
       struct ListRecords
       {

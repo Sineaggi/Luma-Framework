@@ -62,6 +62,8 @@ namespace RTSun
       NdotL = 2, // Geometric N.L of the depth normal, no rays (debug)
       History = 3, // Denoiser history: white kept, black rejected (debug)
       RawHard = 4, // No denoiser and a point light (no penumbra, so no per frame ray jitter): one hard ray per pixel (debug)
+      SceneView = 5, // The ray tracing scene seen from the camera, colored by capture source (RGB565, debug)
+      SceneSun = 6, // The same, seen from the sun (orthographic, 60 m around the camera): what the shadow rays can hit (debug)
       Count
    };
 

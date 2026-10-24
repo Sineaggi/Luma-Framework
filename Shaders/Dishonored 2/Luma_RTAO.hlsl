@@ -36,13 +36,22 @@ cbuffer AOViewParams : register(b0)
     float2 InvTargetSize;
     float2 UVScale; // Used region of the AO texture (render resolution / texture size)
     float Brightness; // 1 for SDR back buffers, paper white / 80 nits for scRGB
-    float3 AOViewPad;
+    float ColorPacked; // 1: the texture holds RGB565 colors in its 16 bits (RT sun "Scene view" debug outputs)
+    float2 AOViewPad;
 };
 SamplerState ao_view_sampler : register(s0);
 
 float4 ao_view_ps(float4 pos : SV_Position) : SV_Target
 {
     float2 uv = pos.xy * InvTargetSize * UVScale;
+    if (ColorPacked != 0.0)
+    {
+        uint2 size;
+        tex.GetDimensions(size.x, size.y);
+        uint v = uint(round(saturate(tex.Load(int3(min(uint2(uv * float2(size)), size - 1), 0))) * 65535.0));
+        float3 c = float3((v >> 11) & 31u, (v >> 5) & 63u, v & 31u) / float3(31.0, 63.0, 31.0);
+        return float4(pow(c, 2.2) * Brightness, 1.0); // sRGB-ish debug colors into a linear back buffer
+    }
     float ao = saturate(tex.SampleLevel(ao_view_sampler, uv, 0));
     return float4(ao.xxx * Brightness, 1.0);
 }

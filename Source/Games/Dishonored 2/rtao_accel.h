@@ -162,6 +162,11 @@ namespace RTAO
    // Where a retained instance was seen (TlasBuilder::AddInstance "source", OR'ed over its life)
    constexpr uint8_t kInstanceSourceMain = 0x01; // The main view
    constexpr uint8_t kInstanceSourceShadow = 0x02; // A shadow map draw
+   // More bits OR'ed into "source", for the debug scene view (RT Sun Output "Scene view"; stored in the TLAS instance's
+   // InstanceContributionToHitGroupIndex, which inline ray queries don't otherwise use). Must match rtsun_trace.hlsl.
+   constexpr uint8_t kInstanceFlagFrameMesh = 0x04; // Per frame mesh (AddFrameInstance)
+   constexpr uint8_t kInstanceFlagMvp = 0x08; // Matrix recovered from the MVP
+   constexpr uint8_t kInstanceFlagSkinned = 0x10; // Skinned (per frame mesh)
 
    // TLAS retention diagnostics, from the last BeginFrame (and the AddInstance calls before it)
    struct RetentionStats
@@ -204,7 +209,7 @@ namespace RTAO
       size_t RetainedCount();
       // An instance for the current frame only (dropped at the next BeginFrame), with its BLAS given directly (e.g. from
       // a DynamicBlasSet). Not thread safe: call from the recording thread, between BeginFrame and Build.
-      void AddFrameInstance(D3D12_GPU_VIRTUAL_ADDRESS blas, const float object_to_world[3][4], uint8_t mask = kInstanceMaskOpaque);
+      void AddFrameInstance(D3D12_GPU_VIRTUAL_ADDRESS blas, const float object_to_world[3][4], uint8_t mask = kInstanceMaskOpaque, uint8_t source = kInstanceSourceMain);
       size_t FrameInstanceCount() const { return frame_instances.size(); }
 
       // Builds the TLAS from every retained instance whose BLAS is in "blases" (the others are skipped). "out" stays

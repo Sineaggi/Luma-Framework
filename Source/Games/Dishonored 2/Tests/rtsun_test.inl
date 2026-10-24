@@ -248,6 +248,34 @@ static void TestSunShadows(ID3D11Device* device, ID3D11DeviceContext* context, R
    CHECK(compared > 10000 && shadowed > 500, "the scene must have lit and shadowed receivers (%d, %d)", compared, shadowed);
    CHECK(mismatched <= compared / 500, "hard RT sun shadow must match the analytic shadow (%d of %d differ)", mismatched, compared);
 
+   // 1b) Debug scene view from the camera: geometry pixels show the "main view only" color (green, RGB565 in the 16 bits),
+   // sky pixels the "nothing" grey
+   {
+      settings.output = RTSun::Output::SceneView;
+      const std::vector<float> scene = run_frame();
+      int geometry = 0, green = 0, sky = 0, grey = 0;
+      for (UINT i = 0; i < W * H; i++)
+      {
+         const uint32_t v = uint32_t(std::lround(std::clamp(scene[i], 0.f, 1.f) * 65535.f));
+         const float r = float((v >> 11) & 31) / 31.f, g = float((v >> 5) & 63) / 63.f, b = float(v & 31) / 31.f;
+         if (hit_id[i] >= 0)
+         {
+            geometry++;
+            green += (g > 0.3f && g > r * 1.5f && g > b * 1.5f) ? 1 : 0;
+         }
+         else
+         {
+            sky++;
+            grey += (std::fabs(r - 0.12f) < 0.05f && std::fabs(g - 0.12f) < 0.05f && std::fabs(b - 0.12f) < 0.05f) ? 1 : 0;
+         }
+      }
+      printf("RT scene view: %d of %d geometry pixels in the main view color, %d of %d sky pixels grey\n", green, geometry, grey, sky);
+      CHECK(geometry > 0 && green >= geometry * 98 / 100, "scene view: geometry must show its capture source color (%d of %d)", green, geometry);
+      CHECK(grey >= sky * 98 / 100, "scene view: rays that hit nothing must be grey (%d of %d)", grey, sky);
+      settings.output = RTSun::Output::SceneSun;
+      run_frame(); // Must run (no validation errors); content checked in game
+   }
+
    // 2) Soft light: the traced penumbra (raw rays, averaged here over frames) has the analytic width and grows with
    // the angle; the denoised result (its 3x3 spatial pass softens edges by about a pixel) follows the disc integral
    auto soft_case = [&](float diameter_deg, float& mae, int& gpu_penumbra, int& cpu_penumbra) {

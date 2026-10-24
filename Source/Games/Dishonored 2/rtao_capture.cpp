@@ -1812,6 +1812,7 @@ namespace RTAO
          record.index_count = index_count;
          record.index_format = soup ? DXGI_FORMAT_UNKNOWN : draw.index_format;
          record.shadow_view = draw.shadow_view;
+         record.skinned = skinned;
          local.push_back(record);
          if (identity)
             frame_identities.insert(identity);
@@ -1939,9 +1940,27 @@ namespace RTAO
       cutouts.OnPresent();
    }
 
+   void GeometryCapture::OnBufferWritten(ID3D11Buffer* buffer, bool forget)
+   {
+      {
+         const std::lock_guard lock(mutex);
+         auto it = buffers.find(buffer);
+         if (it == buffers.end() || !it->second.executed)
+            return;
+         stats.written_after_copy++;
+         if (written_seen.insert(buffer).second)
+            stats.written_buffers++;
+         if (!forget)
+            return;
+         stats.written_forgotten++;
+      }
+      OnDestroyBuffer(buffer);
+   }
+
    void GeometryCapture::OnDestroyBuffer(ID3D11Buffer* buffer)
    {
       const std::lock_guard lock(mutex);
+      written_seen.erase(buffer);
       if (buffers.erase(buffer) == 0)
          return;
       for (auto it = meshes.begin(); it != meshes.end();)
@@ -2087,7 +2106,7 @@ namespace RTAO
                   }
                   float transform[3][4];
                   std::memcpy(transform, rows, sizeof(transform));
-                  tlas.AddInstance(key, r.mesh_key, transform, r.mask, cutout_record, r.shadow_view ? kInstanceSourceShadow : kInstanceSourceMain);
+                  tlas.AddInstance(key, r.mesh_key, transform, r.mask, cutout_record, uint8_t((r.shadow_view ? kInstanceSourceShadow : kInstanceSourceMain) | (r.mvp ? kInstanceFlagMvp : 0)));
                   frame_instances++;
                   frame_cutouts += (r.mask & kInstanceMaskCutout) != 0;
                }
@@ -2219,7 +2238,7 @@ namespace RTAO
                   frame_failed++;
                   continue;
                }
-               tlas.AddFrameInstance(blas, identity);
+               tlas.AddFrameInstance(blas, identity, kInstanceMaskOpaque, uint8_t((record.shadow_view ? kInstanceSourceShadow : kInstanceSourceMain) | (record.skinned ? kInstanceFlagSkinned : 0)));
                frame_draws++;
                frame_vertices += record.count;
                (refit ? frame_refits : frame_builds)++;

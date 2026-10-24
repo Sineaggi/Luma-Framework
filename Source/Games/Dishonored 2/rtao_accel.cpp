@@ -464,7 +464,7 @@ namespace RTAO
          }
          (promoted ? s.promoted : s.young)++;
          s.shadow_young += shadow && !promoted;
-         const uint8_t sources = it->second.sources;
+         const uint8_t sources = it->second.sources & (kInstanceSourceMain | kInstanceSourceShadow);
          if (sources == (kInstanceSourceMain | kInstanceSourceShadow))
             s.both++;
          else if (sources == kInstanceSourceShadow)
@@ -509,7 +509,7 @@ namespace RTAO
       instances.erase(instance_key);
    }
 
-   void TlasBuilder::AddFrameInstance(D3D12_GPU_VIRTUAL_ADDRESS blas, const float object_to_world[3][4], uint8_t mask)
+   void TlasBuilder::AddFrameInstance(D3D12_GPU_VIRTUAL_ADDRESS blas, const float object_to_world[3][4], uint8_t mask, uint8_t source)
    {
       if (!blas)
          return;
@@ -518,6 +518,7 @@ namespace RTAO
       desc.InstanceMask = mask;
       desc.Flags = D3D12_RAYTRACING_INSTANCE_FLAG_TRIANGLE_CULL_DISABLE | D3D12_RAYTRACING_INSTANCE_FLAG_FORCE_OPAQUE;
       desc.AccelerationStructure = blas;
+      desc.InstanceContributionToHitGroupIndex = source | kInstanceFlagFrameMesh; // Debug scene view only (inline ray queries have no hit groups)
       frame_instances.push_back(desc);
    }
 
@@ -560,6 +561,7 @@ namespace RTAO
                last_cutout_count++;
             }
             desc.AccelerationStructure = blas;
+            desc.InstanceContributionToHitGroupIndex = pair.second.sources; // Debug scene view only (inline ray queries have no hit groups)
             descs.push_back(desc);
          }
          for (D3D12_RAYTRACING_INSTANCE_DESC desc : frame_instances)

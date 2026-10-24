@@ -226,6 +226,7 @@ namespace
    bool g_rtao_fast_cutouts = false;
    // Skip draws that repeat one captured earlier in the frame (depth prepass + G-buffer pass) (config "RTAODedup")
    bool g_rtao_dedup = true;
+   bool g_rtao_recopy_written = false; // Re-copy captured buffers the game rewrites (config "RTAORecopyWrittenBuffers", H3 test)
    bool g_rtao_freeze_scene = false; // Debug, not saved: trace the last TLAS again every frame (no capture, no rebuild)
    int g_rtao_blas_budget = 64; // New static BLASes built per frame (config "RTAOBlasBudget")
    // Map(WRITE_DISCARD) of game buffers, per recording thread: buffer -> unique id of its last discard. Part of a draw's
@@ -271,6 +272,11 @@ namespace
    int g_rtsun_rays = 1; // Per pixel per frame (config "RTSunRays")
    int g_rtsun_output = int(RTSun::Output::Denoised); // Config "RTSunOutput"
    std::mutex g_rtsun_status_mutex;
+   // The RT sun output is one of the debug scene views (a color image of the ray tracing scene, shown fullscreen)
+   bool RTSunSceneView()
+   {
+      return g_rtsun_mode != RTSUN_MODE_OFF && (g_rtsun_output == int(RTSun::Output::SceneView) || g_rtsun_output == int(RTSun::Output::SceneSun));
+   }
    std::string g_rtsun_status;
 
    void SetRTSunStatus(std::string status, bool error)
@@ -453,6 +459,10 @@ public:
          reshade::register_event<reshade::addon_event::draw_indexed>(Dishonored2::OnRTAODrawIndexed);
          reshade::register_event<reshade::addon_event::draw_or_dispatch_indirect>(Dishonored2::OnRTAODrawIndirect);
          reshade::register_event<reshade::addon_event::destroy_resource>(Dishonored2::OnRTAODestroyResource);
+         reshade::register_event<reshade::addon_event::update_buffer_region>(Dishonored2::OnRTAOUpdateBuffer);
+         reshade::register_event<reshade::addon_event::update_buffer_region_command>(Dishonored2::OnRTAOUpdateBufferCommand);
+         reshade::register_event<reshade::addon_event::copy_resource>(Dishonored2::OnRTAOCopyResource);
+         reshade::register_event<reshade::addon_event::copy_buffer_region>(Dishonored2::OnRTAOCopyBufferRegion);
       }
    }
 
@@ -699,7 +709,10 @@ public:
       // The AO texture
       com_ptr<ID3D11ShaderResourceView> srv;
       float2 uv_scale = { 1.f, 1.f };
-      if (g_ao_view_mode == 2)
+      // RT sun "Scene view" outputs are colors (RGB565 in the sun visibility): always shown, unpacked by the shader
+      const bool scene_view = RTSunSceneView();
+      const int view_mode = scene_view ? 3 : g_ao_view_mode;
+      if (view_mode == 2)
       {
          if (!game_device_data.rtao.IsInitialized())
             return;
@@ -709,7 +722,7 @@ public:
          srv = rtao_srv;
          rtao_srv->Release();
       }
-      else if (g_ao_view_mode == 3)
+      else if (view_mode == 3)
       {
          ID3D11ShaderResourceView* sun_srv = game_device_data.rtsun_pass.GetSRV();
          if (!sun_srv)
@@ -780,7 +793,7 @@ public:
       D3D11_MAPPED_SUBRESOURCE mapped;
       if (FAILED(context->Map(game_device_data.ao_view_cb.get(), 0, D3D11_MAP_WRITE_DISCARD, 0, &mapped)))
          return;
-      const float params[8] = { 1.f / float(back_buffer_desc.Width), 1.f / float(back_buffer_desc.Height), uv_scale.x, uv_scale.y, scrgb ? 203.f / 80.f : 1.f, 0.f, 0.f, 0.f };
+      const float params[8] = { 1.f / float(back_buffer_desc.Width), 1.f / float(back_buffer_desc.Height), uv_scale.x, uv_scale.y, scrgb ? 203.f / 80.f : 1.f, scene_view ? 1.f : 0.f, 0.f, 0.f };
       std::memcpy(mapped.pData, params, sizeof(params));
       context->Unmap(game_device_data.ao_view_cb.get(), 0);
 
@@ -1381,7 +1394,7 @@ public:
          game_device_data.rtao_capture.OnPresent();
       if (g_rtsun_mode != RTSUN_MODE_OFF)
          PollRTSunLight(native_device, game_device_data);
-      if (g_ao_view_mode != 0)
+      if (g_ao_view_mode != 0 || RTSunSceneView())
          DrawAOView(native_device, device_data, game_device_data);
 
       // The game's HBAO+ follows Luma's AO mode. Applied when the mode changes, and once when the first 3D scene
@@ -1448,17 +1461,18 @@ public:
          {
             const RTAO::CaptureStats stats = game_device_data.rtao_capture.GetStats();
             const RTAO::RetentionStats& r = stats.retention;
-            char line[1024];
+            char line[1400];
             snprintf(line, sizeof(line),
                "RTAO diag: shadow map draws in %u frames: %u frames with none, max %llu in a frame | TLAS retained %u (promoted %u, young %u; main view only %u, shadow maps only %u, both %u), "
                "last readback: new %u, evicted %u promoted + %u young, shadow young %u | BLAS: meshes %llu, built %llu, failed %llu, TLAS instances %u, left out (BLAS not built yet) %u, budget %d/frame, arena %llu MB, draws refused: arena full %llu, buffer %llu, ring %llu | MVP instances %llu, rekeyed %llu (fuzzy entries %llu) | "
-               "camera: SSAO draws %llu, shared copy from another frame %llu, view projection differed %llu (max element diff %.6f), no thread copy %llu, thread copy another camera %llu",
+               "camera: SSAO draws %llu, shared copy from another frame %llu, view projection differed %llu (max element diff %.6f), no thread copy %llu, thread copy another camera %llu | game writes into captured buffers %llu (%llu buffers, %llu re-copied)",
                g_rtao_shadow_frames, g_rtao_shadow_zero_frames, (unsigned long long)g_rtao_shadow_max_per_frame, r.promoted + r.young, r.promoted, r.young, r.main_only, r.shadow_only, r.both,
                r.added_new, r.evicted_promoted, r.evicted_young, r.shadow_young, (unsigned long long)stats.meshes, (unsigned long long)stats.meshes_ready, (unsigned long long)stats.blas_failed,
                game_device_data.rtao_tlas_instances.load(), game_device_data.rtao_tlas_missing_blas.load(), g_rtao_blas_budget, (unsigned long long)(stats.arena_vertex_bytes >> 20),
                (unsigned long long)stats.skipped[RTAO::kSkipArenaFull], (unsigned long long)stats.skipped[RTAO::kSkipBuffer], (unsigned long long)stats.skipped[RTAO::kSkipRingFull], (unsigned long long)stats.mvp_instances, (unsigned long long)stats.mvp_rekeyed, (unsigned long long)stats.fuzzy_entries,
                (unsigned long long)g_rtao_view_checks.load(), (unsigned long long)g_rtao_view_other_frame.load(), (unsigned long long)g_rtao_view_mismatch.load(), g_rtao_view_mismatch_max.load() / 1e6,
-               (unsigned long long)g_rtao_view_no_thread_copy.load(), (unsigned long long)g_rtao_view_other_camera.load());
+               (unsigned long long)g_rtao_view_no_thread_copy.load(), (unsigned long long)g_rtao_view_other_camera.load(),
+               (unsigned long long)stats.written_after_copy, (unsigned long long)stats.written_buffers, (unsigned long long)stats.written_forgotten);
             reshade::log::message(reshade::log::level::info, line);
             g_rtao_shadow_frames = g_rtao_shadow_zero_frames = 0;
             g_rtao_shadow_max_per_frame = 0;
@@ -2461,6 +2475,44 @@ public:
       }
    }
 
+   // H3 (wrong geometry with stable instance counts): the capture copies a game buffer into its arena once, at the first
+   // draw that uses it. A DEFAULT buffer the game rewrites later (UpdateSubresource, a copy into it: streamed or pooled
+   // meshes) would leave stale geometry in the ray tracing scene. Counted always; with "RTAORecopyWrittenBuffers" the
+   // buffer is forgotten (its meshes' BLASes evicted) so the next draw copies it again.
+   static void OnRTAOBufferWritten(reshade::api::device* device, reshade::api::resource dest)
+   {
+      if (device->get_api() != reshade::api::device_api::d3d11 || dest.handle == 0 || !g_rtao_capture_active.load(std::memory_order_relaxed))
+         return;
+      auto* native = reinterpret_cast<ID3D11Resource*>(dest.handle);
+      D3D11_RESOURCE_DIMENSION dimension = D3D11_RESOURCE_DIMENSION_UNKNOWN;
+      native->GetType(&dimension);
+      if (dimension != D3D11_RESOURCE_DIMENSION_BUFFER)
+         return;
+      auto* device_data = device->get_private_data<DeviceData>();
+      if (device_data && device_data->game)
+         GetGameDeviceData(*device_data).rtao_capture.OnBufferWritten(static_cast<ID3D11Buffer*>(native), g_rtao_recopy_written);
+   }
+   static bool OnRTAOUpdateBuffer(reshade::api::device* device, const void*, reshade::api::resource dest, uint64_t, uint64_t)
+   {
+      OnRTAOBufferWritten(device, dest);
+      return false;
+   }
+   static bool OnRTAOUpdateBufferCommand(reshade::api::command_list* cmd_list, const void*, reshade::api::resource dest, uint64_t, uint64_t)
+   {
+      OnRTAOBufferWritten(cmd_list->get_device(), dest);
+      return false;
+   }
+   static bool OnRTAOCopyResource(reshade::api::command_list* cmd_list, reshade::api::resource, reshade::api::resource dest)
+   {
+      OnRTAOBufferWritten(cmd_list->get_device(), dest);
+      return false;
+   }
+   static bool OnRTAOCopyBufferRegion(reshade::api::command_list* cmd_list, reshade::api::resource, uint64_t, reshade::api::resource dest, uint64_t, uint64_t)
+   {
+      OnRTAOBufferWritten(cmd_list->get_device(), dest);
+      return false;
+   }
+
    static void OnMapBufferRegion(reshade::api::device* device, reshade::api::resource resource, uint64_t offset, uint64_t size, reshade::api::map_access access, void** data)
    {
       if (device->get_api() != reshade::api::device_api::d3d11) // e.g. RTAO's D3D12 device
@@ -2777,6 +2829,7 @@ public:
       reshade::get_config_value(runtime, NAME, "RTAOFastCutouts", g_rtao_fast_cutouts);
       reshade::get_config_value(runtime, NAME, "RTAODedup", g_rtao_dedup);
       reshade::get_config_value(runtime, NAME, "RTAOBlasBudget", g_rtao_blas_budget);
+      reshade::get_config_value(runtime, NAME, "RTAORecopyWrittenBuffers", g_rtao_recopy_written);
       reshade::get_config_value(runtime, NAME, "RTAOCutoutsExact", g_rtao_cutouts_exact);
 
       auto& game_settings = cb_luma_global_settings.GameSettings;
@@ -3031,7 +3084,8 @@ public:
          reshade::set_config_value(runtime, NAME, "RTSunRays", g_rtsun_rays);
       if (ImGui::IsItemHovered())
          ImGui::SetTooltip("Rays per pixel per frame (in the penumbra the denoiser averages them over frames).");
-      static const char* rtsun_output_names[int(RTSun::Output::Count)] = { "Denoised", "Raw (no denoiser)", "Geometric N.L (no rays, debug)", "Denoiser history (debug)", "Raw hard (no denoiser, no penumbra)" };
+      static const char* rtsun_output_names[int(RTSun::Output::Count)] = { "Denoised", "Raw (no denoiser)", "Geometric N.L (no rays, debug)", "Denoiser history (debug)", "Raw hard (no denoiser, no penumbra)",
+         "Scene view: from the camera (debug)", "Scene view: from the sun (debug)" };
       if (ImGui::Combo("RT Sun Output", &g_rtsun_output, rtsun_output_names, int(RTSun::Output::Count)))
       {
          g_rtsun_output = std::clamp(g_rtsun_output, 0, int(RTSun::Output::Count) - 1);
@@ -3040,6 +3094,10 @@ public:
       if (ImGui::IsItemHovered())
          ImGui::SetTooltip("What the trace writes. Check it with \"View AO only\" = RT sun visibility.");
       // Debug (shared with RTAO's scene), next to the sun output where they are used
+      if (ImGui::Checkbox("RT debug: re-copy buffers the game rewrites", &g_rtao_recopy_written))
+         reshade::set_config_value(runtime, NAME, "RTAORecopyWrittenBuffers", g_rtao_recopy_written);
+      if (ImGui::IsItemHovered())
+         ImGui::SetTooltip("Test: when the game writes into a vertex/index buffer the ray tracing scene already copied (streamed or pooled\nmeshes), forget the copy so the next draw copies the new contents. Off: the count is still logged (\"RTAO diag\").");
       ImGui::Checkbox("RT debug: freeze ray tracing scene", &g_rtao_freeze_scene);
       if (ImGui::IsItemHovered())
          ImGui::SetTooltip("Keeps tracing the current ray tracing scene (no new geometry, no removals) until unchecked. Not saved.\n"
@@ -3271,6 +3329,10 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD ul_reason_for_call, LPVOID lpReserv
       reshade::unregister_event<reshade::addon_event::draw_indexed>(Dishonored2::OnRTAODrawIndexed);
       reshade::unregister_event<reshade::addon_event::draw_or_dispatch_indirect>(Dishonored2::OnRTAODrawIndirect);
       reshade::unregister_event<reshade::addon_event::destroy_resource>(Dishonored2::OnRTAODestroyResource);
+      reshade::unregister_event<reshade::addon_event::update_buffer_region>(Dishonored2::OnRTAOUpdateBuffer);
+      reshade::unregister_event<reshade::addon_event::update_buffer_region_command>(Dishonored2::OnRTAOUpdateBufferCommand);
+      reshade::unregister_event<reshade::addon_event::copy_resource>(Dishonored2::OnRTAOCopyResource);
+      reshade::unregister_event<reshade::addon_event::copy_buffer_region>(Dishonored2::OnRTAOCopyBufferRegion);
    }
 
    CoreMain(hModule, ul_reason_for_call, lpReserved);

@@ -393,6 +393,14 @@ namespace
    std::mutex g_draw_probe_mutex;
    std::map<std::string, uint64_t> g_draw_probe;
    std::atomic<bool> g_draw_probe_active = false;
+   std::mutex g_copy_probe_mutex;
+   std::map<std::string, uint64_t> g_copy_probe; // Copies between depth textures during a capture (copies.csv)
+   // Shadow maps the game renders into a plain (non array) square depth texture >= 1024 (config "RTAOShadowFlatTargets"):
+   // part of the sun's shadow content (window trim) is drawn there. Their draws get slice kFlatShadowSlice.
+   bool g_rtao_shadow_flat = true;
+   constexpr uint32_t kFlatShadowSlice = 8;
+   // Skinned shadow map draws (config "RTAOShadowSkinned"): many sun casters are drawn with skinned shaders
+   bool g_rtao_shadow_skinned = true;
    // The game's shadow map rasterizer bias (last shadow draw): the reproduction allows for it
    std::atomic<int> g_shadow_depth_bias = 0;
    std::atomic<float> g_shadow_slope_bias = 0.f;
@@ -603,6 +611,7 @@ public:
          reshade::register_event<reshade::addon_event::update_buffer_region>(Dishonored2::OnRTAOUpdateBuffer);
          reshade::register_event<reshade::addon_event::update_buffer_region_command>(Dishonored2::OnRTAOUpdateBufferCommand);
          reshade::register_event<reshade::addon_event::copy_resource>(Dishonored2::OnRTAOCopyResource);
+         reshade::register_event<reshade::addon_event::copy_texture_region>(Dishonored2::OnRTAOCopyTextureRegion);
          reshade::register_event<reshade::addon_event::copy_buffer_region>(Dishonored2::OnRTAOCopyBufferRegion);
       }
    }
@@ -717,6 +726,7 @@ public:
       game_device_data.rtao_capture.dynamic_enabled = g_rtao_dynamic;
       game_device_data.rtao_capture.cutouts_exact = g_rtao_cutouts_exact;
       game_device_data.rtao_capture.dedup_enabled = g_rtao_dedup;
+      game_device_data.rtao_capture.shadow_skinned_enabled = g_rtao_shadow_skinned;
       game_device_data.rtao_capture.skinned_hold_frames = uint32_t(std::clamp(g_rtao_skinned_hold, 0, 600));
       game_device_data.rtao_capture.shadow_frame_meshes_enabled = g_rtdbg_shadow_openables;
       game_device_data.rtao_tlas.shadow_mode = g_rtdbg_shadow_young_long ? 1u : 0u;
@@ -1123,10 +1133,19 @@ public:
                const std::lock_guard lock(g_draw_probe_mutex);
                probe.swap(g_draw_probe);
             }
-            std::string csv = "mesh_key,ib,first_index,index_count,base_vertex,vs_hash,ps_hash,depth_enable,depth_write,depth_func,blend,src_blend,dst_blend,write_mask,alpha_to_coverage,rtv_count,rtv0_format,dsv_slice,depth_bias,slope_bias,cull,vp_x,vp_y,vp_w,vp_h,dynamic_vb,draws\n";
+            std::string csv = "mesh_key,ib,first_index,index_count,base_vertex,vs_hash,ps_hash,depth_enable,depth_write,depth_func,blend,src_blend,dst_blend,write_mask,alpha_to_coverage,rtv_count,rtv0_format,dsv_slice,depth_bias,slope_bias,cull,vp_x,vp_y,vp_w,vp_h,dynamic_vb,dsv_resource,dsv_w,dsv_h,dsv_array,dsv_format,draws\n";
             for (const auto& pair : probe)
                csv += pair.first + "," + std::to_string(pair.second) + "\n";
             std::ofstream(std::filesystem::path(g_rtdiag.dir) / "draws.csv") << csv;
+            std::map<std::string, uint64_t> copies;
+            {
+               const std::lock_guard lock(g_copy_probe_mutex);
+               copies.swap(g_copy_probe);
+            }
+            std::string copy_csv = "kind,src,src_w,src_h,src_array,src_format,src_sub,dst,dst_w,dst_h,dst_array,dst_format,dst_sub,count\n";
+            for (const auto& pair : copies)
+               copy_csv += pair.first + "," + std::to_string(pair.second) + "\n";
+            std::ofstream(std::filesystem::path(g_rtdiag.dir) / "copies.csv") << copy_csv;
          }
          std::ofstream(std::filesystem::path(g_rtdiag.dir) / "timeline.csv") << [&]() {
             std::string all;
@@ -2951,7 +2970,9 @@ public:
          return false;
       D3D11_TEXTURE2D_DESC desc;
       texture->GetDesc(&desc);
-      if (desc.ArraySize < 2 || (desc.Width == g_rtao_main_depth_width.load(std::memory_order_relaxed) && desc.Height == g_rtao_main_depth_height.load(std::memory_order_relaxed)))
+      const bool main_size = desc.Width == g_rtao_main_depth_width.load(std::memory_order_relaxed) && desc.Height == g_rtao_main_depth_height.load(std::memory_order_relaxed);
+      const bool flat = desc.ArraySize == 1 && g_rtao_shadow_flat && desc.Width >= 1024 && desc.Width == desc.Height;
+      if ((desc.ArraySize < 2 && !flat) || main_size)
          return false;
       com_ptr<ID3D11DepthStencilState> state;
       UINT stencil_ref = 0;
@@ -2965,7 +2986,7 @@ public:
       }
       D3D11_DEPTH_STENCIL_VIEW_DESC dsv_desc;
       dsv->GetDesc(&dsv_desc);
-      const uint32_t slice = dsv_desc.ViewDimension == D3D11_DSV_DIMENSION_TEXTURE2DARRAY ? dsv_desc.Texture2DArray.FirstArraySlice : 0;
+      const uint32_t slice = flat ? kFlatShadowSlice : (dsv_desc.ViewDimension == D3D11_DSV_DIMENSION_TEXTURE2DARRAY ? dsv_desc.Texture2DArray.FirstArraySlice : 0);
       {
          D3D11_VIEWPORT viewport = {};
          UINT viewports = 1;
@@ -3123,11 +3144,19 @@ public:
             rtvs[i]->Release();
          }
       int dsv_slice = -1;
+      uintptr_t dsv_resource = 0;
+      D3D11_TEXTURE2D_DESC dsv_tex = {};
       if (dsv)
       {
          D3D11_DEPTH_STENCIL_VIEW_DESC d;
          dsv->GetDesc(&d);
          dsv_slice = d.ViewDimension == D3D11_DSV_DIMENSION_TEXTURE2DARRAY ? int(d.Texture2DArray.FirstArraySlice) : -2;
+         com_ptr<ID3D11Resource> resource;
+         dsv->GetResource(&resource);
+         dsv_resource = uintptr_t(resource.get());
+         com_ptr<ID3D11Texture2D> texture;
+         if (resource && SUCCEEDED(resource->QueryInterface(&texture)))
+            texture->GetDesc(&dsv_tex);
          dsv->Release();
       }
       D3D11_VIEWPORT viewport = {};
@@ -3140,6 +3169,11 @@ public:
          int(depth_desc.DepthEnable), int(depth_desc.DepthWriteMask), int(depth_desc.DepthFunc), int(rt0.BlendEnable), int(rt0.SrcBlend), int(rt0.DestBlend), int(rt0.RenderTargetWriteMask), int(blend_desc.AlphaToCoverageEnable),
          rtv_count, int(rtv0_format), dsv_slice, int(raster_desc.DepthBias), raster_desc.SlopeScaledDepthBias, int(raster_desc.CullMode),
          viewport.TopLeftX, viewport.TopLeftY, viewport.Width, viewport.Height, int(dynamic));
+      {
+         char target[96];
+         snprintf(target, sizeof(target), ",%llX,%u,%u,%u,%d", (unsigned long long)dsv_resource, dsv_tex.Width, dsv_tex.Height, dsv_tex.ArraySize, int(dsv_tex.Format));
+         strncat_s(row, sizeof(row), target, _TRUNCATE);
+      }
       const std::lock_guard lock(g_draw_probe_mutex);
       auto it = g_draw_probe.find(row);
       if (it != g_draw_probe.end())
@@ -3168,7 +3202,7 @@ public:
             return false;
          g_rtao_shadow_slice_draws[(std::min)(slice, 7u)]++;
          shadow_slice = slice;
-         if (g_rtao_shadow_near_only && slice >= uint32_t((std::max)(g_rtao_shadow_near_slices, 1)))
+         if (g_rtao_shadow_near_only && slice >= uint32_t((std::max)(g_rtao_shadow_near_slices, 1)) && slice != kFlatShadowSlice)
          {
             ShadowAudit(context, slice, "far_slice", index_count);
             g_rtao_shadow_far_skipped++;
@@ -3244,7 +3278,7 @@ public:
       if (shadow_view)
       {
          // Same family toggles as the main view, no diagnostics. Skinned draws are left out (see DrawInfo::shadow_view).
-         if ((vs_info.wind && !g_rtao_wind_meshes) || (alpha_tested && !g_rtao_cutouts) || vs_info.source == RTAO::MatrixSource::None || vs_info.skinned)
+         if ((vs_info.wind && !g_rtao_wind_meshes) || (alpha_tested && !g_rtao_cutouts) || vs_info.source == RTAO::MatrixSource::None || (vs_info.skinned && !g_rtao_shadow_skinned))
          {
             ShadowAudit(context, shadow_slice, vs_info.source == RTAO::MatrixSource::None ? (vs_info.skip_reason ? vs_info.skip_reason : "no_matrix_source") : (vs_info.skinned ? "skinned" : "family_off"), index_count);
             return false;
@@ -3254,6 +3288,17 @@ public:
             ShadowAudit(context, shadow_slice, "layout", index_count);
             return false;
          }
+         if (vs_info.skinned)
+            for (uint32_t set = 0; set < vs_info.skin_sets; set++)
+            {
+               const auto& indices = layout_info.skin_indices[set];
+               const auto& weights = layout_info.skin_weights[set];
+               if (!indices.present || !weights.present || indices.per_instance || weights.per_instance)
+               {
+                  ShadowAudit(context, shadow_slice, "skin_layout", index_count);
+                  return false;
+               }
+            }
       }
       else
       {
@@ -3510,8 +3555,40 @@ public:
       OnRTAOBufferWritten(cmd_list->get_device(), dest);
       return false;
    }
-   static bool OnRTAOCopyResource(reshade::api::command_list* cmd_list, reshade::api::resource, reshade::api::resource dest)
+   // Diagnostic capture: copies involving a texture of at least 1024 (depth shadow maps and anything else that size)
+   static void CopyProbe(const char* kind, reshade::api::resource source, uint32_t source_sub, reshade::api::resource dest, uint32_t dest_sub)
    {
+      if (!g_draw_probe_active.load(std::memory_order_relaxed))
+         return;
+      auto describe = [](reshade::api::resource r, D3D11_TEXTURE2D_DESC& out) {
+         out = {};
+         auto* resource = reinterpret_cast<ID3D11Resource*>(r.handle);
+         com_ptr<ID3D11Texture2D> texture;
+         if (resource && SUCCEEDED(resource->QueryInterface(&texture)))
+            texture->GetDesc(&out);
+      };
+      D3D11_TEXTURE2D_DESC s, d;
+      describe(source, s);
+      describe(dest, d);
+      if ((std::max)(s.Width, d.Width) < 1024)
+         return;
+      char row[200];
+      snprintf(row, sizeof(row), "%s,%llX,%u,%u,%u,%d,%u,%llX,%u,%u,%u,%d,%u", kind, (unsigned long long)source.handle, s.Width, s.Height, s.ArraySize, int(s.Format), source_sub,
+         (unsigned long long)dest.handle, d.Width, d.Height, d.ArraySize, int(d.Format), dest_sub);
+      const std::lock_guard lock(g_copy_probe_mutex);
+      if (g_copy_probe.size() < 10000)
+         g_copy_probe[row]++;
+   }
+
+   static bool OnRTAOCopyTextureRegion(reshade::api::command_list*, reshade::api::resource source, uint32_t source_subresource, const reshade::api::subresource_box*, reshade::api::resource dest, uint32_t dest_subresource, const reshade::api::subresource_box*, reshade::api::filter_mode)
+   {
+      CopyProbe("region", source, source_subresource, dest, dest_subresource);
+      return false;
+   }
+
+   static bool OnRTAOCopyResource(reshade::api::command_list* cmd_list, reshade::api::resource source, reshade::api::resource dest)
+   {
+      CopyProbe("resource", source, 0, dest, 0);
       OnRTAOBufferWritten(cmd_list->get_device(), dest);
       return false;
    }
@@ -3818,6 +3895,8 @@ public:
       reshade::get_config_value(runtime, NAME, "RTSunShadowMapCheck", g_rtsun_shadow_consult);
       reshade::get_config_value(runtime, NAME, "RTDiagAutoStartSeconds", g_rtdiag_auto_seconds);
       reshade::get_config_value(runtime, NAME, "RTDiagAutoLevelSeconds", g_rtdiag_auto_level_seconds);
+      reshade::get_config_value(runtime, NAME, "RTAOShadowFlatTargets", g_rtao_shadow_flat);
+      reshade::get_config_value(runtime, NAME, "RTAOShadowSkinned", g_rtao_shadow_skinned);
       reshade::get_config_value(runtime, NAME, "RTSunShadowMapTolerance", g_rtsun_shadow_tolerance);
       reshade::get_config_value(runtime, NAME, "RTAOShadowNearSlices", g_rtao_shadow_near_slices);
       reshade::get_config_value(runtime, NAME, "RTAOShadowNearOnly", g_rtao_shadow_near_only);
@@ -4388,6 +4467,7 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD ul_reason_for_call, LPVOID lpReserv
       reshade::unregister_event<reshade::addon_event::update_buffer_region_command>(Dishonored2::OnRTAOUpdateBufferCommand);
       reshade::unregister_event<reshade::addon_event::copy_resource>(Dishonored2::OnRTAOCopyResource);
       reshade::unregister_event<reshade::addon_event::copy_buffer_region>(Dishonored2::OnRTAOCopyBufferRegion);
+      reshade::unregister_event<reshade::addon_event::copy_texture_region>(Dishonored2::OnRTAOCopyTextureRegion);
    }
 
    CoreMain(hModule, ul_reason_for_call, lpReserved);

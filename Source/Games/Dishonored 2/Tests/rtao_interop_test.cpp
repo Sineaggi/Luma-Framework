@@ -1882,6 +1882,26 @@ static void TestFrameMeshes(ID3D11Device* device, ID3D11DeviceContext* context, 
       CHECK(!probes.empty() && e_found > 0, "probes must hold the dynamic mesh's world position");
    }
 
+   // Skinned shadow map draws (the game draws many of its sun casters with skinned shaders): captured when enabled,
+   // skipped when off
+   {
+      capture.OnPresent(); // A new frame: no duplicate of this frame's main view draw
+      RTAO::DrawInfo shadow_draw1 = draw1;
+      shadow_draw1.shadow_view = true;
+      shadow_draw1.shadow_slice = 0;
+      const RTAO::CaptureStats before = capture.GetStats();
+      CHECK(capture.CaptureDraw(context, shadow_draw1), "a skinned shadow map draw must be captured");
+      capture.shadow_skinned_enabled = false;
+      capture.OnPresent();
+      CHECK(!capture.CaptureDraw(context, shadow_draw1), "a skinned shadow map draw must be skipped when off");
+      capture.shadow_skinned_enabled = true;
+      const RTAO::CaptureStats after = capture.GetStats();
+      printf("skinned shadow map draws: captured %llu, skipped when off %llu\n", (unsigned long long)(after.skinned_captured - before.skinned_captured),
+         (unsigned long long)(after.shadow_skipped_skinned - before.shadow_skipped_skinned));
+      CHECK(after.skinned_captured - before.skinned_captured == 1 && after.shadow_skipped_skinned - before.shadow_skipped_skinned == 1, "skinned shadow map draw counts");
+      run_frame(0, 0);
+   }
+
    CHECK(interop.WaitForIdle(5000), "WaitForIdle");
    retirer.ReleaseAll();
    pass.Shutdown(nullptr, 0);

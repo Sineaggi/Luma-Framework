@@ -1374,7 +1374,7 @@ namespace RTAO
       // Shadow map draws: no skinned meshes (once per cascade, the most expensive capture), see DrawInfo::shadow_view.
       // MVP per frame meshes (openable windows, doors) are taken: Luma_RTAO.hlsl ResolveInstance rejects a non rigid MVP
       // derived matrix on the GPU (NaN vertices, inactive in DXR).
-      if (draw.shadow_view && draw.vs->skinned)
+      if (draw.shadow_view && draw.vs->skinned && !shadow_skinned_enabled.load(std::memory_order_relaxed))
       {
          t_capture_outcome = "shadow_skinned";
          const std::lock_guard lock(mutex);

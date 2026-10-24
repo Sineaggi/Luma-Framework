@@ -328,6 +328,7 @@ namespace RTAO
       std::atomic<bool> dynamic_enabled = true;
       // Draws with the same identity as one captured earlier in the frame are skipped (see CaptureStats::dedup_draws)
       std::atomic<bool> dedup_enabled = true;
+      std::atomic<bool> shadow_skinned_enabled = true; // Skinned shadow map draws (the game draws many sun casters with skinned shaders)
       std::atomic<uint32_t> skinned_hold_frames = 30; // Undrawn frames a skinned mesh keeps its last pose (0: current frame only)
       bool IsInitialized() const { return ring11 != nullptr; }
       void Shutdown();

@@ -388,6 +388,11 @@ namespace
       bool operator<(const ShadowAuditKey& o) const { return std::tie(slice, outcome, vs, ps, indices) < std::tie(o.slice, o.outcome, o.vs, o.ps, o.indices); }
    };
    std::mutex g_shadow_audit_mutex;
+   // Draw probe (diagnostic capture): every indexed draw of the capture, by mesh key (as the TLAS csv) and render state,
+   // written as draws.csv at the end: which passes draw a mesh, blended or not, into which targets
+   std::mutex g_draw_probe_mutex;
+   std::map<std::string, uint64_t> g_draw_probe;
+   std::atomic<bool> g_draw_probe_active = false;
    std::map<ShadowAuditKey, uint64_t> g_shadow_audit;
    // ~20 s cycling the 4 test combos in 1 s blocks (the order rotates every 4 blocks, so each combo sees similar camera
    // motion), then 4 s with the ray tracing scene frozen. Captures within kRTDiagSettle of a switch are tagged settle=1.
@@ -1005,6 +1010,11 @@ public:
          g_rtdiag.last_bound = g.rtsun_bound_draws;
          g_rtdiag.last_stale = g.rtsun_stale_draws;
          g_rtdiag.active = true;
+         {
+            const std::lock_guard lock(g_draw_probe_mutex);
+            g_draw_probe.clear();
+         }
+         g_draw_probe_active = true;
          g_rtdiag.status = "capturing into " + g_rtdiag.dir;
          reshade::log::message(reshade::log::level::info, ("RT diag: capture started, " + g_rtdiag.dir).c_str());
       }
@@ -1102,6 +1112,18 @@ public:
          g_rtdbg_shadow_young_long = g_rtdiag.saved_young_long;
          g_rtao_shadow_near_only = g_rtdiag.saved_near_only;
          g_rtdiag.active = false;
+         g_draw_probe_active = false;
+         {
+            std::map<std::string, uint64_t> probe;
+            {
+               const std::lock_guard lock(g_draw_probe_mutex);
+               probe.swap(g_draw_probe);
+            }
+            std::string csv = "mesh_key,ib,first_index,index_count,base_vertex,vs_hash,ps_hash,depth_enable,depth_write,depth_func,blend,src_blend,dst_blend,write_mask,alpha_to_coverage,rtv_count,rtv0_format,dsv_slice,depth_bias,slope_bias,cull,vp_x,vp_y,vp_w,vp_h,dynamic_vb,draws\n";
+            for (const auto& pair : probe)
+               csv += pair.first + "," + std::to_string(pair.second) + "\n";
+            std::ofstream(std::filesystem::path(g_rtdiag.dir) / "draws.csv") << csv;
+         }
          std::ofstream(std::filesystem::path(g_rtdiag.dir) / "timeline.csv") << [&]() {
             std::string all;
             for (const std::string& l : g_rtdiag.timeline)
@@ -3001,8 +3023,110 @@ public:
          g_shadow_audit.emplace(std::move(key), 1);
    }
 
+   static void DrawProbe(ID3D11DeviceContext* context, uint32_t index_count, uint32_t first_index, int32_t vertex_offset)
+   {
+      com_ptr<ID3D11InputLayout> layout;
+      context->IAGetInputLayout(&layout);
+      com_ptr<ID3D11VertexShader> vs;
+      context->VSGetShader(&vs, nullptr, nullptr);
+      com_ptr<ID3D11PixelShader> ps;
+      context->PSGetShader(&ps, nullptr, nullptr);
+      RTAO::InputLayoutInfo layout_info;
+      uint32_t vs_hash = 0, ps_hash = 0;
+      {
+         const std::shared_lock lock(g_rtao_shader_mutex);
+         auto layout_it = g_rtao_input_layouts.find(uint64_t(uintptr_t(layout.get())));
+         if (layout_it != g_rtao_input_layouts.end())
+            layout_info = layout_it->second;
+         auto vh = g_rtao_vertex_shader_hashes.find(uint64_t(uintptr_t(vs.get())));
+         vs_hash = vh != g_rtao_vertex_shader_hashes.end() ? vh->second : 0;
+         auto ph = ps ? g_rtao_pixel_shader_hashes.find(uint64_t(uintptr_t(ps.get()))) : g_rtao_pixel_shader_hashes.end();
+         ps_hash = ph != g_rtao_pixel_shader_hashes.end() ? ph->second : 0;
+      }
+      com_ptr<ID3D11Buffer> vb, ib;
+      UINT stride = 0, offset = 0, index_offset = 0;
+      DXGI_FORMAT index_format = DXGI_FORMAT_UNKNOWN;
+      context->IAGetVertexBuffers(layout_info.position_slot, 1, &vb, &stride, &offset);
+      context->IAGetIndexBuffer(&ib, &index_format, &index_offset);
+      uint64_t key = 0;
+      const uint32_t index_size = index_format == DXGI_FORMAT_R16_UINT ? 2 : (index_format == DXGI_FORMAT_R32_UINT ? 4 : 0);
+      bool dynamic = false;
+      if (vb && ib && layout_info.has_position && index_size)
+      {
+         D3D11_BUFFER_DESC vb_desc = {};
+         vb->GetDesc(&vb_desc);
+         dynamic = vb_desc.Usage == D3D11_USAGE_DYNAMIC;
+         const int64_t vertex_zero = int64_t(offset) + int64_t(vertex_offset) * int64_t(stride);
+         if (vertex_zero >= 0)
+            key = RTAO::ComputeMeshKey(vb.get(), ib.get(), uint64_t(vertex_zero) + layout_info.position_offset, stride,
+               dynamic ? layout_info.position_format : RTAO::DxrVertexFormat(layout_info.position_format), uint64_t(index_offset) + uint64_t(first_index) * index_size, index_count, index_format);
+      }
+      com_ptr<ID3D11BlendState> blend;
+      FLOAT factor[4];
+      UINT sample_mask = 0;
+      context->OMGetBlendState(&blend, factor, &sample_mask);
+      D3D11_BLEND_DESC blend_desc = {};
+      if (blend)
+         blend->GetDesc(&blend_desc);
+      com_ptr<ID3D11DepthStencilState> depth;
+      UINT stencil_ref = 0;
+      context->OMGetDepthStencilState(&depth, &stencil_ref);
+      D3D11_DEPTH_STENCIL_DESC depth_desc = { TRUE, D3D11_DEPTH_WRITE_MASK_ALL, D3D11_COMPARISON_LESS };
+      if (depth)
+         depth->GetDesc(&depth_desc);
+      com_ptr<ID3D11RasterizerState> raster;
+      context->RSGetState(&raster);
+      D3D11_RASTERIZER_DESC raster_desc = {};
+      raster_desc.CullMode = D3D11_CULL_BACK;
+      if (raster)
+         raster->GetDesc(&raster_desc);
+      ID3D11RenderTargetView* rtvs[8] = {};
+      ID3D11DepthStencilView* dsv = nullptr;
+      context->OMGetRenderTargets(8, rtvs, &dsv);
+      uint32_t rtv_count = 0;
+      DXGI_FORMAT rtv0_format = DXGI_FORMAT_UNKNOWN;
+      for (uint32_t i = 0; i < 8; i++)
+         if (rtvs[i])
+         {
+            if (rtv_count == 0)
+            {
+               D3D11_RENDER_TARGET_VIEW_DESC d;
+               rtvs[i]->GetDesc(&d);
+               rtv0_format = d.Format;
+            }
+            rtv_count++;
+            rtvs[i]->Release();
+         }
+      int dsv_slice = -1;
+      if (dsv)
+      {
+         D3D11_DEPTH_STENCIL_VIEW_DESC d;
+         dsv->GetDesc(&d);
+         dsv_slice = d.ViewDimension == D3D11_DSV_DIMENSION_TEXTURE2DARRAY ? int(d.Texture2DArray.FirstArraySlice) : -2;
+         dsv->Release();
+      }
+      D3D11_VIEWPORT viewport = {};
+      UINT viewports = 1;
+      context->RSGetViewports(&viewports, &viewport);
+      const D3D11_RENDER_TARGET_BLEND_DESC& rt0 = blend_desc.RenderTarget[0];
+      char row[400];
+      snprintf(row, sizeof(row), "%016llX,%llX,%u,%u,%d,%08X,%08X,%d,%d,%d,%d,%d,%d,%d,%d,%u,%d,%d,%d,%.3f,%d,%.0f,%.0f,%.0f,%.0f,%d",
+         (unsigned long long)key, (unsigned long long)uintptr_t(ib.get()), first_index, index_count, vertex_offset, vs_hash, ps_hash,
+         int(depth_desc.DepthEnable), int(depth_desc.DepthWriteMask), int(depth_desc.DepthFunc), int(rt0.BlendEnable), int(rt0.SrcBlend), int(rt0.DestBlend), int(rt0.RenderTargetWriteMask), int(blend_desc.AlphaToCoverageEnable),
+         rtv_count, int(rtv0_format), dsv_slice, int(raster_desc.DepthBias), raster_desc.SlopeScaledDepthBias, int(raster_desc.CullMode),
+         viewport.TopLeftX, viewport.TopLeftY, viewport.Width, viewport.Height, int(dynamic));
+      const std::lock_guard lock(g_draw_probe_mutex);
+      auto it = g_draw_probe.find(row);
+      if (it != g_draw_probe.end())
+         it->second++;
+      else if (g_draw_probe.size() < 200000)
+         g_draw_probe.emplace(row, 1);
+   }
+
    static bool OnRTAODrawIndexed(reshade::api::command_list* cmd_list, uint32_t index_count, uint32_t instance_count, uint32_t first_index, int32_t vertex_offset, uint32_t first_instance)
    {
+      if (g_draw_probe_active.load(std::memory_order_relaxed) && cmd_list->get_device()->get_api() == reshade::api::device_api::d3d11)
+         DrawProbe(reinterpret_cast<ID3D11DeviceContext*>(cmd_list->get_native()), index_count, first_index, vertex_offset);
       if (!g_rtao_capture_active.load(std::memory_order_relaxed))
          return false;
       auto* device = cmd_list->get_device();

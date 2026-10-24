@@ -565,6 +565,17 @@ namespace RTAO
       }
    }
 
+   uint64_t ComputeMeshKey(const void* vertex_buffer, const void* index_buffer, uint64_t vertex_start, uint32_t vertex_stride, DXGI_FORMAT vertex_format,
+      uint64_t index_start, uint32_t index_count, DXGI_FORMAT index_format)
+   {
+      uint64_t key = HashCombine(uint64_t(uintptr_t(vertex_buffer)), uint64_t(uintptr_t(index_buffer)));
+      key = HashCombine(key, vertex_start);
+      key = HashCombine(key, (uint64_t(vertex_stride) << 32) | uint64_t(vertex_format));
+      key = HashCombine(key, index_start);
+      key = HashCombine(key, (uint64_t(index_count) << 32) | uint64_t(index_format));
+      return key;
+   }
+
    DXGI_FORMAT DxrVertexFormat(DXGI_FORMAT format)
    {
       switch (format)
@@ -1389,11 +1400,7 @@ namespace RTAO
       const uint64_t vertex_start = uint64_t(vertex_zero) + draw.position_offset;
       const uint64_t index_start = uint64_t(draw.index_buffer_offset) + uint64_t(draw.first_index) * index_size;
 
-      uint64_t key = HashCombine(uint64_t(uintptr_t(draw.vertex_buffer)), uint64_t(uintptr_t(draw.index_buffer)));
-      key = HashCombine(key, vertex_start);
-      key = HashCombine(key, (uint64_t(draw.vertex_stride) << 32) | uint64_t(vertex_format));
-      key = HashCombine(key, index_start);
-      key = HashCombine(key, (uint64_t(draw.index_count) << 32) | uint64_t(draw.index_format));
+      uint64_t key = ComputeMeshKey(draw.vertex_buffer, draw.index_buffer, vertex_start, draw.vertex_stride, vertex_format, index_start, draw.index_count, draw.index_format);
 
       // Per frame identity: the mesh plus everything that selects its instances' data. A second draw of it in the same
       // frame (another pass) would capture the same instances again (or another per frame BLAS of the same pose).

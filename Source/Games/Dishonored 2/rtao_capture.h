@@ -142,6 +142,10 @@ namespace RTAO
    InputLayoutInfo ParseInputLayout(const D3D11_INPUT_ELEMENT_DESC* elements, uint32_t count);
    // The DXR vertex format for a game position format, or DXGI_FORMAT_UNKNOWN if DXR can't read it
    DXGI_FORMAT DxrVertexFormat(DXGI_FORMAT position_format);
+   // The mesh key GeometryCapture gives a draw's geometry (the TLAS csv's blas_key): "vertex_format" is DxrVertexFormat of
+   // the position format for static meshes, the position format itself for per frame meshes
+   uint64_t ComputeMeshKey(const void* vertex_buffer, const void* index_buffer, uint64_t vertex_start, uint32_t vertex_stride, DXGI_FORMAT vertex_format,
+      uint64_t index_start, uint32_t index_count, DXGI_FORMAT index_format);
 
    // Must match CaptureParams in Shaders/Dishonored 2/Luma_RTAO.hlsl
    struct CaptureParams

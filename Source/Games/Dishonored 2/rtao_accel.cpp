@@ -714,9 +714,11 @@ namespace RTAO
             // Camera only: neither this instance nor any instance of its mesh was ever drawn into a shadow map (the game
             // keeps the mesh out of its shadows: glass, light shaft meshes). A real caster the shadow map hasn't drawn yet
             // becomes one as soon as it does (the shadow map is redrawn rarely, so this is per mesh, not per instance).
-            if (!(pair.second.sources & kInstanceSourceShadow) && !shadow_meshes.count(pair.second.blas_key))
+            const bool camera_only = !(pair.second.sources & kInstanceSourceShadow) && !shadow_meshes.count(pair.second.blas_key);
+            if (camera_only)
                desc.InstanceMask = (pair.second.mask & kInstanceMaskCutout) ? kInstanceMaskCameraOnlyCutout : kInstanceMaskCameraOnly;
-            desc.Flags = D3D12_RAYTRACING_INSTANCE_FLAG_TRIANGLE_CULL_DISABLE | D3D12_RAYTRACING_INSTANCE_FLAG_FORCE_OPAQUE;
+            desc.Flags = D3D12_RAYTRACING_INSTANCE_FLAG_TRIANGLE_CULL_DISABLE |
+               ((camera_only && camera_only_non_opaque) ? D3D12_RAYTRACING_INSTANCE_FLAG_FORCE_NON_OPAQUE : D3D12_RAYTRACING_INSTANCE_FLAG_FORCE_OPAQUE);
             if (pair.second.mask & kInstanceMaskCutout)
             {
                // Same BLAS as an opaque draw of the mesh (built OPAQUE), overridden per instance: the trace's candidate
@@ -726,7 +728,8 @@ namespace RTAO
                last_cutout_count++;
             }
             desc.AccelerationStructure = blas;
-            desc.InstanceContributionToHitGroupIndex = pair.second.sources; // Debug scene view only (inline ray queries have no hit groups)
+            // Sources for the debug scene view (inline ray queries have no hit groups), and the camera only flag
+            desc.InstanceContributionToHitGroupIndex = pair.second.sources | (camera_only ? kInstanceFlagCameraOnly : 0);
             descs.push_back(desc);
             const Instance& i = pair.second;
             last_build_order.push_back({ i.blas_key, i.sources, i.min_slice, { i.transform[0][3], i.transform[1][3], i.transform[2][3] }, i.first_frame, i.last_frame, i.seen_frames });

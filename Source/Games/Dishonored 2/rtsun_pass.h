@@ -53,8 +53,18 @@ namespace RTSun
       uint32_t cutout_exact;
       uint32_t casters_only;
       uint32_t pad;
+      uint32_t shadow_consult;
+      uint32_t shadow_packed;
+      uint32_t shadow_reversed;
+      float shadow_tolerance;
+      uint32_t shadow_size[2];
+      uint32_t shadow_cascades;
+      uint32_t shadow_pad;
    };
-   static_assert(sizeof(SunConstants) == 272);
+   static_assert(sizeof(SunConstants) == 304);
+
+   // Shadow map check: the game's sun cascades copied for the trace (Shaders/Dishonored 2/Luma_RTSunShadowCopy.hlsl)
+   constexpr uint32_t kShadowCascades = 3;
 
    enum class Output : uint32_t
    {
@@ -96,6 +106,12 @@ namespace RTSun
       bool debug_outputs = false;
       // Objects the game never drew into a shadow map (camera only: glass, light shaft meshes) don't block the sun
       bool casters_only = false;
+      // Shadow map check: a camera only object blocks only where the game's shadow map agrees (needs the shadow target,
+      // written this or the last frame). "shadow_reversed": the game's shadow compare is GREATER (nearer the light =
+      // larger). Tolerance in world units.
+      bool shadow_consult = false;
+      bool shadow_reversed = false;
+      float shadow_tolerance = 0.1f;
    };
 
    class SunPass
@@ -116,6 +132,11 @@ namespace RTSun
       // instance, AddRef'd, null if not created.
       void SetDebugOutputs(bool enabled) { debug_requested = enabled; }
       ID3D11ShaderResourceView* GetDebugSRV(uint32_t index);
+      // Shadow map check: (re)creates the texture the game's cascades are copied into (slice_width x (slice_height *
+      // kShadowCascades + 1)), shared with D3D12. GetShadowRTV: its D3D11 render target, AddRef'd, null if none; "packed":
+      // the R8G8B8A8_UNORM fallback (Luma_RTSunShadowCopy.hlsl shadow_pack_ps), else R32_FLOAT (shadow_copy_ps).
+      bool EnsureShadowTarget(ID3D11Device* device11, uint32_t slice_width, uint32_t slice_height, std::string& error);
+      ID3D11RenderTargetView* GetShadowRTV(bool* packed = nullptr);
       DXGI_FORMAT GetVisFormat() const { return vis_format; }
 
       // Inside an Interop recorder, after the TLAS of the frame was built: trace + filter into the private texture,
@@ -175,9 +196,18 @@ namespace RTSun
       ID3D11Texture2D* dbg_shared11[5] = {};
       ID3D11ShaderResourceView* dbg_srv11[5] = {};
       std::vector<IUnknown*> graveyard; // D3D12 objects to retire at the next Record
+      // Shadow map check target (under "mutex")
+      ID3D12Resource* shadow12 = nullptr;
+      ID3D11Texture2D* shadow11 = nullptr;
+      ID3D11RenderTargetView* shadow_rtv11 = nullptr;
+      uint32_t shadow_width = 0, shadow_height = 0; // One cascade
+      bool shadow_packed = false;
+      uint32_t shadow_version = 0;
+      uint32_t heap_shadow_version = UINT32_MAX;
 
       // Descriptors (recorder thread). Per history parity p, 5 from p * 5: [depth SRV, raw UAV, vis UAV, hist prev, hist cur],
-      // then [10] the cutout atlas SRV, then the debug tables from 11 + 5 * i: [depth SRV, raw UAV, dbg_vis[i], hist, dbg_hist]
+      // then [10] the cutout atlas SRV, then the debug tables from 11 + 5 * i: [depth SRV, raw UAV, dbg_vis[i], hist, dbg_hist],
+      // then [36] the shadow map check's SRV (a null descriptor without the target)
       ID3D12DescriptorHeap* heap = nullptr;
       uint32_t descriptor_size = 0;
       uint32_t heap_generation = UINT32_MAX; // Interop targets generation the heap was made for

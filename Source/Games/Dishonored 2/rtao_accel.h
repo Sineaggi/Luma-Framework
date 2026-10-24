@@ -218,6 +218,7 @@ namespace RTAO
    constexpr uint8_t kInstanceFlagFrameMesh = 0x04; // Per frame mesh (AddFrameInstance)
    constexpr uint8_t kInstanceFlagMvp = 0x08; // Matrix recovered from the MVP
    constexpr uint8_t kInstanceFlagSkinned = 0x10; // Skinned (per frame mesh)
+   constexpr uint8_t kInstanceFlagCameraOnly = 0x20; // Camera only (kInstanceMaskCameraOnly*): the RT sun's shadow map check applies
 
    // TLAS retention diagnostics, from the last BeginFrame (and the AddInstance calls before it)
    struct RetentionStats
@@ -299,6 +300,9 @@ namespace RTAO
       uint32_t young_retain_frames = kYoungRetainFrames;
       uint32_t shadow_young_retain_frames = kShadowYoungRetainFrames; // Old rule only
       uint32_t shadow_mode = 0; // 0: static world until unloaded, moving copies dropped; 1: the old rule (test toggle)
+      // Camera only instances non opaque, so the RT sun's candidate loop sees them (its shadow map check). The AO commits
+      // any non opaque non cutout candidate, so it is unaffected.
+      bool camera_only_non_opaque = false;
       std::atomic<bool> drop_shadow_request = false; // Next BeginFrame drops every instance a shadow map draw touched (the main view re-adds what it sees)
 
    private:

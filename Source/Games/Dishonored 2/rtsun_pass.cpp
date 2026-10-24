@@ -182,7 +182,8 @@ namespace RTSun
       // Same layout as the AO pass: [0] CBV b0, [1] SRV t0 (TLAS), [2] table { SRV t1 }, [3] table { UAV u0..u3 }
       // Texture exact cutouts (rtao_cutout.hlsli): [4] SRV t2 (records), [5] SRV t3 (geometry arena), [6] table { SRV t4 }
       // (atlas), [7] UAV u4 (counters), static sampler s0 (linear, wrap)
-      D3D12_DESCRIPTOR_RANGE ranges[3] = {};
+      // [8] table { SRV t5 } (the shadow map check's copy of the game's cascades)
+      D3D12_DESCRIPTOR_RANGE ranges[4] = {};
       ranges[0].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
       ranges[0].NumDescriptors = 1;
       ranges[0].BaseShaderRegister = 1;
@@ -192,7 +193,10 @@ namespace RTSun
       ranges[2].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
       ranges[2].NumDescriptors = 1;
       ranges[2].BaseShaderRegister = 4;
-      D3D12_ROOT_PARAMETER parameters[8] = {};
+      ranges[3].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
+      ranges[3].NumDescriptors = 1;
+      ranges[3].BaseShaderRegister = 5;
+      D3D12_ROOT_PARAMETER parameters[9] = {};
       parameters[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_CBV;
       parameters[0].Descriptor.ShaderRegister = 0;
       parameters[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_SRV;
@@ -212,6 +216,9 @@ namespace RTSun
       parameters[6].DescriptorTable.pDescriptorRanges = &ranges[2];
       parameters[7].ParameterType = D3D12_ROOT_PARAMETER_TYPE_UAV;
       parameters[7].Descriptor.ShaderRegister = 4;
+      parameters[8].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+      parameters[8].DescriptorTable.NumDescriptorRanges = 1;
+      parameters[8].DescriptorTable.pDescriptorRanges = &ranges[3];
       for (auto& parameter : parameters)
          parameter.ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
       D3D12_STATIC_SAMPLER_DESC sampler = {};
@@ -222,7 +229,7 @@ namespace RTSun
       sampler.ShaderRegister = 0;
       sampler.ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
       D3D12_ROOT_SIGNATURE_DESC root_desc = {};
-      root_desc.NumParameters = 8;
+      root_desc.NumParameters = 9;
       root_desc.pParameters = parameters;
       root_desc.NumStaticSamplers = 1;
       root_desc.pStaticSamplers = &sampler;
@@ -442,6 +449,69 @@ namespace RTSun
       return srv;
    }
 
+   bool SunPass::EnsureShadowTarget(ID3D11Device* device11, uint32_t slice_width, uint32_t slice_height, std::string& error)
+   {
+      const std::lock_guard lock(mutex);
+      if (!device)
+      {
+         error = "RT sun pass not initialized";
+         return false;
+      }
+      if (shadow_rtv11 && slice_width == shadow_width && slice_height == shadow_height)
+         return true;
+      if (slice_width == 0 || slice_height == 0 || slice_width > 16384 || uint64_t(slice_height) * kShadowCascades + 1 > 16384 || slice_width < 16 * kShadowCascades)
+      {
+         error = "unsupported shadow map size";
+         return false;
+      }
+      if (shadow12)
+         graveyard.push_back(shadow12);
+      shadow12 = nullptr;
+      if (shadow_rtv11)
+         shadow_rtv11->Release();
+      shadow_rtv11 = nullptr;
+      if (shadow11)
+         shadow11->Release();
+      shadow11 = nullptr;
+      shadow_width = shadow_height = 0;
+      shadow_version++;
+      const uint32_t height = slice_height * kShadowCascades + 1; // + the matrices row
+      std::string float_error;
+      if (CreateSharedTexture(device, device11, DXGI_FORMAT_R32_FLOAT, slice_width, height, shadow12, shadow11, float_error))
+         shadow_packed = false;
+      else if (CreateSharedTexture(device, device11, DXGI_FORMAT_R8G8B8A8_UNORM, slice_width, height, shadow12, shadow11, error))
+         shadow_packed = true;
+      else
+      {
+         error = "RT sun shadow map copy: R32_FLOAT: " + float_error + ", R8G8B8A8_UNORM: " + error;
+         return false;
+      }
+      const HRESULT hr = device11->CreateRenderTargetView(shadow11, nullptr, &shadow_rtv11);
+      if (FAILED(hr))
+      {
+         error = HResultString("CreateRenderTargetView (RT sun shadow map copy)", hr);
+         graveyard.push_back(shadow12);
+         shadow12 = nullptr;
+         shadow11->Release();
+         shadow11 = nullptr;
+         return false;
+      }
+      shadow12->SetName(L"RTSun shadow map copy");
+      shadow_width = slice_width;
+      shadow_height = slice_height;
+      return true;
+   }
+
+   ID3D11RenderTargetView* SunPass::GetShadowRTV(bool* packed)
+   {
+      const std::lock_guard lock(mutex);
+      if (packed)
+         *packed = shadow_packed;
+      if (shadow_rtv11)
+         shadow_rtv11->AddRef();
+      return shadow_rtv11;
+   }
+
    ID3D11ShaderResourceView* SunPass::GetSRV()
    {
       const std::lock_guard lock(mutex);
@@ -452,14 +522,14 @@ namespace RTSun
 
    bool SunPass::EnsureHeap(const RTAO::RecordInfo& info, RTAO::Retirer& retirer, std::string& error)
    {
-      if (heap && heap_generation == info.targets_generation && heap_targets_version == targets_version && heap_debug == (dbg_hist != nullptr))
+      if (heap && heap_generation == info.targets_generation && heap_targets_version == targets_version && heap_debug == (dbg_hist != nullptr) && heap_shadow_version == shadow_version)
          return true;
       Release(heap, &retirer, info.submit_fence_value);
       if (heap_targets_version != targets_version)
          has_history = false;
       D3D12_DESCRIPTOR_HEAP_DESC heap_desc = {};
       heap_desc.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
-      heap_desc.NumDescriptors = 36;
+      heap_desc.NumDescriptors = 37;
       heap_desc.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
       HRESULT hr = device->CreateDescriptorHeap(&heap_desc, IID_PPV_ARGS(&heap));
       if (FAILED(hr))
@@ -513,6 +583,17 @@ namespace RTSun
          }
       }
       heap_debug = dbg_hist != nullptr;
+      {
+         D3D12_CPU_DESCRIPTOR_HANDLE handle = heap->GetCPUDescriptorHandleForHeapStart();
+         handle.ptr += SIZE_T(36) * descriptor_size;
+         D3D12_SHADER_RESOURCE_VIEW_DESC srv = {};
+         srv.Format = shadow_packed ? DXGI_FORMAT_R8G8B8A8_UNORM : DXGI_FORMAT_R32_FLOAT;
+         srv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+         srv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+         srv.Texture2D.MipLevels = 1;
+         device->CreateShaderResourceView(shadow12, &srv, handle); // Null resource: a null descriptor (reads 0)
+      }
+      heap_shadow_version = shadow_version;
       WriteAtlasDescriptor(device, heap, descriptor_size, bound_atlas);
       heap_generation = info.targets_generation;
       heap_targets_version = targets_version;
@@ -605,6 +686,14 @@ namespace RTSun
       constants.cutout_mode = settings.cutout_mode;
       constants.cutout_exact = exact ? 1 : 0;
       constants.casters_only = settings.casters_only ? 1 : 0;
+      const bool consult = settings.shadow_consult && shadow12;
+      constants.shadow_consult = consult ? 1 : 0;
+      constants.shadow_packed = shadow_packed ? 1 : 0;
+      constants.shadow_reversed = settings.shadow_reversed ? 1 : 0;
+      constants.shadow_tolerance = settings.shadow_tolerance;
+      constants.shadow_size[0] = shadow_width;
+      constants.shadow_size[1] = shadow_height;
+      constants.shadow_cascades = kShadowCascades;
       std::memcpy(constants_mapped + slot * kConstantsStride, &constants, sizeof(constants));
 
       D3D12_GPU_DESCRIPTOR_HANDLE table = heap->GetGPUDescriptorHandleForHeapStart();
@@ -624,6 +713,11 @@ namespace RTSun
       list->SetComputeRootShaderResourceView(5, exact ? cutouts->arena->GetGPUVirtualAddress() : dummy_buffer->GetGPUVirtualAddress());
       list->SetComputeRootDescriptorTable(6, atlas_table);
       list->SetComputeRootUnorderedAccessView(7, counters->GetGPUVirtualAddress());
+      D3D12_GPU_DESCRIPTOR_HANDLE shadow_table = heap->GetGPUDescriptorHandleForHeapStart();
+      shadow_table.ptr += UINT64(36) * descriptor_size;
+      list->SetComputeRootDescriptorTable(8, shadow_table);
+      if (consult)
+         TransitionBarrier(list, shadow12, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
       if (exact)
          TransitionBarrier(list, cutouts->arena, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
       TransitionBarrier(list, counters, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
@@ -698,6 +792,8 @@ namespace RTSun
          }
       }
 
+      if (consult)
+         TransitionBarrier(list, shadow12, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COMMON); // D3D11 writes it next
       timer.End(list, info.frame_slot);
 
       parity = 1 - parity;
@@ -713,6 +809,17 @@ namespace RTSun
    {
       const std::lock_guard lock(mutex);
       ReleaseTargetsLocked();
+      if (shadow12)
+         graveyard.push_back(shadow12);
+      shadow12 = nullptr;
+      if (shadow_rtv11)
+         shadow_rtv11->Release();
+      shadow_rtv11 = nullptr;
+      if (shadow11)
+         shadow11->Release();
+      shadow11 = nullptr;
+      shadow_width = shadow_height = 0;
+      heap_shadow_version = UINT32_MAX;
       for (IUnknown* object : graveyard)
       {
          if (retirer)

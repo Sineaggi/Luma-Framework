@@ -474,6 +474,41 @@ aged out by the retention meant for the main view (2 frames young, then 180). Ch
   by source, new and evicted instances, moving copies, MVP rekeys, and how often the shared camera copy was from
   another frame or differed.
 
+### Shadow map check (config `RTSunShadowMapCheck`, default on)
+
+The "casters only" rule (an object blocks the sun only if a shadow map draw of its mesh was captured) removed real
+casters: window trim drawn by passes whose mesh keys differ from its shadow map copies stayed camera only. It is off by
+default now. Instead, the game's own shadow map decides, per ray hit, for camera only instances (flag
+`kInstanceFlagCameraOnly` in InstanceContributionToHitGroupIndex, non opaque while the check is on):
+- At the screen shadows draw, `RTSunCopyShadowMap` copies PS t0 (`ro_lightdepthcomparemap`, cascades 0..2) and, in a last
+  row, each cascade's light matrix (`cb_shadowprojections`, from the same draw's b2) into a texture shared with D3D12
+  (`Luma_RTSunShadowCopy.hlsl`: R32_FLOAT, or packed into R8G8B8A8_UNORM where float textures don't share). The
+  compare direction comes from the draw's PCF sampler (GREATER = reversed). The trace of the next frame reads it (the
+  D3D11 side waits on the D3D12 pass, so a copy is never written while the trace reads it).
+- `GameShadowConfirms` (rtsun_trace.hlsl): the hit point is projected into the finest cascade that covers it; it blocks
+  if the map's nearest-to-light depth over its 3x3 texels is at or in front of the hit, within `RTSunShadowMapTolerance`
+  (0.1 world units) plus two texels. A sun ray keeps its light space xy, so that texel is the receiver's: a pane of glass
+  in front of a lit floor is rejected (the map holds the floor, farther), a caster the map has (or one in its shadow) is
+  accepted. Outside the cascades: accepted. A hit within the tolerance of the receiver itself always passes (a thin
+  contact band at the base of a rejected object).
+- Shadow map drawn objects, characters (skinned) and per frame meshes block as before. The debug "blocker" output uses
+  the check, "blocker all" doesn't.
+Offline test: rtsun_test.inl 0b (a CPU rendered map of the box scene through the real copy shader).
+
+### Per frame meshes missed for a frame (swinging window flap)
+
+The flap of the openable window is skinned (one bone). A diagnostic capture showed its two parts in the TLAS only in
+some frames (about half, changing every few frames with a still camera). The dedup (above) skipped a per frame mesh draw
+whenever any context had captured the same identity first in the frame; the game draws the flap again in its motion
+vector pass (VS 0xABCEF358) on another deferred context, which can be recorded first but executes after the AO pass
+(its record is then dropped as "drawn after the AO pass"), so that frame had no flap. Per frame meshes are now only
+duplicates on the same context; across contexts each draw is captured and the pass keeps the first executed record per
+identity (`Rec::identity`). Skinned meshes also keep their last pose for `RTAOSkinnedHoldFrames` (30) frames when a
+frame misses them (a skinned entry's key is mesh + draw order, so another object with the same mesh doesn't replace
+the hold; it times out). Each diagnostic capture lists every per frame mesh draw of its frame (`frame_mesh=` lines: c
+captured, s skipped, D same context duplicate, x executed before the AO pass, a after it (dropped), p in the TLAS,
+d dropped as a duplicate by the pass, with a context id).
+
 ### Diagnostic capture
 
 To settle where a visible change starts (popping, wobble) without guessing: "RT diagnostic capture" in the Luma

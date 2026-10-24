@@ -251,6 +251,137 @@ static void TestSunShadows(ID3D11Device* device, ID3D11DeviceContext* context, R
       int dark = 0;
       for (UINT i = 0; i < W * H; i++)
          dark += (is_receiver(i) && camera_only[i] < 0.5f) ? 1 : 0; // Receivers face the light: only a caster can darken them
+      // 0b) Shadow map check: the boxes are still camera only. A sun ray hitting one blocks only where the game's shadow map
+      //     (here rendered on the CPU, copied through Luma_RTSunShadowCopy.hlsl) has a surface there. With a map of the
+      //     whole scene they shadow as casters; with a map of the ground alone, not at all; reversed depth the same.
+      {
+         settings.casters_only = false;
+         tlas.camera_only_non_opaque = true;
+         const UINT N = 256;
+         const V3 center = { 0, 1, 0 };
+         const V3 lt = Normalize(std::fabs(L.z) < 0.999f ? Cross(L, { 0, 0, 1 }) : V3{ 1, 0, 0 });
+         const V3 lb = Cross(L, lt);
+         const float extents[RTSun::kShadowCascades] = { 6.f, 24.f, 48.f }; // Cascade 0 covers box 1 only: the rest falls through
+         const float D0 = 30.f, R = 60.f;
+         ID3DBlob* copy_code = Compile(L"..\\..\\..\\..\\Shaders\\Dishonored 2\\Luma_RTSunShadowCopy.hlsl", "shadow_copy_ps", "ps_5_0");
+         ID3DBlob* pack_code = Compile(L"..\\..\\..\\..\\Shaders\\Dishonored 2\\Luma_RTSunShadowCopy.hlsl", "shadow_pack_ps", "ps_5_0");
+         ID3D11PixelShader* shadow_copy_ps = nullptr;
+         ID3D11PixelShader* shadow_pack_ps = nullptr;
+         device->CreatePixelShader(copy_code->GetBufferPointer(), copy_code->GetBufferSize(), nullptr, &shadow_copy_ps);
+         device->CreatePixelShader(pack_code->GetBufferPointer(), pack_code->GetBufferSize(), nullptr, &shadow_pack_ps);
+         copy_code->Release();
+         pack_code->Release();
+         CHECK(sun.EnsureShadowTarget(device, N, N, error), "EnsureShadowTarget: %s", error.c_str());
+
+         // Renders the map (boxes from first_box on, box 0 is the ground) and copies it as the game's screen shadows draw would
+         auto upload_map = [&](int first_box, bool reversed) {
+            std::vector<float> slices(size_t(N) * N * 4, reversed ? 0.f : 1.f);
+            float cb[100] = {}; // PerInstanceCB: c0 slice fars, c1.. cb_shadowprojections
+            for (uint32_t c = 0; c < RTSun::kShadowCascades; c++)
+            {
+               const float E = extents[c];
+               float* rows = cb + 4 + c * 16;
+               const float lc[3] = { L.x, L.y, L.z }, tc[3] = { lt.x, lt.y, lt.z }, bc[3] = { lb.x, lb.y, lb.z };
+               for (int k = 0; k < 3; k++)
+               {
+                  rows[k * 4 + 0] = tc[k] / E;
+                  rows[k * 4 + 1] = bc[k] / E;
+                  rows[k * 4 + 2] = (reversed ? 1.f : -1.f) * lc[k] / R;
+               }
+               const float z0 = (D0 + Dot(center, L)) / R;
+               rows[12] = 0.5f - Dot(center, lt) / E;
+               rows[13] = 0.5f - Dot(center, lb) / E;
+               rows[14] = reversed ? 1.f - z0 : z0;
+               for (UINT y = 0; y < N; y++)
+                  for (UINT x = 0; x < N; x++)
+                  {
+                     const float u = (x + 0.5f) / N - 0.5f, v = (y + 0.5f) / N - 0.5f;
+                     const V3 q = Add(center, Add(Scale(lt, u * E), Scale(lb, v * E)));
+                     const V3 o = Add(q, Scale(L, D0));
+                     const V3 d = { -L.x, -L.y, -L.z };
+                     float best = 1e30f;
+                     for (int b = 0; b < kBoxCount; b++)
+                     {
+                        if (b != 0 && b < first_box)
+                           continue;
+                        float th;
+                        if (RayBox(o, d, kBoxes[b], th) && th < best)
+                           best = th;
+                     }
+                     if (best < 1e29f)
+                        slices[(size_t(c) * N + y) * N + x] = reversed ? 1.f - best / R : best / R;
+                  }
+            }
+            D3D11_TEXTURE2D_DESC desc = { N, N, 1, 4, DXGI_FORMAT_R32_FLOAT, { 1, 0 }, D3D11_USAGE_DEFAULT, D3D11_BIND_SHADER_RESOURCE, 0, 0 };
+            D3D11_SUBRESOURCE_DATA data[4];
+            for (int s = 0; s < 4; s++)
+               data[s] = { slices.data() + size_t(s) * N * N, N * 4, 0 };
+            ID3D11Texture2D* array = nullptr;
+            device->CreateTexture2D(&desc, data, &array);
+            ID3D11ShaderResourceView* array_srv = nullptr;
+            device->CreateShaderResourceView(array, nullptr, &array_srv);
+            D3D11_BUFFER_DESC cb_desc = { sizeof(cb), D3D11_USAGE_DEFAULT, D3D11_BIND_CONSTANT_BUFFER, 0, 0, 0 };
+            D3D11_SUBRESOURCE_DATA cb_data = { cb, 0, 0 };
+            ID3D11Buffer* cb_buffer = nullptr;
+            device->CreateBuffer(&cb_desc, &cb_data, &cb_buffer);
+            bool packed = false;
+            ID3D11RenderTargetView* rtv = sun.GetShadowRTV(&packed);
+            CHECK(rtv, "shadow map check target");
+            D3D11_VIEWPORT viewport = { 0, 0, float(N), float(N * RTSun::kShadowCascades + 1), 0, 1 };
+            context->RSSetViewports(1, &viewport);
+            context->OMSetRenderTargets(1, &rtv, nullptr);
+            context->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP);
+            context->VSSetShader(copy_vs, nullptr, 0);
+            context->PSSetShader(packed ? shadow_pack_ps : shadow_copy_ps, nullptr, 0);
+            context->PSSetShaderResources(0, 1, &array_srv);
+            context->PSSetConstantBuffers(2, 1, &cb_buffer);
+            context->Draw(4, 0);
+            ID3D11RenderTargetView* null_rtv = nullptr;
+            ID3D11ShaderResourceView* null_srv = nullptr;
+            ID3D11Buffer* null_cb = nullptr;
+            context->OMSetRenderTargets(1, &null_rtv, nullptr);
+            context->PSSetShaderResources(0, 1, &null_srv);
+            context->PSSetConstantBuffers(2, 1, &null_cb);
+            rtv->Release();
+            array_srv->Release();
+            array->Release();
+            cb_buffer->Release();
+            settings.shadow_reversed = reversed;
+            return packed;
+         };
+         auto count_dark = [&](const std::vector<float>& vis) {
+            int n_dark = 0;
+            for (UINT i = 0; i < W * H; i++)
+               n_dark += (is_receiver(i) && vis[i] < 0.5f) ? 1 : 0;
+            return n_dark;
+         };
+
+         settings.shadow_consult = false;
+         const int all_block = count_dark(run_frame()); // Camera only boxes, no check: they block like casters
+         settings.shadow_consult = true;
+         const bool packed = upload_map(1, false);
+         const int full_map = count_dark(run_frame());
+         upload_map(kBoxCount, false); // The ground only
+         const int ground_map = count_dark(run_frame());
+         settings.shadow_tolerance = 0.f;
+         const int ground_map_tight = count_dark(run_frame());
+         settings.shadow_tolerance = 0.1f;
+         upload_map(1, true);
+         const int reversed_map = count_dark(run_frame());
+         printf("RT sun shadow map check (%s copy): dark receiver pixels: no check %d, full map %d, ground only map %d (tolerance 0: %d), full map reversed depth %d\n",
+            packed ? "packed" : "float", all_block, full_map, ground_map, ground_map_tight, reversed_map);
+         CHECK(all_block > 1000, "camera only boxes must block without the check (%d)", all_block);
+         CHECK(std::abs(full_map - all_block) < all_block / 50, "with the full shadow map, camera only boxes must shadow as casters (%d vs %d)", full_map, all_block);
+         // Without the boxes in the map only a contact band stays: a hit within the tolerance (plus two texels) of the
+         // receiver passes, as the receiver's own surface is there
+         CHECK(ground_map < all_block / 6 && ground_map_tight < ground_map, "with a shadow map without the boxes, camera only boxes must not block (%d, tolerance 0: %d)", ground_map, ground_map_tight);
+         CHECK(std::abs(reversed_map - full_map) < all_block / 100, "reversed depth must match (%d vs %d)", reversed_map, full_map);
+         settings.shadow_consult = false;
+         settings.shadow_reversed = false;
+         tlas.camera_only_non_opaque = false;
+         shadow_pack_ps->Release();
+         shadow_copy_ps->Release();
+      }
       shadow_box = 0;
       run_frame();
       run_frame();

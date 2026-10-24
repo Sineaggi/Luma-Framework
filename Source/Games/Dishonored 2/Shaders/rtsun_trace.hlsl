@@ -8,6 +8,9 @@
 
 RaytracingAccelerationStructure Scene : register(t0);
 RWTexture2D<float> VisRaw : register(u0);
+// The game's sun shadow map (copied at the screen shadows draw, Luma_RTSunShadowCopy.hlsl): ShadowCascades cascades of
+// ShadowSize stacked vertically, then one row with their light matrices (16 values each), packed RGBA8 if ShadowPacked
+Texture2D<float4> ShadowTex : register(t5);
 
 static const uint kDebugRaw = 1;       // raw visibility (filter off), see RTSun::SunSettings::debug_mode
 static const uint kDebugNdotL = 2;     // geometric N.L from the depth normal (no rays)
@@ -62,7 +65,84 @@ static const uint kDebugBlockerAll = 8; // The same with every instance (the cas
 static const uint kDebugBlocker = 7;    // One hard shadow ray: TLAS index + 1 of the closest blocker, 0 if lit (16 bit id)
 static const uint kDebugSceneSun = 6;  // From the sun, orthographic, a 60 m tall area around the camera, 40 m up the light to 40 m past it
 // Must match rtao_accel.h
-static const uint kSourceMain = 0x01, kSourceShadow = 0x02, kFlagFrameMesh = 0x04, kFlagMvp = 0x08, kFlagSkinned = 0x10;
+static const uint kSourceMain = 0x01, kSourceShadow = 0x02, kFlagFrameMesh = 0x04, kFlagMvp = 0x08, kFlagSkinned = 0x10, kFlagCameraOnly = 0x20;
+
+float LoadShadowValue(uint2 p)
+{
+    float4 v = ShadowTex.Load(int3(p, 0));
+    if (ShadowPacked == 0)
+        return v.x;
+    uint4 b = uint4(round(saturate(v) * 255.0));
+    return asfloat(b.x | (b.y << 8) | (b.z << 16) | (b.w << 24));
+}
+
+// Row r of cascade c's light matrix (the game's cb_shadowprojections: light space = x * row0 + y * row1 + z * row2 + row3)
+float4 ShadowMatrixRow(uint c, uint r)
+{
+    uint2 p = uint2(c * 16 + r * 4, ShadowSize.y * ShadowCascades);
+    return float4(LoadShadowValue(p), LoadShadowValue(p + uint2(1, 0)), LoadShadowValue(p + uint2(2, 0)), LoadShadowValue(p + uint2(3, 0)));
+}
+
+// Does the game's own shadow map agree something blocks the sun at p (a hit on an object the game never drew into it)?
+// True if, in the finest cascade covering p, the map holds a surface at p's light depth or nearer the light (p is on a
+// caster, or in the shadow of one), within ShadowTolerance plus two texels' worth, over p's 3x3 texels. A sun ray keeps
+// its light space xy, so this is the texel of the receiver the ray left from. Outside the cascades: true (no say).
+bool GameShadowConfirms(float3 p)
+{
+    [loop]
+    for (uint c = 0; c < ShadowCascades; c++)
+    {
+        float4 r0 = ShadowMatrixRow(c, 0), r1 = ShadowMatrixRow(c, 1), r2 = ShadowMatrixRow(c, 2), r3 = ShadowMatrixRow(c, 3);
+        float3 ls = p.x * r0.xyz + p.y * r1.xyz + p.z * r2.xyz + r3.xyz;
+        if (any(ls.xy <= 0.0) || any(ls.xy >= 1.0) || ls.z <= 0.0 || ls.z >= 1.0)
+            continue;
+        float depth_per_unit = length(float3(r0.z, r1.z, r2.z));
+        float texel_units = 1.0 / (float(ShadowSize.x) * max(length(float3(r0.x, r1.x, r2.x)), 1e-9));
+        float tolerance = (ShadowTolerance + 2.0 * texel_units) * depth_per_unit;
+        float s = ShadowReversed != 0 ? -1.0 : 1.0; // Compared so that smaller is nearer the light
+        int2 t = int2(ls.xy * float2(ShadowSize));
+        float nearest = 1e30;
+        [unroll]
+        for (int dy = -1; dy <= 1; dy++)
+        {
+            [unroll]
+            for (int dx = -1; dx <= 1; dx++)
+            {
+                int2 q = clamp(t + int2(dx, dy), int2(0, 0), int2(ShadowSize) - 1);
+                nearest = min(nearest, s * LoadShadowValue(uint2(q.x, uint(q.y) + c * ShadowSize.y)));
+            }
+        }
+        return nearest <= s * ls.z + tolerance;
+    }
+    return true;
+}
+
+// A non opaque candidate: does it block the sun? A cutout per its mask (or the stochastic fallback: fallback_coin, then
+// CutoutOpacity), a character beyond its own surface, and, with "consult", an object only the camera saw (glass, light
+// shafts, and real casters drawn only in passes we don't take as casters) only where the game's shadow map agrees.
+bool CandidateBlocks(uint instance_id, uint flags, uint instance_index, uint primitive, float2 bary, float t, float3 origin, float3 dir, int fallback_coin, uint seed, bool consult)
+{
+    if ((instance_id & kInstanceIdCutoutBit) != 0)
+    {
+        int solid = CutoutAlphaTest(instance_id, primitive, bary);
+        if (solid < 0 && fallback_coin >= 0)
+            solid = fallback_coin;
+        if (solid < 0)
+        {
+            uint h = Hash(seed ^ Hash(instance_index * 0x8DA6B343u + primitive));
+            solid = float(h & 0xFFFFFF) / 16777216.0 < CutoutOpacity ? 1 : 0;
+        }
+        if (solid <= 0)
+            return false;
+    }
+    else if ((flags & kFlagSkinned) != 0)
+    {
+        return t > kSkinSelfDistance; // A character, beyond its own surface
+    }
+    if (consult && (flags & kFlagCameraOnly) != 0)
+        return GameShadowConfirms(origin + dir * t);
+    return true;
+}
 
 float PackRGB565(float3 c)
 {
@@ -174,19 +254,15 @@ void main(uint3 id : SV_DispatchThreadID)
         ray.TMax = TMax;
         RayQuery<RAY_FLAG_SKIP_PROCEDURAL_PRIMITIVES> q;
         q.TraceRayInline(Scene, RAY_FLAG_NONE, (CastersOnly != 0 && DebugMode == kDebugBlocker) ? (0xFF & ~(kInstanceMaskCameraOnly | kInstanceMaskCameraOnlyCutout)) : 0xFF, ray);
+        // "All": every object blocks (no shadow map check), cutouts without a mask solid
+        const bool consult = ShadowConsult != 0 && DebugMode == kDebugBlocker;
         uint guard = 0;
         while (q.Proceed() && guard++ < 256)
         {
-            if (q.CandidateType() == CANDIDATE_NON_OPAQUE_TRIANGLE && (q.CandidateInstanceID() & kInstanceIdCutoutBit) != 0)
-            {
-                int solid = CutoutAlphaTest(q.CandidateInstanceID(), q.CandidatePrimitiveIndex(), q.CandidateTriangleBarycentrics());
-                if (solid != 0)
-                    q.CommitNonOpaqueTriangleHit();
-            }
-            else if (q.CandidateType() == CANDIDATE_NON_OPAQUE_TRIANGLE && q.CandidateTriangleRayT() > kSkinSelfDistance)
-            {
-                q.CommitNonOpaqueTriangleHit(); // A character, beyond its own surface
-            }
+            if (q.CandidateType() == CANDIDATE_NON_OPAQUE_TRIANGLE &&
+                CandidateBlocks(q.CandidateInstanceID(), q.CandidateInstanceContributionToHitGroupIndex(), q.CandidateInstanceIndex(), q.CandidatePrimitiveIndex(),
+                    q.CandidateTriangleBarycentrics(), q.CandidateTriangleRayT(), ray.Origin, ray.Direction, 1, 0, consult))
+                q.CommitNonOpaqueTriangleHit();
         }
         VisRaw[px] = q.CommittedStatus() == COMMITTED_TRIANGLE_HIT ? float(min(q.CommittedInstanceIndex() + 1, 65535u)) / 65535.0 : 0.0;
         CutoutFlushCounters();
@@ -200,7 +276,9 @@ void main(uint3 id : SV_DispatchThreadID)
     // Cutouts: exactly as rtao_trace.hlsl. A candidate cutout triangle is tested against its material's alpha mask
     // (texture exact); without a mask, it stops the ray with probability CutoutOpacity (per crossing, or per ray with
     // fast cutouts). With masks off, opacity 1 forces everything opaque and 0 leaves cutouts out.
-    const uint ray_flags = (CutoutOpacity >= 1.0 && CutoutExact == 0) ? RAY_FLAG_FORCE_OPAQUE : RAY_FLAG_NONE;
+    // The shadow map check needs camera only objects as candidates: never force everything opaque with it
+    const bool consult = ShadowConsult != 0;
+    const uint ray_flags = (!consult && CutoutOpacity >= 1.0 && CutoutExact == 0) ? RAY_FLAG_FORCE_OPAQUE : RAY_FLAG_NONE;
     const uint caster_mask = CastersOnly != 0 ? (0xFF & ~(kInstanceMaskCameraOnly | kInstanceMaskCameraOnlyCutout)) : 0xFF;
     const uint ray_mask = caster_mask & ((CutoutOpacity <= 0.0 && CutoutExact == 0) ? (0xFF & ~(kInstanceMaskCutout | kInstanceMaskCameraOnlyCutout)) : 0xFF);
     uint rays = max(RayCount, 1u);
@@ -219,7 +297,7 @@ void main(uint3 id : SV_DispatchThreadID)
         {
             const float u = frac((float(i) + coin_offset) / float(rays));
             const float p = CutoutMode == 2 ? 1.0 - (1.0 - CutoutOpacity) * (1.0 - CutoutOpacity) : CutoutOpacity;
-            if (CutoutExact != 0)
+            if (CutoutExact != 0 || consult)
                 fallback_coin = u < p ? 1 : 0;
             else if (u < p)
                 flags_i |= RAY_FLAG_FORCE_OPAQUE;
@@ -231,23 +309,10 @@ void main(uint3 id : SV_DispatchThreadID)
         const uint seed = Hash(px.x * 0x9E3779B9u + Hash(px.y + Hash(Frame * 64 + i + 0x68E31DA4u)));
         while (q.Proceed())
         {
-            if (q.CandidateType() == CANDIDATE_NON_OPAQUE_TRIANGLE && (q.CandidateInstanceID() & kInstanceIdCutoutBit) != 0)
-            {
-                int solid = CutoutAlphaTest(q.CandidateInstanceID(), q.CandidatePrimitiveIndex(), q.CandidateTriangleBarycentrics());
-                if (solid < 0 && fallback_coin >= 0)
-                    solid = fallback_coin;
-                if (solid < 0)
-                {
-                    uint h = Hash(seed ^ Hash(q.CandidateInstanceIndex() * 0x8DA6B343u + q.CandidatePrimitiveIndex()));
-                    solid = float(h & 0xFFFFFF) / 16777216.0 < CutoutOpacity ? 1 : 0;
-                }
-                if (solid > 0)
-                    q.CommitNonOpaqueTriangleHit();
-            }
-            else if (q.CandidateType() == CANDIDATE_NON_OPAQUE_TRIANGLE && q.CandidateTriangleRayT() > kSkinSelfDistance)
-            {
-                q.CommitNonOpaqueTriangleHit(); // A character (non opaque), beyond its own surface: blocks
-            }
+            if (q.CandidateType() == CANDIDATE_NON_OPAQUE_TRIANGLE &&
+                CandidateBlocks(q.CandidateInstanceID(), q.CandidateInstanceContributionToHitGroupIndex(), q.CandidateInstanceIndex(), q.CandidatePrimitiveIndex(),
+                    q.CandidateTriangleBarycentrics(), q.CandidateTriangleRayT(), ray.Origin, ray.Direction, fallback_coin, seed, consult))
+                q.CommitNonOpaqueTriangleHit();
         }
         if (q.CommittedStatus() != COMMITTED_TRIANGLE_HIT)
             lit += 1.0;

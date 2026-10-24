@@ -18,6 +18,9 @@ cbuffer SunConstants : register(b0)
     uint DepthPacked;   uint ReversedZ;  uint FilterMode;  float AlphaMin;
     float ClampK;       float Bias;      uint DebugMode;   float CutoutOpacity;
     uint CutoutMode;    uint CutoutExact; uint CastersOnly; uint SunPad;  // As RTAO's (rtao_common.hlsli): fast cutouts, texture exact masks; CastersOnly: camera only objects don't block
+    // The game's shadow map decides whether a camera only object blocks (rtsun_trace.hlsl GameShadowConfirms)
+    uint ShadowConsult; uint ShadowPacked; uint ShadowReversed; float ShadowTolerance; // Tolerance in world units
+    uint2 ShadowSize;   uint ShadowCascades; uint ShadowPad;                          // One cascade's size, how many are stacked
 };
 
 // Must match rtao_accel.h

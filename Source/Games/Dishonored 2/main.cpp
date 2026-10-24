@@ -303,6 +303,11 @@ namespace
    // Only objects the game draws into its shadow maps block the RT sun (config "RTSunShadowCastersOnly"): the game keeps
    // some objects out of its shadow maps on purpose (window glass, light shaft meshes); camera only ones still occlude the AO
    bool g_rtsun_casters_only = false;
+   // Shadow map check (config "RTSunShadowMapCheck"): a sun ray hitting an object the game never drew into its shadow map
+   // (camera only: glass, light shafts, or a caster drawn only in passes we don't capture as casters) is blocked only
+   // where the game's own shadow map has a surface there (or is in shadow), within "RTSunShadowMapTolerance" world units
+   bool g_rtsun_shadow_consult = true;
+   float g_rtsun_shadow_tolerance = 0.1f;
    int g_rtsun_output = int(RTSun::Output::Denoised); // Config "RTSunOutput"
    // ---- RT diagnostic capture (RTAO_NOTES.md "Diagnostic capture"): Luma panel button or Ctrl+Shift+Pause (not F9: the game's quickload). About 10 s:
    // 5 s as is, then 5 s with the ray tracing scene frozen, ~5 captures per second. Each capture copies, from the SAME
@@ -517,6 +522,11 @@ struct GameDeviceDataDishonored2 final : public GameDeviceData
    // rtao_frame of the last SSAO draw that queued a sun trace (the screen shadows draw only uses a fresh one)
    std::atomic<uint32_t> rtsun_scheduled_frame = UINT32_MAX / 2;
    std::atomic<uint32_t> rtsun_gpu_us = 0, rtsun_record_failures = 0, rtsun_bound_draws = 0, rtsun_stale_draws = 0;
+   // Shadow map check: the frame the game's cascades were last copied (UINT32_MAX: never), its compare direction
+   std::atomic<uint32_t> rtsun_shadow_copied_frame = UINT32_MAX;
+   std::atomic<bool> rtsun_shadow_reversed = false;
+   std::atomic<uint64_t> rtsun_shadow_copies = 0;
+   std::atomic<bool> rtsun_shadow_logged_error = false;
    std::atomic<bool> rtsun_logged_error = false;
    float rtsun_logged_dir[3] = {};
    std::atomic<uint64_t> rtao_cutout_tests = 0, rtao_cutout_hits = 0, rtao_cutout_fallback_tests = 0; // Trace candidates last frame (read back late)
@@ -577,6 +587,8 @@ public:
       native_shaders_definitions.emplace(CompileTimeStringHash("DS2 XeGTAO Main Pass PS"), ShaderDefinition{ "Luma_XeGTAO", reshade::api::pipeline_subobject_type::pixel_shader, nullptr, "main_pass_ps" });
       native_shaders_definitions.emplace(CompileTimeStringHash("DS2 RTAO Depth Copy PS"), ShaderDefinition{ "Luma_RTAO", reshade::api::pipeline_subobject_type::pixel_shader, nullptr, "depth_copy_ps" });
       native_shaders_definitions.emplace(CompileTimeStringHash("DS2 RTAO Depth Pack PS"), ShaderDefinition{ "Luma_RTAO", reshade::api::pipeline_subobject_type::pixel_shader, nullptr, "depth_pack_ps" });
+      native_shaders_definitions.emplace(CompileTimeStringHash("DS2 RTSun Shadow Copy PS"), ShaderDefinition{ "Luma_RTSunShadowCopy", reshade::api::pipeline_subobject_type::pixel_shader, nullptr, "shadow_copy_ps" });
+      native_shaders_definitions.emplace(CompileTimeStringHash("DS2 RTSun Shadow Pack PS"), ShaderDefinition{ "Luma_RTSunShadowCopy", reshade::api::pipeline_subobject_type::pixel_shader, nullptr, "shadow_pack_ps" });
       native_shaders_definitions.emplace(CompileTimeStringHash("DS2 AO View PS"), ShaderDefinition{ "Luma_RTAO", reshade::api::pipeline_subobject_type::pixel_shader, nullptr, "ao_view_ps" });
       native_shaders_definitions.emplace(CompileTimeStringHash("DS2 RTAO Capture CS"), ShaderDefinition{ "Luma_RTAO", reshade::api::pipeline_subobject_type::compute_shader, nullptr, "capture_instances_cs" });
       native_shaders_definitions.emplace(CompileTimeStringHash("DS2 RTAO Skin CS"), ShaderDefinition{ "Luma_RTAO", reshade::api::pipeline_subobject_type::compute_shader, nullptr, "skin_vertices_cs" });
@@ -671,6 +683,7 @@ public:
       game_device_data.rtao_capture.skinned_hold_frames = uint32_t(std::clamp(g_rtao_skinned_hold, 0, 600));
       game_device_data.rtao_capture.shadow_frame_meshes_enabled = g_rtdbg_shadow_openables;
       game_device_data.rtao_tlas.shadow_mode = g_rtdbg_shadow_young_long ? 1u : 0u;
+      game_device_data.rtao_tlas.camera_only_non_opaque = g_rtsun_shadow_consult;
       game_device_data.rtao_last_draw_frame = game_device_data.rtao_frame;
       g_rtao_main_depth_width = depth_desc.Width;
       g_rtao_main_depth_height = depth_desc.Height;
@@ -1153,6 +1166,8 @@ public:
                std::thread([csv = std::move(csv), path]() { std::ofstream(path) << csv; }).detach();
             }
             add("casters_only=%d\nskinned_hold=%d\n", int(g_rtsun_casters_only), g_rtao_skinned_hold);
+            add("shadow_check=%d\nshadow_check_tolerance=%.3f\nshadow_copied_frame=%u\nshadow_reversed=%d\nshadow_copies=%llu\n", int(g_rtsun_shadow_consult), g_rtsun_shadow_tolerance,
+               g.rtsun_shadow_copied_frame.load(), int(g.rtsun_shadow_reversed.load()), (unsigned long long)g.rtsun_shadow_copies.load());
             // Per frame meshes of the last complete frame: per mesh, its events in order (see RTAO::FrameMeshEvent)
             {
                const std::vector<RTAO::FrameMeshEvent> trace = g.rtao_capture.GetLastFrameMeshTrace();
@@ -1487,6 +1502,13 @@ public:
       out.angular_diameter_deg = std::clamp(g_rtsun_angle, 0.f, 10.f);
       out.ray_count = uint32_t(std::clamp(g_rtsun_rays, 1, 16));
       out.casters_only = g_rtsun_casters_only;
+      {
+         // The copy from the last frame's screen shadows draw (this frame's comes after the trace)
+         const uint32_t copied = game_device_data.rtsun_shadow_copied_frame.load();
+         out.shadow_consult = g_rtsun_shadow_consult && copied != UINT32_MAX && game_device_data.rtao_frame - copied <= 2;
+         out.shadow_reversed = game_device_data.rtsun_shadow_reversed.load();
+         out.shadow_tolerance = g_rtsun_shadow_tolerance;
+      }
       const int output = std::clamp(g_rtsun_output, 0, int(RTSun::Output::Count) - 1);
       out.output = RTSun::Output(output);
       out.reset_history = output != game_device_data.rtsun_last_output || g_rtdiag.reset_history.exchange(false);
@@ -1531,6 +1553,61 @@ public:
 
    // The game's screen shadows draw (replaced pixel shaders ScreenShadows_*.hlsl): captures the light direction, and
    // binds this frame's traced visibility at t3 for the draw. Returns true if it drew (state restored after).
+   // Shadow map check: copies the game's sun cascades (PS t0 of the screen shadows draw) and their light matrices (its PS
+   // b2, still bound) into the texture shared with the RT sun trace (Shaders/Dishonored 2/Luma_RTSunShadowCopy.hlsl)
+   static void RTSunCopyShadowMap(ID3D11Device* native_device, ID3D11DeviceContext* context, DeviceData& device_data, GameDeviceDataDishonored2& g)
+   {
+      if (!g.rtsun_pass.IsInitialized())
+         return;
+      const auto copy_vs = device_data.native_vertex_shaders.find(CompileTimeStringHash("Copy VS"));
+      const auto copy_ps = device_data.native_pixel_shaders.find(CompileTimeStringHash("DS2 RTSun Shadow Copy PS"));
+      const auto pack_ps = device_data.native_pixel_shaders.find(CompileTimeStringHash("DS2 RTSun Shadow Pack PS"));
+      if (copy_vs == device_data.native_vertex_shaders.end() || !copy_vs->second || copy_ps == device_data.native_pixel_shaders.end() || !copy_ps->second ||
+         pack_ps == device_data.native_pixel_shaders.end() || !pack_ps->second)
+         return;
+      com_ptr<ID3D11ShaderResourceView> shadow_srv;
+      context->PSGetShaderResources(0, 1, &shadow_srv);
+      if (!shadow_srv)
+         return;
+      D3D11_SHADER_RESOURCE_VIEW_DESC srv_desc = {};
+      shadow_srv->GetDesc(&srv_desc);
+      com_ptr<ID3D11Resource> resource;
+      shadow_srv->GetResource(&resource);
+      com_ptr<ID3D11Texture2D> texture;
+      if (srv_desc.ViewDimension != D3D11_SRV_DIMENSION_TEXTURE2DARRAY || !resource || FAILED(resource->QueryInterface(&texture)))
+         return;
+      D3D11_TEXTURE2D_DESC desc = {};
+      texture->GetDesc(&desc);
+      std::string error;
+      if (!g.rtsun_pass.EnsureShadowTarget(native_device, desc.Width, desc.Height, error))
+      {
+         if (!g.rtsun_shadow_logged_error.exchange(true))
+            reshade::log::message(reshade::log::level::warning, ("[Luma] RT sun: shadow map check unavailable: " + error).c_str());
+         return;
+      }
+      bool packed = false;
+      ID3D11RenderTargetView* rtv = g.rtsun_pass.GetShadowRTV(&packed);
+      if (!rtv)
+         return;
+      // Which way the game compares (its PCF sampler, s0): GREATER means nearer the light is larger
+      com_ptr<ID3D11SamplerState> sampler;
+      context->PSGetSamplers(0, 1, &sampler);
+      if (sampler)
+      {
+         D3D11_SAMPLER_DESC sampler_desc = {};
+         sampler->GetDesc(&sampler_desc);
+         g.rtsun_shadow_reversed = sampler_desc.ComparisonFunc == D3D11_COMPARISON_GREATER || sampler_desc.ComparisonFunc == D3D11_COMPARISON_GREATER_EQUAL;
+      }
+      DrawStateStack<DrawStateStackType::FullGraphics> draw_state_stack;
+      draw_state_stack.Cache(context, device_data.uav_max_count);
+      DrawCustomPixelShader(context, device_data.default_depth_stencil_state.get(), device_data.default_blend_state.get(), nullptr, copy_vs->second.get(),
+         packed ? pack_ps->second.get() : copy_ps->second.get(), shadow_srv.get(), rtv, desc.Width, desc.Height * RTSun::kShadowCascades + 1);
+      draw_state_stack.Restore(context);
+      rtv->Release();
+      g.rtsun_shadow_copied_frame = g.rtao_frame;
+      g.rtsun_shadow_copies++;
+   }
+
    static bool DrawRTSunScreenShadows(ID3D11Device* native_device, ID3D11DeviceContext* native_device_context, CommandListData& cmd_list_data, DeviceData& device_data, GameDeviceDataDishonored2& game_device_data, bool& updated_cbuffers, std::function<void()>* original_draw_dispatch_func)
    {
       if (g_rtsun_mode == RTSUN_MODE_OFF || GetEffectiveAOMode() != AO_MODE_RTAO)
@@ -1540,6 +1617,8 @@ public:
          return false;
       const uint32_t frame = game_device_data.rtao_frame;
       game_device_data.rtsun_light.OnScreenShadowsDraw(native_device_context, frame);
+      if (g_rtsun_shadow_consult)
+         RTSunCopyShadowMap(native_device, native_device_context, device_data, game_device_data);
       // Traced by this frame's SSAO draw (or the previous frame's, if the recording threads raced): otherwise the game's
       if (frame - game_device_data.rtsun_scheduled_frame.load() > 1 || game_device_data.rtsun_pass.TraceCount() == 0)
       {
@@ -3379,6 +3458,8 @@ public:
       reshade::get_config_value(runtime, NAME, "RTAODynamic", g_rtao_dynamic);
       reshade::get_config_value(runtime, NAME, "RTAOShadowCasters", g_rtao_shadow_casters);
       reshade::get_config_value(runtime, NAME, "RTSunShadowCastersOnly", g_rtsun_casters_only);
+      reshade::get_config_value(runtime, NAME, "RTSunShadowMapCheck", g_rtsun_shadow_consult);
+      reshade::get_config_value(runtime, NAME, "RTSunShadowMapTolerance", g_rtsun_shadow_tolerance);
       reshade::get_config_value(runtime, NAME, "RTAOShadowNearSlices", g_rtao_shadow_near_slices);
       reshade::get_config_value(runtime, NAME, "RTAOShadowNearOnly", g_rtao_shadow_near_only);
       reshade::get_config_value(runtime, NAME, "RTAOStrength", g_rtao_strength);
@@ -3689,6 +3770,15 @@ public:
       ImGui::Checkbox("RT test: openables from the shadow map", &g_rtdbg_shadow_openables);
       if (ImGui::IsItemHovered())
          ImGui::SetTooltip("Off: openable windows/doors only enter the ray tracing scene from the camera's draws (not saved).");
+      if (ImGui::Checkbox("RT sun: shadow map check", &g_rtsun_shadow_consult))
+         reshade::set_config_value(runtime, NAME, "RTSunShadowMapCheck", g_rtsun_shadow_consult);
+      if (ImGui::IsItemHovered())
+         ImGui::SetTooltip("An object the game never drew into its shadow map (window glass, fake light shafts) blocks the ray traced sun only\n"
+            "where the game's own shadow map has a surface (or a shadow) there. Objects drawn into the shadow map, characters\nand openable doors/windows always block.");
+      if (ImGui::SliderFloat("RT sun: shadow map check tolerance", &g_rtsun_shadow_tolerance, 0.f, 1.f, "%.2f"))
+         reshade::set_config_value(runtime, NAME, "RTSunShadowMapTolerance", g_rtsun_shadow_tolerance);
+      if (ImGui::IsItemHovered())
+         ImGui::SetTooltip("How far (world units, plus two shadow map texels) a hit may be behind the shadow map's surface and still count.");
       if (ImGui::Checkbox("RT sun: only shadow casting objects block it", &g_rtsun_casters_only))
          reshade::set_config_value(runtime, NAME, "RTSunShadowCastersOnly", g_rtsun_casters_only);
       if (ImGui::IsItemHovered())

@@ -214,6 +214,7 @@ namespace
    std::shared_mutex g_rtao_shader_mutex;
    std::unordered_map<uint64_t, RTAO::VertexShaderInfo> g_rtao_vertex_shaders;
    std::unordered_map<uint64_t, uint32_t> g_rtao_vertex_shader_hashes; // Luma's shader hash (as in the Dump folder names), diagnostics
+   std::unordered_map<uint64_t, uint32_t> g_rtao_pixel_shader_hashes; // Same, pixel shaders
    // Diagnostics: each uncaptured main view (shader, reason) logged once, up to a limit
    std::mutex g_rtao_diag_mutex;
    std::unordered_set<uint64_t> g_rtao_diag_logged;
@@ -297,6 +298,9 @@ namespace
    int g_rtsun_mode = RTSUN_MODE_OFF; // Config "RTSunMode" (mirrored in LumaGameSettings.RTSunMode for the shaders)
    float g_rtsun_angle = 0.75f; // The light's angular diameter, degrees (config "RTSunAngle"); the real sun is 0.53
    int g_rtsun_rays = 1; // Per pixel per frame (config "RTSunRays")
+   // Only objects the game draws into its shadow maps block the RT sun (config "RTSunShadowCastersOnly"): the game keeps
+   // some objects out of its shadow maps on purpose (window glass, light shaft meshes); camera only ones still occlude the AO
+   bool g_rtsun_casters_only = true;
    int g_rtsun_output = int(RTSun::Output::Denoised); // Config "RTSunOutput"
    // ---- RT diagnostic capture (RTAO_NOTES.md "Diagnostic capture"): Luma panel button or Ctrl+Shift+Pause (not F9: the game's quickload). About 10 s:
    // 5 s as is, then 5 s with the ray tracing scene frozen, ~5 captures per second. Each capture copies, from the SAME
@@ -1129,13 +1133,13 @@ public:
             add("slice_fars=%.4g,%.4g,%.4g,%.4g\n", fars[0], fars[1], fars[2], fars[3]);
             // Every retained TLAS instance of this frame, for the duplicate check (cNNNN_instances.csv)
             {
-               std::string csv = "blas_key,sources,min_slice,x,y,z,index_count,vertex_count,first_frame,last_frame,seen_frames\n";
+               std::string csv = "blas_key,sources,min_slice,x,y,z,index_count,vertex_count,first_frame,last_frame,seen_frames,vs_hash,ps_hash\n";
                char row[192];
                for (const auto& i : g.rtao_tlas.LastBuildOrder()) // In TLAS index order: row r = blocker id r + 1
                {
-                  uint32_t indices = 0, vertices = 0;
-                  g.rtao_capture.GetMeshSize(i.blas_key, indices, vertices);
-                  snprintf(row, sizeof(row), "%016llX,%u,%u,%.3f,%.3f,%.3f,%u,%u,%u,%u,%u\n", (unsigned long long)i.blas_key, i.sources, i.min_slice, i.pos[0], i.pos[1], i.pos[2], indices, vertices, i.first_frame, i.last_frame, i.seen_frames);
+                  uint32_t indices = 0, vertices = 0, vs_hash = 0, ps_hash = 0;
+                  g.rtao_capture.GetMeshSize(i.blas_key, indices, vertices, &vs_hash, &ps_hash);
+                  snprintf(row, sizeof(row), "%016llX,%u,%u,%.3f,%.3f,%.3f,%u,%u,%u,%u,%u,%08X,%08X\n", (unsigned long long)i.blas_key, i.sources, i.min_slice, i.pos[0], i.pos[1], i.pos[2], indices, vertices, i.first_frame, i.last_frame, i.seen_frames, vs_hash, ps_hash);
                   csv += row;
                }
                char name[32];
@@ -1143,6 +1147,7 @@ public:
                const std::string path = (std::filesystem::path(g_rtdiag.dir) / name).string();
                std::thread([csv = std::move(csv), path]() { std::ofstream(path) << csv; }).detach();
             }
+            add("casters_only=%d\n", int(g_rtsun_casters_only));
             add("near_only=%d\nnear_slices=%d\nfar_skipped=%llu\n", int(g_rtao_shadow_near_only), g_rtao_shadow_near_slices, (unsigned long long)g_rtao_shadow_far_skipped.load());
             add("slice_draws=%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu\n", (unsigned long long)g_rtao_shadow_slice_draws[0].load(), (unsigned long long)g_rtao_shadow_slice_draws[1].load(),
                (unsigned long long)g_rtao_shadow_slice_draws[2].load(), (unsigned long long)g_rtao_shadow_slice_draws[3].load(), (unsigned long long)g_rtao_shadow_slice_draws[4].load(),
@@ -1457,6 +1462,7 @@ public:
       out.cutout_exact = ao_settings.cutout_exact; // Texture exact masks (the sun always traces at full resolution, whatever RTAO Quality)
       out.angular_diameter_deg = std::clamp(g_rtsun_angle, 0.f, 10.f);
       out.ray_count = uint32_t(std::clamp(g_rtsun_rays, 1, 16));
+      out.casters_only = g_rtsun_casters_only;
       const int output = std::clamp(g_rtsun_output, 0, int(RTSun::Output::Count) - 1);
       out.output = RTSun::Output(output);
       out.reset_history = output != game_device_data.rtsun_last_output || g_rtdiag.reset_history.exchange(false);
@@ -2556,6 +2562,10 @@ public:
             const auto* desc = static_cast<const reshade::api::shader_desc*>(subobject.data);
             if (!desc->code || desc->code_size == 0)
                continue;
+            {
+               const std::unique_lock lock(g_rtao_shader_mutex);
+               g_rtao_pixel_shader_hashes[pipeline.handle] = Shader::BinToHash(static_cast<const uint8_t*>(desc->code), desc->code_size);
+            }
             RTAO::PixelShaderInfo info;
             RTAO::ReflectPixelShader(desc->code, desc->code_size, info);
             g_rtao_ps_reflected++;
@@ -2596,6 +2606,7 @@ public:
       const std::unique_lock lock(g_rtao_shader_mutex);
       g_rtao_vertex_shaders.erase(pipeline.handle);
       g_rtao_vertex_shader_hashes.erase(pipeline.handle);
+      g_rtao_pixel_shader_hashes.erase(pipeline.handle);
       g_rtao_input_layouts.erase(pipeline.handle);
       g_rtao_alpha_tested_ps.erase(pipeline.handle);
    }
@@ -2834,6 +2845,13 @@ public:
       RTAO::DrawInfo draw;
       draw.vs = &vs_info;
       draw.shadow_view = shadow_view;
+      {
+         const std::shared_lock lock(g_rtao_shader_mutex);
+         auto vh = g_rtao_vertex_shader_hashes.find(uint64_t(uintptr_t(vs.get())));
+         draw.debug_vs_hash = vh != g_rtao_vertex_shader_hashes.end() ? vh->second : 0;
+         auto ph = ps ? g_rtao_pixel_shader_hashes.find(uint64_t(uintptr_t(ps.get()))) : g_rtao_pixel_shader_hashes.end();
+         draw.debug_ps_hash = ph != g_rtao_pixel_shader_hashes.end() ? ph->second : 0;
+      }
       draw.shadow_slice = uint8_t((std::min)(shadow_slice, 0xFEu));
       draw.position_format = layout_info.position_format;
       draw.position_offset = layout_info.position_offset;
@@ -3336,6 +3354,7 @@ public:
       reshade::get_config_value(runtime, NAME, "RTAOSkinned", g_rtao_skinned);
       reshade::get_config_value(runtime, NAME, "RTAODynamic", g_rtao_dynamic);
       reshade::get_config_value(runtime, NAME, "RTAOShadowCasters", g_rtao_shadow_casters);
+      reshade::get_config_value(runtime, NAME, "RTSunShadowCastersOnly", g_rtsun_casters_only);
       reshade::get_config_value(runtime, NAME, "RTAOShadowNearSlices", g_rtao_shadow_near_slices);
       reshade::get_config_value(runtime, NAME, "RTAOShadowNearOnly", g_rtao_shadow_near_only);
       reshade::get_config_value(runtime, NAME, "RTAOStrength", g_rtao_strength);
@@ -3641,6 +3660,10 @@ public:
       ImGui::Checkbox("RT test: openables from the shadow map", &g_rtdbg_shadow_openables);
       if (ImGui::IsItemHovered())
          ImGui::SetTooltip("Off: openable windows/doors only enter the ray tracing scene from the camera's draws (not saved).");
+      if (ImGui::Checkbox("RT sun: only shadow casting objects block it", &g_rtsun_casters_only))
+         reshade::set_config_value(runtime, NAME, "RTSunShadowCastersOnly", g_rtsun_casters_only);
+      if (ImGui::IsItemHovered())
+         ImGui::SetTooltip("Objects the game draws for the camera but never into its shadow maps (window glass, fake light shafts) don't block\nthe ray traced sun, like the game's own shadows. They still occlude the AO.");
       if (ImGui::Checkbox("RT: shadow map casters from near slices only", &g_rtao_shadow_near_only))
          reshade::set_config_value(runtime, NAME, "RTAOShadowNearOnly", g_rtao_shadow_near_only);
       if (ImGui::IsItemHovered())

@@ -18,6 +18,7 @@
 #include <mutex>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -28,6 +29,10 @@ namespace RTAO
    // InstanceID, so the trace can resolve them in its candidate loop (see Shaders/rtao_trace.hlsl).
    constexpr uint8_t kInstanceMaskOpaque = 0x01;
    constexpr uint8_t kInstanceMaskCutout = 0x02;
+   // Retained instances the game only ever drew for the camera, never into a shadow map (window glass, light shaft meshes):
+   // they occlude the AO but the RT sun can leave them out, like the game's own shadows (RTSun "shadow casters only")
+   constexpr uint8_t kInstanceMaskCameraOnly = 0x04;
+   constexpr uint8_t kInstanceMaskCameraOnlyCutout = 0x08;
    constexpr uint32_t kInstanceIdCutoutBit = 1u << 23;
    // The low 23 bits of a cutout's InstanceID: its texture exact cutout record (rtao_alpha.h), or this (none: the trace
    // falls back to the stochastic opacity)
@@ -292,6 +297,7 @@ namespace RTAO
          bool batch; // Arrived in a shadow map redraw batch (never taken for a move)
       };
       uint32_t added_new_shadow = 0;
+      std::unordered_set<uint64_t> shadow_meshes; // BLAS keys ever drawn into a shadow map (sun casters, any instance)
       std::vector<InstanceInfo> last_build_order;
       std::vector<uint64_t> batch_candidates; // Shadow map instances created since the last BeginFrame
       RetentionStats retention_stats;

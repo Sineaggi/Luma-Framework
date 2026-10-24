@@ -1474,6 +1474,8 @@ namespace RTAO
             mesh.index_start = index_start;
             mesh.index_count = draw.index_count;
             mesh.index_format = draw.index_format;
+            mesh.vs_hash = draw.debug_vs_hash;
+            mesh.ps_hash = draw.debug_ps_hash;
             meshes.emplace(key, mesh);
             stats.meshes = meshes.size();
          }

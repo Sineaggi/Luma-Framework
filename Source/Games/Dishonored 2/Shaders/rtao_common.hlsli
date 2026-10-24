@@ -35,6 +35,7 @@ uint2 TracedPixel(uint2 cell)
 
 // Must match rtao_accel.h
 static const uint kInstanceMaskCutout = 0x02;
+static const uint kInstanceMaskCameraOnlyCutout = 0x08; // Must match rtao_accel.h
 static const uint kInstanceIdCutoutBit = 1u << 23;
 
 Texture2D<float4> DepthTex : register(t1);

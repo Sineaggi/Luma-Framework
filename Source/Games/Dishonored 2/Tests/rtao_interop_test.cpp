@@ -2032,6 +2032,7 @@ static void TestCutoutTextures(ID3D11Device* device, ID3D11DeviceContext* contex
    // RT sun shadows through the same cutouts (recorded after the AO when sun_on, as the addon does)
    RTSun::SunPass sun;
    RTSun::SunSettings sun_settings;
+   sun_settings.casters_only = false; // The scene's instances are added as main view ones (no shadow map)
    bool sun_on = false;
 
    auto run_frame = [&]() {

@@ -172,7 +172,7 @@ void main(uint3 id : SV_DispatchThreadID)
         ray.TMin = 0.0;
         ray.TMax = TMax;
         RayQuery<RAY_FLAG_SKIP_PROCEDURAL_PRIMITIVES> q;
-        q.TraceRayInline(Scene, RAY_FLAG_NONE, 0xFF, ray);
+        q.TraceRayInline(Scene, RAY_FLAG_NONE, CastersOnly != 0 ? (0xFF & ~(kInstanceMaskCameraOnly | kInstanceMaskCameraOnlyCutout)) : 0xFF, ray);
         uint guard = 0;
         while (q.Proceed() && guard++ < 256)
         {
@@ -200,7 +200,8 @@ void main(uint3 id : SV_DispatchThreadID)
     // (texture exact); without a mask, it stops the ray with probability CutoutOpacity (per crossing, or per ray with
     // fast cutouts). With masks off, opacity 1 forces everything opaque and 0 leaves cutouts out.
     const uint ray_flags = (CutoutOpacity >= 1.0 && CutoutExact == 0) ? RAY_FLAG_FORCE_OPAQUE : RAY_FLAG_NONE;
-    const uint ray_mask = (CutoutOpacity <= 0.0 && CutoutExact == 0) ? (0xFF & ~kInstanceMaskCutout) : 0xFF;
+    const uint caster_mask = CastersOnly != 0 ? (0xFF & ~(kInstanceMaskCameraOnly | kInstanceMaskCameraOnlyCutout)) : 0xFF;
+    const uint ray_mask = caster_mask & ((CutoutOpacity <= 0.0 && CutoutExact == 0) ? (0xFF & ~(kInstanceMaskCutout | kInstanceMaskCameraOnlyCutout)) : 0xFF);
     uint rays = max(RayCount, 1u);
     float lit = 0.0;
     const float coin_offset = float(Hash(px.x * 0x632BE5ABu + Hash(px.y + Hash(Frame + 0x165667B1u))) & 0xFFFF) / 65536.0;

@@ -613,6 +613,8 @@ namespace RTAO
       else if (instance.last_frame != frame)
          instance.seen_frames++;
       instance.sources |= source;
+      if (source & kInstanceSourceShadow)
+         shadow_meshes.insert(blas_key);
       if (shadow_slice < instance.min_slice)
          instance.min_slice = shadow_slice;
       std::memcpy(instance.transform, object_to_world, sizeof(instance.transform));
@@ -688,6 +690,11 @@ namespace RTAO
             std::memcpy(desc.Transform, pair.second.transform, sizeof(desc.Transform));
             desc.InstanceID = uint32_t(descs.size()) & (kInstanceIdCutoutBit - 1);
             desc.InstanceMask = pair.second.mask;
+            // Camera only: neither this instance nor any instance of its mesh was ever drawn into a shadow map (the game
+            // keeps the mesh out of its shadows: glass, light shaft meshes). A real caster the shadow map hasn't drawn yet
+            // becomes one as soon as it does (the shadow map is redrawn rarely, so this is per mesh, not per instance).
+            if (!(pair.second.sources & kInstanceSourceShadow) && !shadow_meshes.count(pair.second.blas_key))
+               desc.InstanceMask = (pair.second.mask & kInstanceMaskCutout) ? kInstanceMaskCameraOnlyCutout : kInstanceMaskCameraOnly;
             desc.Flags = D3D12_RAYTRACING_INSTANCE_FLAG_TRIANGLE_CULL_DISABLE | D3D12_RAYTRACING_INSTANCE_FLAG_FORCE_OPAQUE;
             if (pair.second.mask & kInstanceMaskCutout)
             {
@@ -798,6 +805,7 @@ namespace RTAO
          frame_instances.clear();
          batch_candidates.clear();
          added_new_shadow = 0;
+         shadow_meshes.clear();
       }
       for (uint32_t i = 0; i < kSlots; i++)
       {

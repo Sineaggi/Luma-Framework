@@ -101,7 +101,7 @@ void main(uint3 id : SV_DispatchThreadID)
     // Texture exact cutouts (CutoutExact, rtao_cutout.hlsli): a cutout with a mask stops the ray where its alpha passes the
     // game's test; the opacity only applies to the others, so neither shortcut is taken.
     const uint ray_flags = (CutoutOpacity >= 1.0 && CutoutExact == 0) ? RAY_FLAG_FORCE_OPAQUE : RAY_FLAG_NONE;
-    const uint ray_mask = (CutoutOpacity <= 0.0 && CutoutExact == 0) ? (0xFF & ~kInstanceMaskCutout) : 0xFF;
+    const uint ray_mask = (CutoutOpacity <= 0.0 && CutoutExact == 0) ? (0xFF & ~(kInstanceMaskCutout | kInstanceMaskCameraOnlyCutout)) : 0xFF;
     float occlusion = 0.0;
     uint rays = max(RayCount, 1u);
     const float coin_offset = float(Hash(px.x * 0x632BE5ABu + Hash(px.y + Hash(Frame + 0x27d4eb2du))) & 0xFFFF) / 65536.0;

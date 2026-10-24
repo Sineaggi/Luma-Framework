@@ -38,7 +38,7 @@ struct Capture
    std::map<std::string, std::vector<uint8_t>> gray; // game_shadow, rt_raw, rt_denoised
    std::vector<uint8_t> scene, final_image, scene_sun; // RGB
    std::vector<uint16_t> blocker; // TLAS index + 1 of the first hit of a hard sun ray, 0 lit
-   struct TlasRow { std::string key; int sources = 0, min_slice = 255; double pos[3] = {}; int indices = 0, vertices = 0; };
+   struct TlasRow { std::string key; int sources = 0, min_slice = 255; double pos[3] = {}; int indices = 0, vertices = 0; unsigned vs = 0, ps = 0; };
    std::vector<TlasRow> tlas; // cNNNN_tlas.csv, row r = blocker id r + 1
    struct Probe { uint32_t key, flags; double pos[3]; };
    std::vector<Probe> probes;
@@ -166,7 +166,7 @@ static bool Load(const fs::path& dir, int index, Capture& c)
          Capture::TlasRow t;
          char key[32] = {};
          unsigned first = 0, last = 0, seen = 0;
-         if (sscanf(row.c_str(), "%31[^,],%d,%d,%lf,%lf,%lf,%d,%d,%u,%u,%u", key, &t.sources, &t.min_slice, &t.pos[0], &t.pos[1], &t.pos[2], &t.indices, &t.vertices, &first, &last, &seen) >= 8)
+         if (sscanf(row.c_str(), "%31[^,],%d,%d,%lf,%lf,%lf,%d,%d,%u,%u,%u,%X,%X", key, &t.sources, &t.min_slice, &t.pos[0], &t.pos[1], &t.pos[2], &t.indices, &t.vertices, &first, &last, &seen, &t.vs, &t.ps) >= 8)
          {
             t.key = key;
             c.tlas.push_back(t);
@@ -492,8 +492,8 @@ int main(int argc, char** argv)
          const auto& b = sorted[k].second;
          const int s = b.row.sources;
          std::string src = std::string((s & 4) ? "per-frame mesh" : "") + ((s & 1) ? " camera" : "") + ((s & 2) ? " shadow-map" : "") + ((s & 8) ? " (MVP)" : "") + ((s & 16) ? " skinned" : "");
-         printf("  %6d px in %3d captures: mesh %s, %s, lowest slice %s, %d indices / %d vertices, at %.2f %.2f %.2f\n", b.pixels, b.captures, b.row.key.c_str(), src.c_str(),
-            b.row.min_slice == 255 ? "-" : std::to_string(b.row.min_slice).c_str(), b.row.indices, b.row.vertices, b.row.pos[0], b.row.pos[1], b.row.pos[2]);
+         printf("  %6d px in %3d captures: mesh %s, %s, lowest slice %s, %d indices / %d vertices, at %.2f %.2f %.2f, VS %08X PS %08X\n", b.pixels, b.captures, b.row.key.c_str(), src.c_str(),
+            b.row.min_slice == 255 ? "-" : std::to_string(b.row.min_slice).c_str(), b.row.indices, b.row.vertices, b.row.pos[0], b.row.pos[1], b.row.pos[2], b.row.vs, b.row.ps);
       }
    }
    const char* combo_names[4] = { "current settings", "(combo 1)", "(combo 2)", "(combo 3)" };

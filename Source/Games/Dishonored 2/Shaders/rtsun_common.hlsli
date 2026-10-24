@@ -17,11 +17,13 @@ cbuffer SunConstants : register(b0)
     uint2 Size;         uint2 DepthSize;
     uint DepthPacked;   uint ReversedZ;  uint FilterMode;  float AlphaMin;
     float ClampK;       float Bias;      uint DebugMode;   float CutoutOpacity;
-    uint CutoutMode;    uint CutoutExact; uint2 SunPad;  // As RTAO's (rtao_common.hlsli): fast cutouts, texture exact masks
+    uint CutoutMode;    uint CutoutExact; uint CastersOnly; uint SunPad;  // As RTAO's (rtao_common.hlsli): fast cutouts, texture exact masks; CastersOnly: camera only objects don't block
 };
 
 // Must match rtao_accel.h
 static const uint kInstanceMaskCutout = 0x02;
+static const uint kInstanceMaskCameraOnly = 0x04;
+static const uint kInstanceMaskCameraOnlyCutout = 0x08;
 static const uint kInstanceIdCutoutBit = 1u << 23;
 
 static const uint kFilterOff = 0;

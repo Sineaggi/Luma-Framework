@@ -604,6 +604,7 @@ namespace RTSun
       constants.cutout_opacity = settings.cutout_opacity;
       constants.cutout_mode = settings.cutout_mode;
       constants.cutout_exact = exact ? 1 : 0;
+      constants.casters_only = settings.casters_only ? 1 : 0;
       std::memcpy(constants_mapped + slot * kConstantsStride, &constants, sizeof(constants));
 
       D3D12_GPU_DESCRIPTOR_HANDLE table = heap->GetGPUDescriptorHandleForHeapStart();

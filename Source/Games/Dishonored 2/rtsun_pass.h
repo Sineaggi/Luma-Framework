@@ -51,7 +51,8 @@ namespace RTSun
       float cutout_opacity;
       uint32_t cutout_mode;
       uint32_t cutout_exact;
-      uint32_t pad[2];
+      uint32_t casters_only;
+      uint32_t pad;
    };
    static_assert(sizeof(SunConstants) == 272);
 
@@ -92,6 +93,8 @@ namespace RTSun
       // Diagnostic capture (main.cpp "RT diagnostic capture"): also write the raw visibility and the camera scene view
       // of the same frame into the two debug shared textures (GetDebugSRV), without touching the output or its history
       bool debug_outputs = false;
+      // Objects the game never drew into a shadow map (camera only: glass, light shaft meshes) don't block the sun
+      bool casters_only = true;
    };
 
    class SunPass

@@ -237,7 +237,8 @@ namespace RTAO
       // transform check at readback: world = MVP x inverse(the bound PerViewCB view projection) is only right if the
       // game bound the light's view in PerViewCB.
       bool shadow_view = false;
-      uint8_t shadow_slice = 0xFF; // shadow_view: the shadow map array slice the draw renders into
+      uint8_t shadow_slice = 0xFF;
+      uint32_t debug_vs_hash = 0, debug_ps_hash = 0; // Luma shader hashes of the draw (diagnostics) // shadow_view: the shadow map array slice the draw renders into
    };
 
    struct CaptureStats
@@ -339,12 +340,16 @@ namespace RTAO
       };
       std::vector<FrameMeshProbe> GetProbes() { const std::lock_guard lock(mutex); return probes; }
       // Diagnostic capture: index and vertex count of a captured mesh (0 if unknown)
-      void GetMeshSize(uint64_t key, uint32_t& index_count, uint32_t& vertex_count)
+      void GetMeshSize(uint64_t key, uint32_t& index_count, uint32_t& vertex_count, uint32_t* vs_hash = nullptr, uint32_t* ps_hash = nullptr)
       {
          const std::lock_guard lock(mutex);
          auto it = meshes.find(key);
          index_count = it != meshes.end() ? it->second.index_count : 0;
          vertex_count = it != meshes.end() ? it->second.vertex_count : 0;
+         if (vs_hash)
+            *vs_hash = it != meshes.end() ? it->second.vs_hash : 0;
+         if (ps_hash)
+            *ps_hash = it != meshes.end() ? it->second.ps_hash : 0;
       }
       // Test toggle: per frame meshes (openables) from shadow map draws are skipped while this is off
       std::atomic<bool> shadow_frame_meshes_enabled = true;
@@ -401,6 +406,7 @@ namespace RTAO
          DXGI_FORMAT index_format;
          bool built = false;
          bool failed = false;
+         uint32_t vs_hash = 0, ps_hash = 0; // The first draw's shaders (diagnostics)
       };
       struct Rec
       {

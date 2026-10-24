@@ -171,6 +171,7 @@ static void TestSunShadows(ID3D11Device* device, ID3D11DeviceContext* context, R
    settings.cam_fwd[0] = f.x; settings.cam_fwd[1] = f.y; settings.cam_fwd[2] = f.z;
    settings.light_dir[0] = L.x; settings.light_dir[1] = L.y; settings.light_dir[2] = L.z;
    settings.t_max = 100.f;
+   int shadow_box = -1; // The box whose instance a shadow map draw saw (sun caster rule), -1 none
 
    uint32_t instances = 0;
    auto run_frame = [&]() {
@@ -198,7 +199,7 @@ static void TestSunShadows(ID3D11Device* device, ID3D11DeviceContext* context, R
          {
             const Box& box = kBoxes[b];
             const float xform[3][4] = { { box.max.x - box.min.x, 0, 0, box.min.x }, { 0, box.max.y - box.min.y, 0, box.min.y }, { 0, 0, box.max.z - box.min.z, box.min.z } };
-            tlas.AddInstance(uint64_t(b), 1, xform);
+            tlas.AddInstance(uint64_t(b), 1, xform, RTAO::kInstanceMaskOpaque, RTAO::kNoCutoutRecord, b == shadow_box ? RTAO::kInstanceSourceShadow : RTAO::kInstanceSourceMain);
          }
          D3D12_GPU_VIRTUAL_ADDRESS top = 0;
          if (!tlas.Build(ctx, blases, info.frame_slot, top, instances, err))
@@ -215,6 +216,25 @@ static void TestSunShadows(ID3D11Device* device, ID3D11DeviceContext* context, R
    // Receivers with a known normal (+y): the ground, and box tops
    auto is_receiver = [&](UINT i) { return hit_id[i] == 0 || (hit_id[i] > 0 && hit_pos[i].y >= kBoxes[hit_id[i]].max.y - 1e-3f); };
 
+   // 0) Sun casters: with "casters only", boxes only the camera saw don't block the sun; once a shadow map draw saw one
+   //    instance of their mesh (all boxes share mesh 1), all of them do
+   {
+      settings.angular_diameter_deg = 0.f;
+      settings.ray_count = 1;
+      settings.output = RTSun::Output::Raw;
+      settings.casters_only = true;
+      const std::vector<float> camera_only = run_frame();
+      int dark = 0;
+      for (UINT i = 0; i < W * H; i++)
+         dark += (is_receiver(i) && camera_only[i] < 0.5f) ? 1 : 0; // Receivers face the light: only a caster can darken them
+      shadow_box = 0;
+      run_frame();
+      run_frame();
+      printf("RT sun casters only: camera only boxes darken %d receiver pixels\n", dark);
+      // The scene's boxes cast ~1566 shadowed receiver pixels (test 1); with no caster only edge pixels whose depth
+      // normal faces away remain (the facing away rule, not a ray hit)
+      CHECK(dark < 100, "camera only objects must not block the sun with casters only (%d dark)", dark);
+   }
    // 1) Hard light: the raw trace must match the analytic shadow, away from the boundary (1 px of bias and edges)
    settings.angular_diameter_deg = 0.f;
    settings.ray_count = 1;
@@ -261,7 +281,8 @@ static void TestSunShadows(ID3D11Device* device, ID3D11DeviceContext* context, R
          if (hit_id[i] >= 0)
          {
             geometry++;
-            green += (g > 0.3f && g > r * 1.5f && g > b * 1.5f) ? 1 : 0;
+            // Main view only (green) or main view + shadow map (blue): box 0's instance was seen by a shadow map (test 0)
+            green += ((g > 0.3f && g > r * 1.5f && g > b * 1.5f) || (b > 0.6f && b > r * 1.5f)) ? 1 : 0;
          }
          else
          {

@@ -528,12 +528,11 @@ namespace RTAO
          }
       batch_candidates.clear();
 
-      // Shadow map instances (shadow_mode 0): the game keeps what it drew into its shadow maps and redraws parts of them only
+      // Shadow map instances: the game keeps what it drew into its shadow maps and redraws parts of them only
       // now and then, so a shadow map instance whose position never changed is static world, kept until its mesh is
       // unloaded (Build: kMissingBlasFrames) or the cap. A moving object gets a new key (its transform) each frame: its new
       // copy shows up next to the previous one, which stopped being drawn. That previous copy is then dropped here. The
       // copies a redraw batch brings are never taken for moves (two copies of a mesh side by side in the world).
-      if (shadow_mode == 0)
       {
          std::unordered_map<uint64_t, std::vector<uint64_t>> stale_by_mesh; // Shadow copies last drawn 2..kMovingWindow frames ago
          for (const auto& [key, instance] : instances)
@@ -574,7 +573,6 @@ namespace RTAO
       // the same spot, which squares its light. Instances at the same transform drawn in the same frame are parts of one
       // window (siblings, all kept, even while one is culled); one never drawn together with the latest drawn copies is
       // an old version: dropped.
-      if (shadow_mode == 0)
       {
          auto transform_hash = [](const float t[3][4]) {
             uint64_t h = 0xcbf29ce484222325ull;
@@ -649,7 +647,6 @@ namespace RTAO
          const bool shadow = (instance.sources & kInstanceSourceShadow) != 0;
          bool shadow_static, promoted;
          uint32_t max_age;
-         if (shadow_mode == 0)
          {
             auto d = shadow ? dynamic_latest.find(instance.blas_key) : dynamic_latest.end();
             const bool dynamic = d != dynamic_latest.end() && instance.last_frame + kDynamicRetainFrames < d->second; // Older than its mesh's latest draw
@@ -659,13 +656,6 @@ namespace RTAO
             promoted = shadow_static || instance.seen_frames >= promote_frames;
             max_age = shadow_static ? UINT32_MAX : (instance.moved || dynamic ? 0 : (promoted ? retain_frames : young_retain_frames));
             s.dynamic_dropped += dynamic;
-         }
-         else
-         {
-            // Old rule (test toggle): kShadowPromoteFrames sightings, else kShadowYoungRetainFrames
-            shadow_static = shadow && instance.seen_frames >= kShadowPromoteFrames;
-            promoted = shadow_static || instance.seen_frames >= promote_frames;
-            max_age = shadow_static ? (std::max)(retain_frames, kShadowRetainFrames) : (promoted ? retain_frames : (shadow ? shadow_young_retain_frames : young_retain_frames));
          }
          if (frame - instance.last_frame > max_age)
          {

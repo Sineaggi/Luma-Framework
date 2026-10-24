@@ -251,15 +251,11 @@ namespace RTAO
       // promoted and age out at once: no trail of copies, no pile-up. A static object in view is promoted quickly.
       static constexpr uint32_t kPromoteFrames = 4;
       static constexpr uint32_t kYoungRetainFrames = 2;
-      // Instances seen in a shadow map (see BeginFrame): confirmed static after kShadowPromoteFrames sightings (a moving
-      // object is seen at most twice per key), then kept kShadowRetainFrames after their last draw (~2 min at 60 fps):
-      // casters out of the camera's view; until then kept kShadowYoungRetainFrames (cascades may be time sliced).
-      static constexpr uint32_t kShadowPromoteFrames = 3;
+      // How long the MVP matcher remembers a fuzzy entry (GeometryCapture, ~2 min at 60 fps)
       static constexpr uint32_t kShadowRetainFrames = 7200;
-      static constexpr uint32_t kShadowYoungRetainFrames = 4;
       // A retained instance whose BLAS has been missing this many builds (mesh freed, e.g. a level change) is dropped
       static constexpr uint32_t kMissingBlasFrames = 120;
-      // Shadow map retention (BeginFrame, shadow_mode 0): a redraw batch is this many new shadow map instances in one
+      // Shadow map retention (BeginFrame): a redraw batch is this many new shadow map instances in one
       // readback; a moved copy is within kMovingDistance of the previous one, which stopped being drawn within
       // kMovingWindowFrames; at most kMaxShadowStatic static shadow map instances (the least recently drawn go first)
       static constexpr uint32_t kShadowBatch = 30;
@@ -314,8 +310,6 @@ namespace RTAO
       uint32_t retain_frames = kRetainFrames;
       uint32_t promote_frames = kPromoteFrames;
       uint32_t young_retain_frames = kYoungRetainFrames;
-      uint32_t shadow_young_retain_frames = kShadowYoungRetainFrames; // Old rule only
-      uint32_t shadow_mode = 0; // 0: static world until unloaded, moving copies dropped; 1: the old rule (test toggle)
       // Camera only instances non opaque, so the RT sun's candidate loop sees them (its shadow map check). The AO commits
       // any non opaque non cutout candidate, so it is unaffected.
       bool camera_only_non_opaque = false;

@@ -297,36 +297,6 @@ static void TestTlasRetention()
       CHECK(shadow.RetainedCount() >= 6 + 2 + 80, "static shadow map world must stay without sightings (retained %zu)", shadow.RetainedCount());
    }
 
-   // The old rule (test toggle): static casters need kShadowPromoteFrames sightings
-   {
-      RTAO::TlasBuilder shadow;
-      shadow.shadow_mode = 1;
-      for (uint32_t f = 0; f < RTAO::TlasBuilder::kShadowPromoteFrames; f++)
-      {
-         shadow.BeginFrame();
-         for (uint64_t k = 0; k < 6; k++)
-         {
-            float xform[3][4] = { { 1, 0, 0, 10.f + 0.3f * k }, { 0, 1, 0, 0 }, { 0, 0, 1, 0 } };
-            shadow.AddInstance(500 + k, 3, xform, RTAO::kInstanceMaskOpaque, RTAO::kNoCutoutRecord, RTAO::kInstanceSourceShadow);
-         }
-      }
-      for (uint64_t f = 0; f < 40; f++)
-      {
-         shadow.BeginFrame();
-         float now[3][4] = { { 1, 0, 0, 0.1f * f }, { 0, 1, 0, 5 }, { 0, 0, 1, 0 } };
-         float before[3][4] = { { 1, 0, 0, 0.1f * (f - 1) }, { 0, 1, 0, 5 }, { 0, 0, 1, 0 } };
-         shadow.AddInstance(1000 + f, 2, now, RTAO::kInstanceMaskOpaque, RTAO::kNoCutoutRecord, RTAO::kInstanceSourceMain);
-         if (f > 0)
-            shadow.AddInstance(1000 + f - 1, 2, before, RTAO::kInstanceMaskOpaque, RTAO::kNoCutoutRecord, RTAO::kInstanceSourceShadow);
-      }
-      CHECK(shadow.RetainedCount() <= 6 + RTAO::TlasBuilder::kShadowYoungRetainFrames + 2, "a moving object must not leave a trail (retained %zu)", shadow.RetainedCount());
-      for (uint32_t i = 0; i < RTAO::TlasBuilder::kRetainFrames + 50; i++)
-         shadow.BeginFrame();
-      CHECK(shadow.RetainedCount() == 6, "static shadow map casters must be kept past kRetainFrames (retained %zu)", shadow.RetainedCount());
-      for (uint32_t i = 0; i < RTAO::TlasBuilder::kShadowRetainFrames; i++)
-         shadow.BeginFrame();
-      CHECK(shadow.RetainedCount() == 0, "shadow map casters must go after kShadowRetainFrames (retained %zu)", shadow.RetainedCount());
-   }
    // Particles in the shadow maps: a mesh bringing 40 new copies in random places every frame (more than a redraw batch)
    // keeps only its latest frame of copies; a one off static redraw burst of another mesh (the game filling its shadow
    // map) stays

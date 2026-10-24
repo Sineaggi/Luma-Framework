@@ -253,11 +253,7 @@ namespace
    bool g_rtao_dedup = true;
    // Frames a skinned mesh (character, swinging window flap) keeps its last pose when a frame misses its draw (config "RTAOSkinnedHoldFrames")
    int g_rtao_skinned_hold = 30;
-   bool g_rtao_recopy_written = false; // Re-copy captured buffers the game rewrites (config "RTAORecopyWrittenBuffers", H3 test)
    bool g_rtao_freeze_scene = false;
-   // Popping tests (not saved): openables taken from shadow map draws; shadow map objects not confirmed yet kept 64 frames, not 4
-   bool g_rtdbg_shadow_openables = true;
-   bool g_rtdbg_shadow_young_long = false; // "old shadow map retention" (TlasBuilder::shadow_mode 1) // Debug, not saved: trace the last TLAS again every frame (no capture, no rebuild)
    int g_rtao_blas_budget = 64; // New static BLASes built per frame (config "RTAOBlasBudget")
    // Map(WRITE_DISCARD) of game buffers, per recording thread: buffer -> unique id of its last discard. Part of a draw's
    // identity for the dedup, so a per instance buffer rewritten between two draws never makes them look the same.
@@ -303,11 +299,12 @@ namespace
    // Only objects the game draws into its shadow maps block the RT sun (config "RTSunShadowCastersOnly"): the game keeps
    // some objects out of its shadow maps on purpose (window glass, light shaft meshes); camera only ones still occlude the AO
    bool g_rtsun_casters_only = true;
-   // Shadow map check (config "RTSunShadowMapCheck"): a sun ray hitting an object the game never drew into its shadow map
+   // Shadow map check (formerly config "RTSunShadowMapCheck"): a sun ray hitting an object the game never drew into its shadow map
    // (camera only: glass, light shafts, or a caster drawn only in passes we don't capture as casters) is blocked only
-   // where the game's own shadow map has a surface there (or is in shadow), within "RTSunShadowMapTolerance" world units
-   bool g_rtsun_shadow_consult = false;
-   float g_rtsun_shadow_tolerance = 0.1f;
+   // where the game's own shadow map has a surface there (or is in shadow), within a tolerance in world units.
+   // Not in the settings any more (replaced by "RTSunShadowCastersOnly"); the pass and its tests keep the feature
+   constexpr bool g_rtsun_shadow_consult = false;
+   constexpr float g_rtsun_shadow_tolerance = 0.1f;
    int g_rtsun_output = int(RTSun::Output::Denoised); // Config "RTSunOutput"
    // ---- RT diagnostic capture (RTAO_NOTES.md "Diagnostic capture"): Luma panel button or Ctrl+Shift+Pause (not F9: the game's quickload). About 10 s:
    // 5 s as is, then 5 s with the ray tracing scene frozen, ~5 captures per second. Each capture copies, from the SAME
@@ -335,7 +332,7 @@ namespace
       uint32_t index = 0; // Captures taken
       uint32_t frame = 0;
       int phase = 0; // 0 as is, 1 scene frozen
-      bool saved_freeze = false, saved_openables = true, saved_young_long = false, saved_near_only = true;
+      bool saved_freeze = false, saved_near_only = true;
       // Test matrix: 0 near slices + static retention, 1 near slices + old retention, 2 every slice + old retention
       int combo = 0;
       std::chrono::steady_clock::time_point switch_time;
@@ -439,9 +436,8 @@ namespace
    // The sun's shadow map array (PS t0 of the screen shadows draw). The game draws each sun cascade into a plain square
    // depth texture (and keeps a cached static one it restores from), then copies it into a slice of this array; its
    // other shadow arrays are the local lights' atlas. Only draws into this array or plain square depth textures are sun
-   // casters, unless "RTAOShadowAtlasCasters" (the old rule: slices 0 and 1 of any shadow array).
+   // casters.
    std::atomic<uintptr_t> g_sun_shadow_array = 0;
-   bool g_rtao_shadow_atlas_casters = false;
    // The game's shadow map rasterizer bias (last shadow draw): the reproduction allows for it
    std::atomic<int> g_shadow_depth_bias = 0;
    std::atomic<float> g_shadow_slope_bias = 0.f;
@@ -771,8 +767,7 @@ public:
       game_device_data.rtao_capture.dedup_enabled = g_rtao_dedup;
       game_device_data.rtao_capture.shadow_skinned_enabled = g_rtao_shadow_skinned;
       game_device_data.rtao_capture.skinned_hold_frames = uint32_t(std::clamp(g_rtao_skinned_hold, 0, 600));
-      game_device_data.rtao_capture.shadow_frame_meshes_enabled = g_rtdbg_shadow_openables;
-      game_device_data.rtao_tlas.shadow_mode = g_rtdbg_shadow_young_long ? 1u : 0u;
+      game_device_data.rtao_capture.shadow_frame_meshes_enabled = true;
       game_device_data.rtao_tlas.camera_only_non_opaque = g_rtsun_shadow_consult;
       // Textured windows toggled: the kept panes go (out of view ones would keep their old state), the next draws re-add them
       if (game_device_data.last_textured_windows != g_rtsun_textured_windows)
@@ -1061,8 +1056,6 @@ public:
          g_rtdiag.frame = 0;
          g_rtdiag.phase = 0;
          g_rtdiag.saved_freeze = g_rtao_freeze_scene;
-         g_rtdiag.saved_openables = g_rtdbg_shadow_openables;
-         g_rtdiag.saved_young_long = g_rtdbg_shadow_young_long;
          g_rtdiag.saved_near_only = g_rtao_shadow_near_only;
          g_rtdiag.combo = -1;
          g_rtdiag.pending_set = -1;
@@ -1221,8 +1214,6 @@ public:
       if (t >= kRTDiagMatrixSeconds + kRTDiagFrozenSeconds)
       {
          g_rtao_freeze_scene = g_rtdiag.saved_freeze;
-         g_rtdbg_shadow_openables = g_rtdiag.saved_openables;
-         g_rtdbg_shadow_young_long = g_rtdiag.saved_young_long;
          g_rtao_shadow_near_only = g_rtdiag.saved_near_only;
          g_rtdiag.active = false;
          g_draw_probe_active = false;
@@ -1459,7 +1450,7 @@ public:
             add("slice_draws=%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu\n", (unsigned long long)g_rtao_shadow_slice_draws[0].load(), (unsigned long long)g_rtao_shadow_slice_draws[1].load(),
                (unsigned long long)g_rtao_shadow_slice_draws[2].load(), (unsigned long long)g_rtao_shadow_slice_draws[3].load(), (unsigned long long)g_rtao_shadow_slice_draws[4].load(),
                (unsigned long long)g_rtao_shadow_slice_draws[5].load(), (unsigned long long)g_rtao_shadow_slice_draws[6].load(), (unsigned long long)g_rtao_shadow_slice_draws[7].load());
-            add("test_shadow_openables=%d\ntest_shadow_young_long=%d\ncombo=%d\nsettle=%d\n", int(g_rtdbg_shadow_openables), int(g_rtdbg_shadow_young_long), g_rtdiag.combo,
+            add("combo=%d\nsettle=%d\n", g_rtdiag.combo,
                int(std::chrono::duration<double>(now - g_rtdiag.switch_time).count() < kRTDiagSettle));
             // Per frame mesh probes: key, flags (1 from a shadow map, 2 skinned), vertex 0 world position
             for (const auto& probe : g.rtao_capture.GetProbes())
@@ -3107,7 +3098,7 @@ public:
       dsv->GetDesc(&dsv_desc);
       const uint32_t slice = flat ? kFlatShadowSlice : (dsv_desc.ViewDimension == D3D11_DSV_DIMENSION_TEXTURE2DARRAY ? dsv_desc.Texture2DArray.FirstArraySlice : 0);
       if (out_sun)
-         *out_sun = flat || g_rtao_shadow_atlas_casters || uintptr_t(resource.get()) == g_sun_shadow_array.load(std::memory_order_relaxed);
+         *out_sun = flat || uintptr_t(resource.get()) == g_sun_shadow_array.load(std::memory_order_relaxed);
       {
          D3D11_VIEWPORT viewport = {};
          UINT viewports = 1;
@@ -3813,8 +3804,8 @@ public:
 
    // H3 (wrong geometry with stable instance counts): the capture copies a game buffer into its arena once, at the first
    // draw that uses it. A DEFAULT buffer the game rewrites later (UpdateSubresource, a copy into it: streamed or pooled
-   // meshes) would leave stale geometry in the ray tracing scene. Counted always; with "RTAORecopyWrittenBuffers" the
-   // buffer is forgotten (its meshes' BLASes evicted) so the next draw copies it again.
+   // meshes) would leave stale geometry in the ray tracing scene. Counted always (the logs showed 0 such writes, so the
+   // re-copy test setting is gone; OnBufferWritten can still forget the buffer and evict its meshes' BLASes).
    static void OnRTAOBufferWritten(reshade::api::device* device, reshade::api::resource dest)
    {
       if (device->get_api() != reshade::api::device_api::d3d11 || dest.handle == 0 || !g_rtao_capture_active.load(std::memory_order_relaxed))
@@ -3826,7 +3817,7 @@ public:
          return;
       auto* device_data = device->get_private_data<DeviceData>();
       if (device_data && device_data->game)
-         GetGameDeviceData(*device_data).rtao_capture.OnBufferWritten(static_cast<ID3D11Buffer*>(native), g_rtao_recopy_written);
+         GetGameDeviceData(*device_data).rtao_capture.OnBufferWritten(static_cast<ID3D11Buffer*>(native), false); // Only counted ("RTAO diag")
    }
    static bool OnRTAOUpdateBuffer(reshade::api::device* device, const void*, reshade::api::resource dest, uint64_t, uint64_t)
    {
@@ -4175,12 +4166,10 @@ public:
       reshade::get_config_value(runtime, NAME, "RTAODynamic", g_rtao_dynamic);
       reshade::get_config_value(runtime, NAME, "RTAOShadowCasters", g_rtao_shadow_casters);
       reshade::get_config_value(runtime, NAME, "RTSunShadowCastersOnly", g_rtsun_casters_only);
-      reshade::get_config_value(runtime, NAME, "RTSunShadowMapCheck", g_rtsun_shadow_consult);
       reshade::get_config_value(runtime, NAME, "RTDiagAutoStartSeconds", g_rtdiag_auto_seconds);
       reshade::get_config_value(runtime, NAME, "RTDiagAutoLevelSeconds", g_rtdiag_auto_level_seconds);
       reshade::get_config_value(runtime, NAME, "RTAOShadowFlatTargets", g_rtao_shadow_flat);
       reshade::get_config_value(runtime, NAME, "RTAOShadowSkinned", g_rtao_shadow_skinned);
-      reshade::get_config_value(runtime, NAME, "RTAOShadowAtlasCasters", g_rtao_shadow_atlas_casters);
       reshade::get_config_value(runtime, NAME, "RTSunTexturedWindows", g_rtsun_textured_windows);
       reshade::get_config_value(runtime, NAME, "RTSunWindowPattern", g_rtsun_window_pattern);
       reshade::get_config_value(runtime, NAME, "RTSunWindowSharpness", g_rtsun_window_sharpness);
@@ -4195,7 +4184,6 @@ public:
          info.alpha_ref = 0.5f;
          info.alpha_ref_exact = true;
       }
-      reshade::get_config_value(runtime, NAME, "RTSunShadowMapTolerance", g_rtsun_shadow_tolerance);
       reshade::get_config_value(runtime, NAME, "RTAOShadowNearSlices", g_rtao_shadow_near_slices);
       reshade::get_config_value(runtime, NAME, "RTAOShadowNearOnly", g_rtao_shadow_near_only);
       reshade::get_config_value(runtime, NAME, "RTAOStrength", g_rtao_strength);
@@ -4222,7 +4210,6 @@ public:
       reshade::get_config_value(runtime, NAME, "RTAODedup", g_rtao_dedup);
       reshade::get_config_value(runtime, NAME, "RTAOSkinnedHoldFrames", g_rtao_skinned_hold);
       reshade::get_config_value(runtime, NAME, "RTAOBlasBudget", g_rtao_blas_budget);
-      reshade::get_config_value(runtime, NAME, "RTAORecopyWrittenBuffers", g_rtao_recopy_written);
       reshade::get_config_value(runtime, NAME, "RTAOCutoutsExact", g_rtao_cutouts_exact);
 
       auto& game_settings = cb_luma_global_settings.GameSettings;
@@ -4490,79 +4477,61 @@ public:
       }
       if (ImGui::IsItemHovered())
          ImGui::SetTooltip("What the trace writes. Check it with \"View AO only\" = RT sun visibility.");
-      // Debug (shared with RTAO's scene), next to the sun output where they are used
-      if (ImGui::Button(g_rtdiag.active ? "RT diagnostic capture: running..." : "RT diagnostic capture (24 s, Ctrl+Shift+Pause)") && !g_rtdiag.active)
-         g_rtdiag.start_requested = true;
-      if (ImGui::IsItemHovered())
-         ImGui::SetTooltip("Saves ~120 captures over 24 s into RTDiag\\<time> next to the game exe: 20 s with the current settings, then 4 s with the ray tracing scene frozen.\n"
-                           "Each has, from the same frame: the game's own shadow, the RT raw and denoised shadow, the scene view, depth and the final image.\n"
-                           "Stand where the problem shows and turn slowly (or hold still) while it runs.");
-      ImGui::SameLine();
-      ImGui::TextUnformatted(g_rtdiag.status.c_str());
-      if (ImGui::Checkbox("RT debug: re-copy buffers the game rewrites", &g_rtao_recopy_written))
-         reshade::set_config_value(runtime, NAME, "RTAORecopyWrittenBuffers", g_rtao_recopy_written);
-      if (ImGui::IsItemHovered())
-         ImGui::SetTooltip("Test: when the game writes into a vertex/index buffer the ray tracing scene already copied (streamed or pooled\nmeshes), forget the copy so the next draw copies the new contents. Off: the count is still logged (\"RTAO diag\").");
-      ImGui::Checkbox("RT test: openables from the shadow map", &g_rtdbg_shadow_openables);
-      if (ImGui::IsItemHovered())
-         ImGui::SetTooltip("Off: openable windows/doors only enter the ray tracing scene from the camera's draws (not saved).");
-      if (ImGui::Checkbox("RT sun: casters from the local light shadow atlas too", &g_rtao_shadow_atlas_casters))
-         reshade::set_config_value(runtime, NAME, "RTAOShadowAtlasCasters", g_rtao_shadow_atlas_casters);
-      if (ImGui::IsItemHovered())
-         ImGui::SetTooltip("Off (default): only what the game draws into its sun shadow maps blocks the sun. On: the old rule, also slices 0 and 1 of\n"
-            "the game's other shadow array (local lights' tiles, and a cache of its own). A test: if a missing roof shadow comes back with this on,\n"
-            "that array holds sun content too. Applies to shadow draws from now on.");
+
+      ImGui::SeparatorText("Sun Shadows: Windows");
       if (ImGui::Checkbox("RT sun: textured windows", &g_rtsun_textured_windows))
          reshade::set_config_value(runtime, NAME, "RTSunTexturedWindows", g_rtsun_textured_windows);
       if (ImGui::IsItemHovered())
          ImGui::SetTooltip("The game leaves window panes out of its sun shadows. On: a pane's own texture decides where sunlight passes\n(the lead of a leaded window blocks, the glass lets it through). Not the game's look: an addition.");
+      if (ImGui::SliderFloat("RT sun: window glass density", &g_rtsun_glass_density, 0.f, 1.f, "%.2f"))
+         reshade::set_config_value(runtime, NAME, "RTSunGlassDensity", g_rtsun_glass_density);
+      if (ImGui::IsItemHovered())
+         ImGui::SetTooltip("Patterns 8/9: how much the stained glass texture holds back the sunlight (0: clear glass, only the lead casts;\n1: darker panes let through as little as they look). Takes effect for windows seen after the change.");
       if (ImGui::SliderFloat("RT sun: window pattern sharpness", &g_rtsun_window_sharpness, 0.f, 1.f, "%.2f"))
          reshade::set_config_value(runtime, NAME, "RTSunWindowSharpness", g_rtsun_window_sharpness);
       if (ImGui::IsItemHovered())
          ImGui::SetTooltip("Thin lead lines are thinner than the sun's penumbra, so they only half shade the floor (physically right, but subtle).\n"
             "Above 0, one more hard ray toward the sun's center, against the windows only, darkens the lead lines by this much (stylised).");
-      if (ImGui::SliderFloat("RT sun: window glass density", &g_rtsun_glass_density, 0.f, 1.f, "%.2f"))
-         reshade::set_config_value(runtime, NAME, "RTSunGlassDensity", g_rtsun_glass_density);
-      if (ImGui::IsItemHovered())
-         ImGui::SetTooltip("Patterns 8/9: how much the stained glass texture holds back the sunlight (0: clear glass, only the lead casts;\n1: darker panes let through as little as they look). Takes effect for windows seen after the change.");
-      if (ImGui::SliderInt("RT sun: window pattern source", &g_rtsun_window_pattern, 4, 9))
-         reshade::set_config_value(runtime, NAME, "RTSunWindowPattern", g_rtsun_window_pattern);
-      if (ImGui::IsItemHovered())
-         ImGui::SetTooltip("8: lead (normal map) x stained glass (emissive texture), 9: lead x glass (diffuse texture), 4: lead only,\n5: one minus the one channel map, 6: the one channel map, 7: one minus the diffuse brightness. Takes effect for windows seen after the change.");
-      if (ImGui::Checkbox("RT sun: shadow map check", &g_rtsun_shadow_consult))
-         reshade::set_config_value(runtime, NAME, "RTSunShadowMapCheck", g_rtsun_shadow_consult);
-      if (ImGui::IsItemHovered())
-         ImGui::SetTooltip("An object the game never drew into its shadow map (window glass, fake light shafts) blocks the ray traced sun only\n"
-            "where the game's own shadow map has a surface (or a shadow) there. Objects drawn into the shadow map, characters\nand openable doors/windows always block.");
-      if (ImGui::SliderFloat("RT sun: shadow map check tolerance", &g_rtsun_shadow_tolerance, 0.f, 1.f, "%.2f"))
-         reshade::set_config_value(runtime, NAME, "RTSunShadowMapTolerance", g_rtsun_shadow_tolerance);
-      if (ImGui::IsItemHovered())
-         ImGui::SetTooltip("How far (world units, plus two shadow map texels) a hit may be behind the shadow map's surface and still count.");
-      if (ImGui::Checkbox("RT sun: only shadow casting objects block it", &g_rtsun_casters_only))
-         reshade::set_config_value(runtime, NAME, "RTSunShadowCastersOnly", g_rtsun_casters_only);
-      if (ImGui::IsItemHovered())
-         ImGui::SetTooltip("Objects the game draws for the camera but never into its shadow maps (window glass, fake light shafts) don't block\nthe ray traced sun, like the game's own shadows. They still occlude the AO.");
-      if (ImGui::Checkbox("RT: shadow map casters from near slices only", &g_rtao_shadow_near_only))
-         reshade::set_config_value(runtime, NAME, "RTAOShadowNearOnly", g_rtao_shadow_near_only);
-      if (ImGui::IsItemHovered())
-         ImGui::SetTooltip("The game draws simplified copies of buildings (no proper window openings) into its far shadow cascades.\nOn: only the near cascades' draws enter the ray tracing scene.");
-      if (ImGui::SliderInt("RT: near shadow slices", &g_rtao_shadow_near_slices, 1, 8))
-         g_rtao_shadow_near_slices = std::clamp(g_rtao_shadow_near_slices, 1, 8);
-      if (ImGui::IsItemDeactivatedAfterEdit())
-         reshade::set_config_value(runtime, NAME, "RTAOShadowNearSlices", g_rtao_shadow_near_slices);
-      ImGui::Checkbox("RT test: old shadow map retention", &g_rtdbg_shadow_young_long);
-      if (ImGui::IsItemHovered())
-         ImGui::SetTooltip("On: the previous rule (3 sightings to keep a shadow map object, else dropped after 4 frames) instead of keeping static ones until unloaded (not saved).");
-      ImGui::Checkbox("RT debug: freeze ray tracing scene", &g_rtao_freeze_scene);
-      if (ImGui::IsItemHovered())
-         ImGui::SetTooltip("Keeps tracing the current ray tracing scene (no new geometry, no removals) until unchecked. Not saved.\n"
-                           "If the RT shadows still change while frozen, the cause is in the trace or the denoiser, not in what is captured.");
-      if (ImGui::SliderInt("RT BLAS builds per frame", &g_rtao_blas_budget, 8, 1024))
-         g_rtao_blas_budget = std::clamp(g_rtao_blas_budget, 8, 1024);
-      if (ImGui::IsItemDeactivatedAfterEdit())
-         reshade::set_config_value(runtime, NAME, "RTAOBlasBudget", g_rtao_blas_budget);
-      if (ImGui::IsItemHovered())
-         ImGui::SetTooltip("New meshes built for ray tracing per frame. A mesh waiting for its build is missing from the scene (late casters).");
+
+      // Debug and tuning (shared with RTAO's scene), collapsed
+      if (ImGui::TreeNode("RT debug"))
+      {
+         if (ImGui::Button(g_rtdiag.active ? "RT diagnostic capture: running..." : "RT diagnostic capture (24 s, Ctrl+Shift+Pause)") && !g_rtdiag.active)
+            g_rtdiag.start_requested = true;
+         if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("Saves ~120 captures over 24 s into RTDiag\\<time> next to the game exe: 20 s with the current settings, then 4 s with the ray tracing scene frozen.\n"
+                              "Each has, from the same frame: the game's own shadow, the RT raw and denoised shadow, the scene view, depth and the final image.\n"
+                              "Stand where the problem shows and turn slowly (or hold still) while it runs.");
+         ImGui::SameLine();
+         ImGui::TextUnformatted(g_rtdiag.status.c_str());
+         ImGui::Checkbox("RT debug: freeze ray tracing scene", &g_rtao_freeze_scene);
+         if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("Keeps tracing the current ray tracing scene (no new geometry, no removals) until unchecked. Not saved.\n"
+                              "If the RT shadows still change while frozen, the cause is in the trace or the denoiser, not in what is captured.");
+         if (ImGui::Checkbox("RT sun: only shadow casting objects block it", &g_rtsun_casters_only))
+            reshade::set_config_value(runtime, NAME, "RTSunShadowCastersOnly", g_rtsun_casters_only);
+         if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("Objects the game draws for the camera but never into its shadow maps (window glass, fake light shafts) don't block\nthe ray traced sun, like the game's own shadows. They still occlude the AO.");
+         if (ImGui::Checkbox("RT: shadow map casters from near slices only", &g_rtao_shadow_near_only))
+            reshade::set_config_value(runtime, NAME, "RTAOShadowNearOnly", g_rtao_shadow_near_only);
+         if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("The game draws simplified copies of buildings (no proper window openings) into its far shadow cascades.\nOn: only the near cascades' draws enter the ray tracing scene.");
+         if (ImGui::SliderInt("RT: near shadow slices", &g_rtao_shadow_near_slices, 1, 8))
+            g_rtao_shadow_near_slices = std::clamp(g_rtao_shadow_near_slices, 1, 8);
+         if (ImGui::IsItemDeactivatedAfterEdit())
+            reshade::set_config_value(runtime, NAME, "RTAOShadowNearSlices", g_rtao_shadow_near_slices);
+         if (ImGui::SliderInt("RT BLAS builds per frame", &g_rtao_blas_budget, 8, 1024))
+            g_rtao_blas_budget = std::clamp(g_rtao_blas_budget, 8, 1024);
+         if (ImGui::IsItemDeactivatedAfterEdit())
+            reshade::set_config_value(runtime, NAME, "RTAOBlasBudget", g_rtao_blas_budget);
+         if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("New meshes built for ray tracing per frame. A mesh waiting for its build is missing from the scene (late casters).");
+         if (ImGui::SliderInt("RT sun: window pattern source", &g_rtsun_window_pattern, 4, 9))
+            reshade::set_config_value(runtime, NAME, "RTSunWindowPattern", g_rtsun_window_pattern);
+         if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("8: lead (normal map) x stained glass (emissive texture), 9: lead x glass (diffuse texture), 4: lead only,\n5: one minus the one channel map, 6: the one channel map, 7: one minus the diffuse brightness. Takes effect for windows seen after the change.");
+         ImGui::TreePop();
+      }
 
       auto& game_device_data = GetGameDeviceData(device_data);
       std::string status;

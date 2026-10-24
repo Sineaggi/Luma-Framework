@@ -474,7 +474,7 @@ aged out by the retention meant for the main view (2 frames young, then 180). Ch
   by source, new and evicted instances, moving copies, MVP rekeys, and how often the shared camera copy was from
   another frame or differed.
 
-### Shadow map check (config `RTSunShadowMapCheck`, default on)
+### Shadow map check (formerly config `RTSunShadowMapCheck`; removed from the settings, superseded by casters only)
 
 The "casters only" rule (an object blocks the sun only if a shadow map draw of its mesh was captured) removed real
 casters: window trim drawn by passes whose mesh keys differ from its shadow map copies stayed camera only. It is off by

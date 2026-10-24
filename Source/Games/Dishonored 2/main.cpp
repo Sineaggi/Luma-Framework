@@ -3270,7 +3270,7 @@ public:
                {
                   char name[96];
                   snprintf(name, sizeof(name), "tex_%08X_t%u_%llX", ps_hash, slot, (unsigned long long)uintptr_t(res.get()));
-                  g_tex_dump_queue.emplace_back(name, com_ptr<ID3D11ShaderResourceView>(srvs[slot], true));
+                  g_tex_dump_queue.emplace_back(name, com_ptr<ID3D11ShaderResourceView>(srvs[slot]) /* AddRefs; the PSGetShaderResources reference is released below */);
                }
             }
             srvs[slot]->Release();

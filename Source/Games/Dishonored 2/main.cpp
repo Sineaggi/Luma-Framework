@@ -336,7 +336,7 @@ namespace
       std::vector<std::string> timeline;
       uint32_t last_bound = 0, last_stale = 0;
       uint64_t last_slices[8] = {};
-      RTDiagStage stages[7] = {
+      RTDiagStage stages[8] = {
          { "game_shadow", RTDiag::Kind::Gray, 1 }, // The game's own screen shadow (y of its target)
          { "rt_raw", RTDiag::Kind::Gray, 0 },
          { "rt_denoised", RTDiag::Kind::Gray, 0 }, // What the lighting reads
@@ -344,6 +344,7 @@ namespace
          { "depth", RTDiag::Kind::DepthPacked, 0 },
          { "final", RTDiag::Kind::Color, 0 },
          { "scene_sun", RTDiag::Kind::Rgb565, 0 }, // The ray tracing scene seen from the sun (60 m around the camera)
+         { "blocker", RTDiag::Kind::Id16, 0 }, // TLAS index + 1 of the first thing a hard sun ray hits (cNNNN_tlas.csv)
       };
       std::string status = "idle";
    };
@@ -982,7 +983,12 @@ public:
             {
                const std::string file = base + "_" + out.name;
                const RTDiag::Image& im = out.image;
-               if (im.channels == 0)
+               if (!im.u16.empty())
+               {
+                  std::ofstream(file + ".bin", std::ios::binary).write(reinterpret_cast<const char*>(im.u16.data()), im.u16.size() * sizeof(uint16_t));
+                  stbi_write_png((file + ".png").c_str(), int(im.width), int(im.height), 1, im.u8.data(), int(im.width));
+               }
+               else if (im.channels == 0)
                {
                   std::ofstream(file + ".bin", std::ios::binary).write(reinterpret_cast<const char*>(im.f32.data()), im.f32.size() * sizeof(float));
                   // Viewable: reversed Z device depth, sqrt for contrast
@@ -1048,7 +1054,7 @@ public:
       {
          g_rtdiag.next = now + std::chrono::milliseconds(int(kRTDiagInterval * 1000.0));
          const int set = int(g_rtdiag.index & 1);
-         com_ptr<ID3D11Resource> sources[7];
+         com_ptr<ID3D11Resource> sources[8];
          {
             const std::lock_guard lock(g_rtdiag.mutex);
             // Drawn this frame (rtao_frame has already advanced at present)
@@ -1059,6 +1065,7 @@ public:
          sources[2] = com_ptr<ID3D11Resource>(RTDiagResource(g.rtsun_pass.GetSRV()), true);
          sources[3] = com_ptr<ID3D11Resource>(RTDiagResource(g.rtsun_pass.GetDebugSRV(1)), true);
          sources[6] = com_ptr<ID3D11Resource>(RTDiagResource(g.rtsun_pass.GetDebugSRV(2)), true);
+         sources[7] = com_ptr<ID3D11Resource>(RTDiagResource(g.rtsun_pass.GetDebugSRV(3)), true);
          if (g.rtao.IsInitialized())
             sources[4] = com_ptr<ID3D11Resource>(RTDiagResource(g.rtao.GetDepthRTV()), true);
          {
@@ -1072,7 +1079,7 @@ public:
             }
          }
          int copied = 0;
-         for (int s = 0; s < 7; s++)
+         for (int s = 0; s < 8; s++)
          {
             RTDiagStage& stage = g_rtdiag.stages[s];
             if (!sources[s])
@@ -1137,7 +1144,7 @@ public:
             {
                std::string csv = "blas_key,sources,min_slice,x,y,z,index_count,vertex_count,first_frame,last_frame,seen_frames\n";
                char row[192];
-               for (const auto& i : g.rtao_tlas.Snapshot())
+               for (const auto& i : g.rtao_tlas.LastBuildOrder()) // In TLAS index order: row r = blocker id r + 1
                {
                   uint32_t indices = 0, vertices = 0;
                   g.rtao_capture.GetMeshSize(i.blas_key, indices, vertices);
@@ -1145,7 +1152,7 @@ public:
                   csv += row;
                }
                char name[32];
-               snprintf(name, sizeof(name), "c%04u_instances.csv", g_rtdiag.index);
+               snprintf(name, sizeof(name), "c%04u_tlas.csv", g_rtdiag.index);
                const std::string path = (std::filesystem::path(g_rtdiag.dir) / name).string();
                std::thread([csv = std::move(csv), path]() { std::ofstream(path) << csv; }).detach();
             }
@@ -3623,7 +3630,7 @@ public:
       if (ImGui::IsItemHovered())
          ImGui::SetTooltip("Rays per pixel per frame (in the penumbra the denoiser averages them over frames).");
       static const char* rtsun_output_names[int(RTSun::Output::Count)] = { "Denoised", "Raw (no denoiser)", "Geometric N.L (no rays, debug)", "Denoiser history (debug)", "Raw hard (no denoiser, no penumbra)",
-         "Scene view: from the camera (debug)", "Scene view: from the sun (debug)" };
+         "Scene view: from the camera (debug)", "Scene view: from the sun (debug)", "Blocker ids (debug)" };
       if (ImGui::Combo("RT Sun Output", &g_rtsun_output, rtsun_output_names, int(RTSun::Output::Count)))
       {
          g_rtsun_output = std::clamp(g_rtsun_output, 0, int(RTSun::Output::Count) - 1);

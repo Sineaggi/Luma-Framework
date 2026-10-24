@@ -37,6 +37,9 @@ struct Capture
    std::vector<float> depth;
    std::map<std::string, std::vector<uint8_t>> gray; // game_shadow, rt_raw, rt_denoised
    std::vector<uint8_t> scene, final_image, scene_sun; // RGB
+   std::vector<uint16_t> blocker; // TLAS index + 1 of the first hit of a hard sun ray, 0 lit
+   struct TlasRow { std::string key; int sources = 0, min_slice = 255; double pos[3] = {}; int indices = 0, vertices = 0; };
+   std::vector<TlasRow> tlas; // cNNNN_tlas.csv, row r = blocker id r + 1
    struct Probe { uint32_t key, flags; double pos[3]; };
    std::vector<Probe> probes;
 };
@@ -148,6 +151,28 @@ static bool Load(const fs::path& dir, int index, Capture& c)
    std::vector<uint8_t> s = ReadBytes(dir / (std::string(name) + "_scene.bin"));
    if (s.size() == n * 3)
       c.scene = std::move(s);
+   std::vector<uint8_t> bl = ReadBytes(dir / (std::string(name) + "_blocker.bin"));
+   if (bl.size() == n * 2)
+   {
+      c.blocker.resize(n);
+      std::memcpy(c.blocker.data(), bl.data(), bl.size());
+   }
+   {
+      std::ifstream tl(dir / (std::string(name) + "_tlas.csv"));
+      std::string row;
+      std::getline(tl, row); // header
+      while (std::getline(tl, row))
+      {
+         Capture::TlasRow t;
+         char key[32] = {};
+         unsigned first = 0, last = 0, seen = 0;
+         if (sscanf(row.c_str(), "%31[^,],%d,%d,%lf,%lf,%lf,%d,%d,%u,%u,%u", key, &t.sources, &t.min_slice, &t.pos[0], &t.pos[1], &t.pos[2], &t.indices, &t.vertices, &first, &last, &seen) >= 8)
+         {
+            t.key = key;
+            c.tlas.push_back(t);
+         }
+      }
+   }
    std::vector<uint8_t> ss = ReadBytes(dir / (std::string(name) + "_scene_sun.bin"));
    if (ss.size() == n * 3)
       c.scene_sun = std::move(ss);
@@ -419,6 +444,57 @@ int main(int argc, char** argv)
       if (recall < 0.8 || false_light > 0.05)
          printf("  c%04d t=%5.1fs phase %d combo %d%s: recall %.3f, false light %.3f | lit pixels' median view depth %.2f m, cascade 0 ends at %.2f m\n", c.index,
             std::stod(c.meta.count("t_ms") ? c.meta.at("t_ms") : std::string("0")) / 1000.0, c.phase, c.combo, c.settle ? " (settle)" : "", recall, false_light, median_z, fars[0]);
+   }
+   // Blockers: where the game's own shadow is lit but the RT shadow is dark, what a hard sun ray hits first
+   {
+      struct Blocker { int pixels = 0, captures = 0; Capture::TlasRow row; int last_capture = -1; };
+      std::map<std::string, Blocker> blockers; // By mesh key + rounded position
+      int wrong_pixels = 0, unexplained = 0, facing_away = 0;
+      for (const Capture& c : captures)
+      {
+         auto g = c.gray.find("game_shadow"), r = c.gray.find("rt_denoised");
+         if (g == c.gray.end() || r == c.gray.end() || c.blocker.empty() || c.tlas.empty())
+            continue;
+         for (size_t i = 0; i < c.blocker.size(); i++)
+         {
+            if (!(g->second[i] > 127 && r->second[i] <= 127))
+               continue;
+            wrong_pixels++;
+            const uint16_t id = c.blocker[i];
+            if (id == 65534)
+            {
+               facing_away++;
+               continue;
+            }
+            if (id == 0 || id > c.tlas.size())
+            {
+               unexplained++;
+               continue;
+            }
+            const Capture::TlasRow& t = c.tlas[id - 1];
+            char k[96];
+            snprintf(k, sizeof(k), "%s@%.1f,%.1f,%.1f", t.key.c_str(), t.pos[0], t.pos[1], t.pos[2]);
+            Blocker& b = blockers[k];
+            b.pixels++;
+            b.row = t;
+            if (b.last_capture != c.index)
+            {
+               b.captures++;
+               b.last_capture = c.index;
+            }
+         }
+      }
+      std::vector<std::pair<std::string, Blocker>> sorted(blockers.begin(), blockers.end());
+      std::sort(sorted.begin(), sorted.end(), [](const auto& a, const auto& b) { return a.second.pixels > b.second.pixels; });
+      printf("\nblockers of the game's lit pixels that RT darkens: %d pixels, %d with no hard ray hit (penumbra/denoiser), %d facing away from the sun (depth normal)\n", wrong_pixels, unexplained, facing_away);
+      for (size_t k = 0; k < sorted.size() && k < 15; k++)
+      {
+         const auto& b = sorted[k].second;
+         const int s = b.row.sources;
+         std::string src = std::string((s & 4) ? "per-frame mesh" : "") + ((s & 1) ? " camera" : "") + ((s & 2) ? " shadow-map" : "") + ((s & 8) ? " (MVP)" : "") + ((s & 16) ? " skinned" : "");
+         printf("  %6d px in %3d captures: mesh %s, %s, lowest slice %s, %d indices / %d vertices, at %.2f %.2f %.2f\n", b.pixels, b.captures, b.row.key.c_str(), src.c_str(),
+            b.row.min_slice == 255 ? "-" : std::to_string(b.row.min_slice).c_str(), b.row.indices, b.row.vertices, b.row.pos[0], b.row.pos[1], b.row.pos[2]);
+      }
    }
    const char* combo_names[4] = { "default (near slices only, static shadow world kept)", "near slices only, OLD retention", "ALL slices, OLD retention", "(unused)" };
    printf("\nper combo (pairs within a block, settling captures skipped): mean %% of compared pixels flipping\n");

@@ -462,7 +462,7 @@ namespace RTAO
       s.added_new = added_new;
       added_new = 0;
       if (drop_shadow_request.exchange(false))
-         std::erase_if(instances, [](const auto& pair) { return (pair.second.sources & (kInstanceSourceMain | kInstanceSourceShadow)) == kInstanceSourceShadow; });
+         std::erase_if(instances, [](const auto& pair) { return (pair.second.sources & kInstanceSourceShadow) != 0; }); // Also those the main view saw: their slice history goes too
       const bool batch = added_new_shadow >= kShadowBatch; // The last readback brought a shadow map redraw of the world
       added_new_shadow = 0;
       if (batch)
@@ -659,6 +659,7 @@ namespace RTAO
          const std::lock_guard lock(mutex);
          descs.clear();
          descs.reserve(instances.size() + frame_instances.size());
+         last_build_order.clear();
          for (auto it = instances.begin(); it != instances.end();)
          {
             auto& pair = *it;
@@ -695,11 +696,14 @@ namespace RTAO
             desc.AccelerationStructure = blas;
             desc.InstanceContributionToHitGroupIndex = pair.second.sources; // Debug scene view only (inline ray queries have no hit groups)
             descs.push_back(desc);
+            const Instance& i = pair.second;
+            last_build_order.push_back({ i.blas_key, i.sources, i.min_slice, { i.transform[0][3], i.transform[1][3], i.transform[2][3] }, i.first_frame, i.last_frame, i.seen_frames });
          }
          for (D3D12_RAYTRACING_INSTANCE_DESC desc : frame_instances)
          {
             desc.InstanceID = uint32_t(descs.size()) & 0xFFFFFF;
             descs.push_back(desc);
+            last_build_order.push_back({ 0, uint8_t(desc.InstanceContributionToHitGroupIndex), 0xFF, { desc.Transform[0][3], desc.Transform[1][3], desc.Transform[2][3] }, 0, 0, 0 });
          }
       }
 

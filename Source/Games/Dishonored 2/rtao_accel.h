@@ -249,6 +249,9 @@ namespace RTAO
          uint32_t first_frame, last_frame, seen_frames;
       };
       std::vector<InstanceInfo> Snapshot();
+      // The last Build's instances in TLAS index order (CommittedInstanceIndex): retained ones, then the frame instances
+      // (sources = their source | kInstanceFlagFrameMesh, no BLAS key / position)
+      std::vector<InstanceInfo> LastBuildOrder() { const std::lock_guard lock(mutex); return last_build_order; }
       RetentionStats GetRetentionStats();
       void RemoveInstance(uint64_t instance_key);
       size_t RetainedCount();
@@ -269,7 +272,7 @@ namespace RTAO
       uint32_t young_retain_frames = kYoungRetainFrames;
       uint32_t shadow_young_retain_frames = kShadowYoungRetainFrames; // Old rule only
       uint32_t shadow_mode = 0; // 0: static world until unloaded, moving copies dropped; 1: the old rule (test toggle)
-      std::atomic<bool> drop_shadow_request = false; // Next BeginFrame drops every instance seen only in shadow maps
+      std::atomic<bool> drop_shadow_request = false; // Next BeginFrame drops every instance a shadow map draw touched (the main view re-adds what it sees)
 
    private:
       struct Instance
@@ -289,6 +292,7 @@ namespace RTAO
          bool batch; // Arrived in a shadow map redraw batch (never taken for a move)
       };
       uint32_t added_new_shadow = 0;
+      std::vector<InstanceInfo> last_build_order;
       std::vector<uint64_t> batch_candidates; // Shadow map instances created since the last BeginFrame
       RetentionStats retention_stats;
       uint32_t added_new = 0;

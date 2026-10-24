@@ -299,6 +299,24 @@ static void TestSunShadows(ID3D11Device* device, ID3D11DeviceContext* context, R
       }
       printf("RT diag outputs: raw matches the Raw output on %d of %u pixels, scene view on %d of %u\n", raw_same, W * H, scene_same, W * H);
       CHECK(raw_same == int(W * H) && scene_same == int(W * H), "diagnostic outputs must equal the corresponding outputs");
+      // Blocker ids (hard ray): an id exactly where the hard visibility is dark, and it names a box (TLAS index < instances)
+      ID3D11ShaderResourceView* blocker_srv = sun.GetDebugSRV(3);
+      CHECK(blocker_srv, "blocker output created");
+      const std::vector<float> blocker = ReadAO(device, context, blocker_srv, dw, dh);
+      blocker_srv->Release();
+      int agree = 0, ids_valid = 0, blocked = 0;
+      for (UINT i = 0; i < W * H; i++)
+      {
+         const uint32_t id = uint32_t(std::lround(blocker[i] * 65535.f));
+         agree += (id != 0) == (out_raw[i] < 0.5f) ? 1 : 0;
+         if (id)
+         {
+            blocked++;
+            ids_valid += (id <= instances || id == 65534) ? 1 : 0; // A box, or facing away from the light
+         }
+      }
+      printf("RT diag blocker ids: %d of %u pixels agree with the hard visibility, %d blocked, ids valid %d\n", agree, W * H, blocked, ids_valid);
+      CHECK(blocked > 500 && ids_valid == blocked && agree >= int(W * H) * 99 / 100, "blocker ids must match the hard shadow");
       settings.debug_outputs = false;
       sun.SetDebugOutputs(false);
    }

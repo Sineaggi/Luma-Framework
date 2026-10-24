@@ -110,6 +110,7 @@ namespace RTDiag
       DepthPacked, // RGBA8 holding the 4 bytes of a float (RTAO's packed depth copy), f32
       DepthFloat, // Channel 0 as is, f32
       Color, // RGB, scRGB (linear, 1 = 80 nits) when "scrgb", else already display encoded, u8 RGB sRGB
+      Id16, // R16_UNORM holding an id: written as u16 (.bin), the png shows id != 0 as white
    };
 
    struct Image
@@ -117,6 +118,7 @@ namespace RTDiag
       uint32_t width = 0, height = 0, channels = 0; // channels: 1 gray, 3 rgb, 0 float
       std::vector<uint8_t> u8;
       std::vector<float> f32;
+      std::vector<uint16_t> u16; // Id16
    };
 
    inline float LinearToSrgb(float v)
@@ -134,6 +136,23 @@ namespace RTDiag
          return image;
       image.width = width / kDownsample;
       image.height = height / kDownsample;
+      if (kind == Kind::Id16)
+      {
+         if (format != DXGI_FORMAT_R16_UNORM && format != DXGI_FORMAT_R16_TYPELESS)
+            return Image();
+         image.channels = 1;
+         image.u16.resize(size_t(image.width) * image.height);
+         image.u8.resize(image.u16.size());
+         for (uint32_t y = 0; y < image.height; y++)
+            for (uint32_t x = 0; x < image.width; x++)
+            {
+               uint16_t id;
+               std::memcpy(&id, static_cast<const uint8_t*>(mapped.pData) + size_t(y * kDownsample + kDownsample / 2) * mapped.RowPitch + size_t(x * kDownsample + kDownsample / 2) * 2, 2);
+               image.u16[size_t(y) * image.width + x] = id;
+               image.u8[size_t(y) * image.width + x] = id ? 255 : 0;
+            }
+         return image;
+      }
       const bool float_out = kind == Kind::DepthPacked || kind == Kind::DepthFloat;
       const bool rgb_out = kind == Kind::Rgb565 || kind == Kind::Color;
       image.channels = float_out ? 0 : (rgb_out ? 3 : 1);

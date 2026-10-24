@@ -350,13 +350,12 @@ void main(uint3 id : SV_DispatchThreadID)
         VisRaw[px] = saturate(n_dot_l);
         return;
     }
-    // Facing away from the light (geometric normal): in its own shadow, like the shadow map says. A small tolerance
-    // keeps grazing surfaces, whose reconstructed normal is noisy, on the traced path.
+    // Facing away from the light (geometric normal): traced from just behind the surface, which is what the game's
+    // shadow map does (it compares depths, not facing). A solid's back face starts inside it and the ray hits its far
+    // side (no culling): shadowed. A thin sheet (curtains, cloth, paper) has nothing behind it: lit when nothing else
+    // is in the way, like the game, which lights such sheets from behind.
     if (n_dot_l < -0.05)
-    {
-        VisRaw[px] = (DebugMode == kDebugBlocker || DebugMode == kDebugBlockerAll) ? 65534.0 / 65535.0 : 0.0; // Facing away (blocker id 65534)
-        return;
-    }
+        n = -n;
 
     if (DebugMode == kDebugBlocker || DebugMode == kDebugBlockerAll)
     {

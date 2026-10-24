@@ -468,6 +468,41 @@ static void TestSunShadows(ID3D11Device* device, ID3D11DeviceContext* context, R
    printf("RT sun hard (%u TLAS instances): %d receiver pixels compared, %d in shadow, %d mismatched (%.3f %%)\n", instances, compared, shadowed, mismatched, compared ? 100.0 * mismatched / compared : 0.0);
    CHECK(compared > 10000 && shadowed > 500, "the scene must have lit and shadowed receivers (%d, %d)", compared, shadowed);
    CHECK(mismatched <= compared / 500, "hard RT sun shadow must match the analytic shadow (%d of %d differ)", mismatched, compared);
+   // Box sides facing away from the sun are traced from just behind the surface (thin sheets like curtains get lit from
+   // behind, like the game's shadow map): a solid's back face starts inside it, its far side blocks, so it stays dark
+   {
+      auto away_side = [&](UINT i) {
+         const int b = hit_id[i];
+         if (b <= 0)
+            return false;
+         const Box& box = kBoxes[b];
+         const V3 p = hit_pos[i];
+         const float e = 1e-3f;
+         float nx = 0.f, nz = 0.f;
+         if (p.x <= box.min.x + e) nx = -1.f; else if (p.x >= box.max.x - e) nx = 1.f;
+         else if (p.z <= box.min.z + e) nz = -1.f; else if (p.z >= box.max.z - e) nz = 1.f;
+         else return false; // Top or bottom
+         return nx * L.x + nz * L.z < -0.2f;
+      };
+      int sides = 0, lit_sides = 0;
+      for (UINT y = 2; y + 2 < H; y++)
+         for (UINT x = 2; x + 2 < W; x++)
+         {
+            const UINT i = y * W + x;
+            if (!away_side(i))
+               continue;
+            bool edge = false;
+            for (int dy = -2; dy <= 2; dy++)
+               for (int dx = -2; dx <= 2; dx++)
+                  edge = edge || !away_side((y + dy) * W + (x + dx));
+            if (edge)
+               continue;
+            sides++;
+            lit_sides += hard[i] > 0.5f ? 1 : 0;
+         }
+      printf("RT sun: box sides facing away from the sun: %d pixels, %d lit\n", sides, lit_sides);
+      CHECK(sides > 200 && lit_sides == 0, "solid back faces must stay in their own shadow (%d of %d lit)", lit_sides, sides);
+   }
 
    // 1b) Debug scene view from the camera: geometry pixels show the "main view only" color (green, RGB565 in the 16 bits),
    // sky pixels the "nothing" grey

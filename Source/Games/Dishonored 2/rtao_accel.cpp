@@ -285,7 +285,7 @@ namespace RTAO
       return true;
    }
 
-   D3D12_GPU_VIRTUAL_ADDRESS DynamicBlasSet::Update(const BuildContext& ctx, uint64_t key, const GpuMesh& mesh, bool& refit, std::string& error)
+   D3D12_GPU_VIRTUAL_ADDRESS DynamicBlasSet::Update(const BuildContext& ctx, uint64_t key, const GpuMesh& mesh, bool& refit, std::string& error, bool retain, uint8_t source)
    {
       refit = false;
       if (!mesh.vertices || mesh.vertex_count < 3 || (mesh.indices && mesh.index_count < 3))
@@ -384,6 +384,8 @@ namespace RTAO
          it->second.refits = 0;
       }
       it->second.last_frame = frame;
+      it->second.retain = retain;
+      it->second.source = source;
       build.Inputs = inputs;
       build.DestAccelerationStructureData = it->second.result->GetGPUVirtualAddress();
       build.ScratchAccelerationStructureData = scratch_address;
@@ -399,9 +401,24 @@ namespace RTAO
          UavBarrier(ctx.list, nullptr);
          barrier_owed = false;
       }
+      // Retained entries beyond kMaxRetained: the oldest go first
+      std::vector<std::pair<uint32_t, uint64_t>> retained;
+      for (const auto& pair : entries)
+         if (pair.second.retain && pair.second.last_frame != frame)
+            retained.emplace_back(pair.second.last_frame, pair.first);
+      uint32_t retain_cutoff = 0;
+      if (retained.size() > kMaxRetained)
+      {
+         std::nth_element(retained.begin(), retained.begin() + (retained.size() - kMaxRetained), retained.end());
+         retain_cutoff = retained[retained.size() - kMaxRetained].first;
+      }
+      retained_count = 0;
       for (auto it = entries.begin(); it != entries.end();)
       {
-         if (frame - it->second.last_frame > kEvictFrames)
+         const Entry& e = it->second;
+         const bool expired = e.retain ? (frame - e.last_frame > kRetainFrames || (e.last_frame != frame && e.last_frame < retain_cutoff)) : frame - e.last_frame > kEvictFrames;
+         retained_count += (!expired && e.retain && e.last_frame != frame) ? 1 : 0;
+         if (expired)
          {
             result_bytes -= it->second.bytes;
             Release(it->second.result, ctx.retirer, ctx.submit_fence_value);

@@ -1592,6 +1592,7 @@ static void TestFrameMeshes(ID3D11Device* device, ID3D11DeviceContext* context, 
 
    uint32_t tlas_count = 0;
    bool repeat_draws = false; // Draws two of the per frame meshes a second time (another pass): skipped as duplicates
+   bool skip_dynamic = false, skip_skinned_a = false; // The game doesn't draw them this frame
    auto run_frame = [&](int pose, uint32_t debug_mode) {
       // The pose: bones (DEFAULT buffer) and the dynamic vertices (Map discard), as the game would update them
       palette = make_palette(pose);
@@ -1612,10 +1613,12 @@ static void TestFrameMeshes(ID3D11Device* device, ID3D11DeviceContext* context, 
       context->UpdateSubresource(depth_texture, 0, nullptr, refs[pose].depth.data(), W * 4, 0);
 
       CHECK(capture.CaptureDraw(context, draw_ground), "capture (ground)");
-      CHECK(capture.CaptureDraw(context, draw1), "capture (skinned, direct instance buffer)");
+      if (!skip_skinned_a)
+         CHECK(capture.CaptureDraw(context, draw1), "capture (skinned, direct instance buffer)");
       CHECK(capture.CaptureDraw(context, draw_view_model), "capture (skinned view model: dispatched, writes inactive triangles)");
       CHECK(!capture.CaptureDraw(context, draw_instanced), "an instanced skinned draw must be skipped");
-      CHECK(capture.CaptureDraw(context, draw_dynamic), "capture (dynamic vertex buffer)");
+      if (!skip_dynamic)
+         CHECK(capture.CaptureDraw(context, draw_dynamic), "capture (dynamic vertex buffer)");
       CHECK(capture.CaptureDraw(deferred, draw2), "capture (skinned, MVP only, deferred)");
       if (repeat_draws)
       {
@@ -1740,6 +1743,24 @@ static void TestFrameMeshes(ID3D11Device* device, ID3D11DeviceContext* context, 
          (unsigned long long)after.frame_draws, tlas_count);
       CHECK(after.dedup_frame_meshes - before.dedup_frame_meshes == 2, "the 2 repeated per frame draws must be skipped");
       CHECK(after.skinned_captured - before.skinned_captured == 3 && after.frame_draws == 4 && tlas_count == 5, "no duplicate per frame BLAS");
+   }
+
+   // Frames the game doesn't draw a movable object (dynamic vertex buffer, e.g. an openable window out of view): it
+   // stays in its last pose; a skinned character not drawn is gone at once (it moves)
+   {
+      skip_dynamic = true;
+      skip_skinned_a = true;
+      std::vector<float> ao;
+      for (int i = 0; i < 3; i++)
+         ao = run_frame(0, 0);
+      skip_dynamic = false;
+      skip_skinned_a = false;
+      int count = 0;
+      const float near_e_kept = average(ao, near_box(kE), count);
+      const RTAO::CaptureStats kept = capture.GetStats();
+      printf("frame meshes not drawn for 3 frames: dynamic E kept (AO next to it %.3f), retained %llu, TLAS %u\n", near_e_kept, (unsigned long long)kept.frame_retained, tlas_count);
+      CHECK(count > 5 && near_e_kept < 0.8f, "a movable object not drawn must keep occluding in its last pose (%.3f)", near_e_kept);
+      CHECK(kept.frame_retained == 1 && tlas_count == 4, "TLAS: ground + view model + C + retained E, skinned A gone (retained %llu, TLAS %u)", (unsigned long long)kept.frame_retained, tlas_count);
    }
 
    CHECK(interop.WaitForIdle(5000), "WaitForIdle");

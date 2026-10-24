@@ -255,6 +255,7 @@ namespace RTAO
       uint64_t frame_draws = 0, frame_vertices = 0; // Built into the last frame's TLAS
       uint64_t frame_blas_builds = 0, frame_blas_refits = 0, frame_blas_failed = 0;
       uint64_t frame_blas_count = 0, frame_blas_bytes = 0;
+      uint64_t frame_retained = 0; // Movable objects kept in their last pose (not drawn in the last frame)
       uint64_t draws_seen = 0, draws_captured = 0, instances_captured = 0;
       uint64_t skipped[8] = {}; // By CaptureSkip
       uint64_t meshes = 0, meshes_ready = 0, buffers_copied = 0, arena_vertex_bytes = 0, arena_index_bytes = 0;

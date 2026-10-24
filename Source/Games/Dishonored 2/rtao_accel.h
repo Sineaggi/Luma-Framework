@@ -123,13 +123,27 @@ namespace RTAO
    public:
       static constexpr uint32_t kMaxRefits = 30;
       static constexpr uint32_t kEvictFrames = 2;
+      // Entries updated with "retain" (movable objects with a DYNAMIC vertex buffer: openable windows, doors) are kept
+      // this long after their last draw, with their last pose (ForEachRetained), instead of vanishing on the frames the
+      // game doesn't draw them (out of the view and of the shadow cascades). At most kMaxRetained, oldest evicted first.
+      static constexpr uint32_t kRetainFrames = 600;
+      static constexpr size_t kMaxRetained = 512;
 
       ~DynamicBlasSet() { Clear(nullptr, 0); }
 
       void BeginFrame();
       // Records a build or refit into ctx.list (the vertices/indices must be readable by the build). Returns the BLAS
       // address, 0 on failure. Call EndFrame() after the frame's updates, before the TLAS build.
-      D3D12_GPU_VIRTUAL_ADDRESS Update(const BuildContext& ctx, uint64_t key, const GpuMesh& mesh, bool& refit, std::string& error);
+      D3D12_GPU_VIRTUAL_ADDRESS Update(const BuildContext& ctx, uint64_t key, const GpuMesh& mesh, bool& refit, std::string& error, bool retain = false, uint8_t source = 0);
+      // Retained entries not updated this frame (call after EndFrame): fn(blas address, source)
+      template <class F>
+      void ForEachRetained(F&& fn) const
+      {
+         for (const auto& pair : entries)
+            if (pair.second.retain && pair.second.last_frame != frame && pair.second.result)
+               fn(pair.second.result->GetGPUVirtualAddress(), pair.second.source);
+      }
+      size_t RetainedCount() const { return retained_count; }
       // UAV barrier for the frame's builds, evicts unused entries
       void EndFrame(const BuildContext& ctx);
       void Clear(Retirer* retirer, uint64_t fence_value);
@@ -150,7 +164,10 @@ namespace RTAO
          D3D12_GPU_VIRTUAL_ADDRESS indices = 0;
          uint32_t last_frame = 0;
          uint32_t refits = 0;
+         bool retain = false;
+         uint8_t source = 0;
       };
+      size_t retained_count = 0; // Retained entries not drawn in the last frame
       std::unordered_map<uint64_t, Entry> entries;
       uint64_t result_bytes = 0;
       uint32_t frame = 0;

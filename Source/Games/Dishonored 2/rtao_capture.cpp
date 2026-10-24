@@ -2242,13 +2242,16 @@ namespace RTAO
                }
                bool refit = false;
                std::string build_error;
-               const D3D12_GPU_VIRTUAL_ADDRESS blas = frame_blases.Update(ctx, key, mesh, refit, build_error);
+               // Movable objects (dynamic vertex buffers: openable windows, doors) keep their last pose while the game skips
+               // drawing them (DynamicBlasSet::kRetainFrames); characters (skinned) are current-frame only
+               const uint8_t source = uint8_t((record.shadow_view ? kInstanceSourceShadow : kInstanceSourceMain) | (record.skinned ? kInstanceFlagSkinned : 0));
+               const D3D12_GPU_VIRTUAL_ADDRESS blas = frame_blases.Update(ctx, key, mesh, refit, build_error, !record.skinned, source);
                if (!blas)
                {
                   frame_failed++;
                   continue;
                }
-               tlas.AddFrameInstance(blas, identity, kInstanceMaskOpaque, uint8_t((record.shadow_view ? kInstanceSourceShadow : kInstanceSourceMain) | (record.skinned ? kInstanceFlagSkinned : 0)));
+               tlas.AddFrameInstance(blas, identity, kInstanceMaskOpaque, source);
                frame_draws++;
                frame_vertices += record.count;
                (refit ? frame_refits : frame_builds)++;
@@ -2262,6 +2265,11 @@ namespace RTAO
          {
             frame_blases.EndFrame(ctx); // Evicts the BLASes of draws that went away
          }
+         // Movable objects not drawn this frame: their last pose
+         frame_blases.ForEachRetained([&](D3D12_GPU_VIRTUAL_ADDRESS blas, uint8_t source) {
+            static const float identity[3][4] = { { 1, 0, 0, 0 }, { 0, 1, 0, 0 }, { 0, 0, 1, 0 } };
+            tlas.AddFrameInstance(blas, identity, kInstanceMaskOpaque, source);
+         });
       }
 
       // 6) Texture exact cutouts: new masks into the atlas, the record table (after this frame's records were resolved above)
@@ -2275,6 +2283,7 @@ namespace RTAO
       stats.frame_blas_refits += frame_refits;
       stats.frame_blas_failed += frame_failed;
       stats.frame_blas_count = frame_blases.Count();
+      stats.frame_retained = frame_blases.RetainedCount();
       stats.frame_blas_bytes = frame_blases.ResultBytes();
       for (uint64_t key : failed_keys)
       {

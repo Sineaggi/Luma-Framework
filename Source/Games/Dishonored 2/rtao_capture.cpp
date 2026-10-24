@@ -1411,10 +1411,15 @@ namespace RTAO
          identity = HashCombine(identity, (uint64_t(draw.instance_cb_first_constant) << 32) | draw.instance_cb_num_constants);
          identity = HashCombine(identity, uint64_t(uintptr_t(draw.instance_buffer)));
          identity = HashCombine(identity, uint64_t(uintptr_t(draw.instance_index)));
-         identity = HashCombine(identity, uint64_t(uintptr_t(draw.per_view_cb)) ^ (uint64_t(draw.per_view_cb_first_constant) << 44));
+         // A skinned shadow map draw is repeated per cascade with only the view changing: its skinned world positions
+         // are the same, so the view (and the binding version its per cascade cbuffer writes bump) is left out
+         const bool shadow_skinned = draw.shadow_view && draw.vs->skinned;
+         if (!shadow_skinned)
+            identity = HashCombine(identity, uint64_t(uintptr_t(draw.per_view_cb)) ^ (uint64_t(draw.per_view_cb_first_constant) << 44));
          identity = HashCombine(identity, uint64_t(uintptr_t(draw.bones)));
-         identity = HashCombine(identity, uint64_t(draw.instance_count) | (uint64_t(draw.cutout) << 32) | (uint64_t(frame_mesh) << 33));
-         identity = HashCombine(identity, draw.binding_version);
+         identity = HashCombine(identity, uint64_t(draw.instance_count) | (uint64_t(draw.cutout) << 32) | (uint64_t(frame_mesh) << 33) | (uint64_t(shadow_skinned) << 34));
+         if (!shadow_skinned)
+            identity = HashCombine(identity, draw.binding_version);
          identity |= 1; // Never 0
          const std::lock_guard lock(mutex);
          auto seen = frame_identities.find(identity);

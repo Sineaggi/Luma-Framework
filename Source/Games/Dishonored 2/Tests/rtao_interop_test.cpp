@@ -1891,6 +1891,17 @@ static void TestFrameMeshes(ID3D11Device* device, ID3D11DeviceContext* context, 
       shadow_draw1.shadow_slice = 0;
       const RTAO::CaptureStats before = capture.GetStats();
       CHECK(capture.CaptureDraw(context, shadow_draw1), "a skinned shadow map draw must be captured");
+      // The same object in the next cascade: only the view differs, a duplicate
+      {
+         RTAO::DrawInfo next_cascade = shadow_draw1;
+         next_cascade.per_view_cb_first_constant += 64;
+         next_cascade.binding_version += 1;
+         next_cascade.shadow_slice = 1;
+         const RTAO::CaptureStats mid = capture.GetStats();
+         CHECK(capture.CaptureDraw(context, next_cascade), "the next cascade's draw");
+         const RTAO::CaptureStats mid2 = capture.GetStats();
+         CHECK(mid2.dedup_frame_meshes - mid.dedup_frame_meshes == 1 && mid2.skinned_captured == mid.skinned_captured, "a skinned shadow draw repeated for another cascade must be skipped");
+      }
       capture.shadow_skinned_enabled = false;
       capture.OnPresent();
       CHECK(!capture.CaptureDraw(context, shadow_draw1), "a skinned shadow map draw must be skipped when off");

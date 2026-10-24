@@ -401,6 +401,12 @@ namespace
    constexpr uint32_t kFlatShadowSlice = 8;
    // Skinned shadow map draws (config "RTAOShadowSkinned"): many sun casters are drawn with skinned shaders
    bool g_rtao_shadow_skinned = true;
+   // The sun's shadow map array (PS t0 of the screen shadows draw). The game draws each sun cascade into a plain square
+   // depth texture (and keeps a cached static one it restores from), then copies it into a slice of this array; its
+   // other shadow arrays are the local lights' atlas. Only draws into this array or plain square depth textures are sun
+   // casters, unless "RTAOShadowAtlasCasters" (the old rule: slices 0 and 1 of any shadow array).
+   std::atomic<uintptr_t> g_sun_shadow_array = 0;
+   bool g_rtao_shadow_atlas_casters = false;
    // The game's shadow map rasterizer bias (last shadow draw): the reproduction allows for it
    std::atomic<int> g_shadow_depth_bias = 0;
    std::atomic<float> g_shadow_slope_bias = 0.f;
@@ -1787,6 +1793,16 @@ public:
          return false;
       const uint32_t frame = game_device_data.rtao_frame;
       game_device_data.rtsun_light.OnScreenShadowsDraw(native_device_context, frame);
+      {
+         com_ptr<ID3D11ShaderResourceView> sun_srv;
+         native_device_context->PSGetShaderResources(0, 1, &sun_srv);
+         if (sun_srv)
+         {
+            com_ptr<ID3D11Resource> sun_array;
+            sun_srv->GetResource(&sun_array);
+            g_sun_shadow_array.store(uintptr_t(sun_array.get()), std::memory_order_relaxed);
+         }
+      }
       // The copy: for the shadow map check, captures, and the periodic reproduction (the frame before it)
       if (g_rtsun_shadow_consult || g_rtdiag.active || (game_device_data.rtao_frame + 2) % kReproLogFrames <= 1)
          RTSunCopyShadowMap(native_device, native_device_context, device_data, game_device_data);
@@ -2956,7 +2972,7 @@ public:
 
    // A shadow map draw: depth only (no render target) with depth writes on, into a depth texture array (the sun's
    // cascades, the local lights' atlas) that isn't the main view's depth. Whatever is drawn there is world geometry.
-   static bool IsShadowViewDepthWrite(ID3D11DeviceContext* context, uint32_t* out_slice = nullptr)
+   static bool IsShadowViewDepthWrite(ID3D11DeviceContext* context, uint32_t* out_slice = nullptr, bool* out_sun = nullptr)
    {
       com_ptr<ID3D11RenderTargetView> rtv;
       com_ptr<ID3D11DepthStencilView> dsv;
@@ -2987,6 +3003,8 @@ public:
       D3D11_DEPTH_STENCIL_VIEW_DESC dsv_desc;
       dsv->GetDesc(&dsv_desc);
       const uint32_t slice = flat ? kFlatShadowSlice : (dsv_desc.ViewDimension == D3D11_DSV_DIMENSION_TEXTURE2DARRAY ? dsv_desc.Texture2DArray.FirstArraySlice : 0);
+      if (out_sun)
+         *out_sun = flat || g_rtao_shadow_atlas_casters || uintptr_t(resource.get()) == g_sun_shadow_array.load(std::memory_order_relaxed);
       {
          D3D11_VIEWPORT viewport = {};
          UINT viewports = 1;
@@ -3198,8 +3216,14 @@ public:
       if (!IsMainViewDepthWrite(context, g_rtao_capture_pass == 0))
       {
          uint32_t slice = 0;
-         if (!g_rtao_shadow_casters || !IsShadowViewDepthWrite(context, &slice))
+         bool sun_target = false;
+         if (!g_rtao_shadow_casters || !IsShadowViewDepthWrite(context, &slice, &sun_target))
             return false;
+         if (!sun_target)
+         {
+            ShadowAudit(context, slice, "not_sun_target", index_count);
+            return false;
+         }
          g_rtao_shadow_slice_draws[(std::min)(slice, 7u)]++;
          shadow_slice = slice;
          if (g_rtao_shadow_near_only && slice >= uint32_t((std::max)(g_rtao_shadow_near_slices, 1)) && slice != kFlatShadowSlice)
@@ -3897,6 +3921,7 @@ public:
       reshade::get_config_value(runtime, NAME, "RTDiagAutoLevelSeconds", g_rtdiag_auto_level_seconds);
       reshade::get_config_value(runtime, NAME, "RTAOShadowFlatTargets", g_rtao_shadow_flat);
       reshade::get_config_value(runtime, NAME, "RTAOShadowSkinned", g_rtao_shadow_skinned);
+      reshade::get_config_value(runtime, NAME, "RTAOShadowAtlasCasters", g_rtao_shadow_atlas_casters);
       reshade::get_config_value(runtime, NAME, "RTSunShadowMapTolerance", g_rtsun_shadow_tolerance);
       reshade::get_config_value(runtime, NAME, "RTAOShadowNearSlices", g_rtao_shadow_near_slices);
       reshade::get_config_value(runtime, NAME, "RTAOShadowNearOnly", g_rtao_shadow_near_only);

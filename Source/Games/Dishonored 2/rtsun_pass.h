@@ -95,7 +95,7 @@ namespace RTSun
       // of the same frame into the two debug shared textures (GetDebugSRV), without touching the output or its history
       bool debug_outputs = false;
       // Objects the game never drew into a shadow map (camera only: glass, light shaft meshes) don't block the sun
-      bool casters_only = true;
+      bool casters_only = false;
    };
 
    class SunPass

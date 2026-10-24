@@ -260,7 +260,7 @@ namespace RTAO
       // Per frame meshes dispatched / with a rejected matrix (NaN vertices), shadow maps and main view (GPU counters, cumulative)
       uint64_t gpu_shadow_frame = 0, gpu_shadow_frame_rejected = 0, gpu_main_frame = 0, gpu_main_frame_rejected = 0;
       uint64_t frame_retained = 0; // Movable objects kept in their last pose (not drawn in the last frame)
-      uint64_t hold_superseded = 0, hold_owner_freed = 0, hold_capped = 0; // Held poses dropped: moved (newer pose), buffer freed, cap
+      uint64_t hold_superseded = 0, hold_owner_freed = 0, hold_capped = 0, hold_timed_out = 0; // Held poses dropped: moved (newer pose), buffer freed, cap
       uint64_t draws_seen = 0, draws_captured = 0, instances_captured = 0;
       uint64_t skipped[8] = {}; // By CaptureSkip
       uint64_t meshes = 0, meshes_ready = 0, buffers_copied = 0, arena_vertex_bytes = 0, arena_index_bytes = 0;
@@ -290,6 +290,17 @@ namespace RTAO
       kSkipShader = 0, kSkipFormat, kSkipBuffer, kSkipArenaFull, kSkipRingFull, kSkipBinding, kSkipOther, kSkipCount
    };
 
+   // Diagnostics: one step of a per frame mesh draw. event: 'c' captured, 's' skipped (CaptureFrameDraw failed),
+   // 'D' duplicate (same context), 'x' executed before the AO pass, 'a' executed after it (dropped), 'p' in the pass's
+   // TLAS, 'd' dropped by the pass as a duplicate of an earlier executed draw. context: low byte of the context hash.
+   struct FrameMeshEvent
+   {
+      uint64_t key;
+      char event;
+      uint8_t context;
+      bool skinned;
+   };
+
    class GeometryCapture
    {
    public:
@@ -305,6 +316,7 @@ namespace RTAO
       std::atomic<bool> dynamic_enabled = true;
       // Draws with the same identity as one captured earlier in the frame are skipped (see CaptureStats::dedup_draws)
       std::atomic<bool> dedup_enabled = true;
+      std::atomic<uint32_t> skinned_hold_frames = 30; // Undrawn frames a skinned mesh keeps its last pose (0: current frame only)
       bool IsInitialized() const { return ring11 != nullptr; }
       void Shutdown();
       // Texture exact cutouts (after Init). strip_cs: Luma_RTAO.hlsl "alpha_strip_cs". Without it cutouts stay stochastic.
@@ -367,6 +379,12 @@ namespace RTAO
       bool Record(ID3D12GraphicsCommandList4* list, const RecordInfo& info, BlasCache& blases, TlasBuilder& tlas, Retirer& retirer, uint32_t blas_budget, std::string& error);
 
       CaptureStats GetStats();
+      // Per frame meshes (skinned, dynamic vertex buffers) of the last complete frame: what happened to each draw
+      std::vector<FrameMeshEvent> GetLastFrameMeshTrace()
+      {
+         const std::lock_guard lock(mutex);
+         return last_mesh_trace;
+      }
 
       static constexpr uint32_t kCounterBytes = 32 + 64 * 32; // FrameCounters: counters, then the probe ring
       static constexpr uint32_t kRingSlots = 1u << 18; // 64 bytes each: 16 MB
@@ -431,6 +449,8 @@ namespace RTAO
          uintptr_t owner = 0; // FrameMesh: the draw's vertex buffer (held poses go when it is freed)
          bool skinned = false; // FrameMesh: skinned (else a dynamic vertex buffer), debug scene view
          bool mvp = false; // Instances: MVP derived matrix (identity matched with a tolerance, see FuzzyKey)
+         uint64_t identity = 0; // FrameMesh: the draw's per frame identity (the pass keeps one record per identity)
+         uint8_t context_id = 0; // FrameMesh: diagnostics (FrameMeshEvent)
       };
 
       bool EnsureBufferCopy(ID3D11DeviceContext* context, ID3D11Buffer* buffer, bool vertex, std::vector<Rec>& records);
@@ -438,6 +458,17 @@ namespace RTAO
       bool CaptureFrameDraw(ID3D11DeviceContext* context, const DrawInfo& draw, uint64_t key, uint64_t identity, uint64_t index_start, uint32_t index_size, bool dynamic_vertices);
       void CommitLocked(std::vector<Rec>& records);
       void QueueLocked(ID3D11DeviceContext* context, std::vector<Rec>& local);
+      static uint8_t ContextId(ID3D11DeviceContext* context)
+      {
+         const uint64_t h = uint64_t(uintptr_t(context)) * 0x9E3779B97F4A7C15ull;
+         return uint8_t(h >> 56);
+      }
+      void TraceMeshEventLocked(const FrameMeshEvent& e)
+      {
+         if (mesh_trace.size() < 4096)
+            mesh_trace.push_back(e);
+      }
+      void TraceMeshLocked(uint64_t key, char event, ID3D11DeviceContext* context, bool skinned) { TraceMeshEventLocked({ key, event, ContextId(context), skinned }); }
 
       std::mutex mutex;
       ID3D11Device* device11 = nullptr;
@@ -479,7 +510,12 @@ namespace RTAO
       std::vector<uintptr_t> freed_owners; // Freed buffers: their held per frame poses go (DynamicBlasSet::DropOwner)
       std::unordered_map<ID3D11DeviceContext*, std::vector<Rec>> context_records;
       std::unordered_set<ID3D11Buffer*> written_seen; // Distinct buffers counted in written_buffers
-      std::unordered_set<uint64_t> frame_identities; // Draws captured this frame (dedup), cleared at OnPresent
+      // Draws captured this frame (dedup) and the context that recorded them, cleared at OnPresent. A per frame mesh is
+      // only a duplicate on the same context: across deferred contexts the first one recorded may be the one that runs
+      // after the AO pass (its record is then dropped), so each context's draw is captured and the pass keeps the first
+      // that executed (Rec::identity).
+      std::unordered_map<uint64_t, ID3D11DeviceContext*> frame_identities;
+      std::vector<FrameMeshEvent> mesh_trace, last_mesh_trace; // This frame's / the last complete frame's
       struct ListRecords
       {
          std::vector<Rec> records;

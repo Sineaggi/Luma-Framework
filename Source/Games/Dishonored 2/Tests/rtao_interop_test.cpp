@@ -1788,13 +1788,39 @@ static void TestFrameMeshes(ID3D11Device* device, ID3D11DeviceContext* context, 
       const RTAO::CaptureStats after = capture.GetStats();
       printf("frame meshes dedup: %llu repeated draws skipped, last frame %llu per frame meshes, TLAS %u\n", (unsigned long long)(after.dedup_frame_meshes - before.dedup_frame_meshes),
          (unsigned long long)after.frame_draws, tlas_count);
-      CHECK(after.dedup_frame_meshes - before.dedup_frame_meshes == 2, "the 2 repeated per frame draws must be skipped");
+      // Same context: skipped at the draw. Other context: captured (the first one recorded may run after the AO pass and
+      // be dropped), the pass keeps the first executed one
+      CHECK(after.dedup_frame_meshes - before.dedup_frame_meshes == 1, "the repeated per frame draw on the same context must be skipped");
+      CHECK(after.dynamic_captured - before.dynamic_captured == 2, "the repeated per frame draw on another context must be captured");
       CHECK(after.skinned_captured - before.skinned_captured == 3 && after.frame_draws == 4 && tlas_count == 5, "no duplicate per frame BLAS");
+      // The trace of that frame (the pass ran before Present): 'D' for the same context repeat, 'd' for the other one
+      run_frame(0, 0);
+      int same_context = 0, pass_dropped = 0, in_pass = 0;
+      for (const RTAO::FrameMeshEvent& e : capture.GetLastFrameMeshTrace())
+      {
+         same_context += e.event == 'D';
+         pass_dropped += e.event == 'd';
+         in_pass += e.event == 'p';
+      }
+      printf("frame mesh trace (no repeats): %d in the pass, %d same context repeats, %d dropped by the pass\n", in_pass, same_context, pass_dropped);
+      CHECK(in_pass == 4 && same_context == 0 && pass_dropped == 0, "frame mesh trace");
    }
 
    // Frames the game doesn't draw a movable object (dynamic vertex buffer, e.g. an openable window out of view): it
    // stays in its last pose; a skinned character not drawn is gone at once (it moves)
    {
+      // Skinned held for a few frames: A not drawn for 3 frames keeps its last pose
+      skip_skinned_a = true;
+      for (int i = 0; i < 3; i++)
+         run_frame(0, 0);
+      skip_skinned_a = false;
+      const RTAO::CaptureStats held = capture.GetStats();
+      printf("skinned A not drawn for 3 frames (hold %u): retained %llu, TLAS %u\n", capture.skinned_hold_frames.load(), (unsigned long long)held.frame_retained, tlas_count);
+      CHECK(held.frame_retained == 1 && tlas_count == 5, "a skinned mesh missing a few frames must keep its last pose");
+      run_frame(0, 0);
+      CHECK(capture.GetStats().frame_retained == 0 && tlas_count == 5, "a skinned mesh drawn again is current again");
+      capture.skinned_hold_frames = 0; // Applies at an entry's next draw
+      run_frame(0, 0);
       skip_dynamic = true;
       skip_skinned_a = true;
       std::vector<float> ao;
@@ -1802,6 +1828,7 @@ static void TestFrameMeshes(ID3D11Device* device, ID3D11DeviceContext* context, 
          ao = run_frame(0, 0);
       skip_dynamic = false;
       skip_skinned_a = false;
+      capture.skinned_hold_frames = 30;
       int count = 0;
       const float near_e_kept = average(ao, near_box(kE), count);
       const RTAO::CaptureStats kept = capture.GetStats();

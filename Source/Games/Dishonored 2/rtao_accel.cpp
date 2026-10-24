@@ -287,7 +287,7 @@ namespace RTAO
       return true;
    }
 
-   D3D12_GPU_VIRTUAL_ADDRESS DynamicBlasSet::Update(const BuildContext& ctx, uint64_t key, const GpuMesh& mesh, bool& refit, std::string& error, bool retain, uint8_t source, uint64_t group, uintptr_t owner)
+   D3D12_GPU_VIRTUAL_ADDRESS DynamicBlasSet::Update(const BuildContext& ctx, uint64_t key, const GpuMesh& mesh, bool& refit, std::string& error, bool retain, uint8_t source, uint64_t group, uintptr_t owner, uint32_t hold_frames)
    {
       refit = false;
       if (!mesh.vertices || mesh.vertex_count < 3 || (mesh.indices && mesh.index_count < 3))
@@ -390,6 +390,7 @@ namespace RTAO
       it->second.source = source;
       it->second.group = group;
       it->second.owner = owner;
+      it->second.hold_frames = hold_frames;
       build.Inputs = inputs;
       build.DestAccelerationStructureData = it->second.result->GetGPUVirtualAddress();
       build.ScratchAccelerationStructureData = scratch_address;
@@ -426,10 +427,14 @@ namespace RTAO
       {
          const Entry& e = it->second;
          const bool held = e.retain && e.last_frame != frame;
-         const bool superseded = held && e.group && drawn_groups.count(e.group);
+         // Only for unlimited holds (movable objects): a skinned entry's key is its mesh plus its draw order, so another
+         // object with the same mesh drawn this frame is not this one moving; it times out instead (hold_frames)
+         const bool superseded = held && e.hold_frames == kRetainFrames && e.group && drawn_groups.count(e.group);
          const bool capped = held && e.last_frame < retain_cutoff;
          const bool owner_freed = !e.retain && e.last_frame == 0 && e.owner;
-         const bool expired = e.retain ? (superseded || capped) : frame - e.last_frame > kEvictFrames;
+         const bool timed_out = held && frame - e.last_frame > e.hold_frames;
+         const bool expired = e.retain ? (superseded || capped || timed_out) : frame - e.last_frame > kEvictFrames;
+         hold_stats.timed_out += timed_out && !superseded && !capped;
          hold_stats.superseded += superseded;
          hold_stats.capped += capped && !superseded;
          hold_stats.owner_freed += owner_freed;

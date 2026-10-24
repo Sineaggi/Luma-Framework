@@ -251,6 +251,8 @@ namespace
    bool g_rtao_fast_cutouts = false;
    // Skip draws that repeat one captured earlier in the frame (depth prepass + G-buffer pass) (config "RTAODedup")
    bool g_rtao_dedup = true;
+   // Frames a skinned mesh (character, swinging window flap) keeps its last pose when a frame misses its draw (config "RTAOSkinnedHoldFrames")
+   int g_rtao_skinned_hold = 30;
    bool g_rtao_recopy_written = false; // Re-copy captured buffers the game rewrites (config "RTAORecopyWrittenBuffers", H3 test)
    bool g_rtao_freeze_scene = false;
    // Popping tests (not saved): openables taken from shadow map draws; shadow map objects not confirmed yet kept 64 frames, not 4
@@ -300,7 +302,7 @@ namespace
    int g_rtsun_rays = 1; // Per pixel per frame (config "RTSunRays")
    // Only objects the game draws into its shadow maps block the RT sun (config "RTSunShadowCastersOnly"): the game keeps
    // some objects out of its shadow maps on purpose (window glass, light shaft meshes); camera only ones still occlude the AO
-   bool g_rtsun_casters_only = true;
+   bool g_rtsun_casters_only = false;
    int g_rtsun_output = int(RTSun::Output::Denoised); // Config "RTSunOutput"
    // ---- RT diagnostic capture (RTAO_NOTES.md "Diagnostic capture"): Luma panel button or Ctrl+Shift+Pause (not F9: the game's quickload). About 10 s:
    // 5 s as is, then 5 s with the ray tracing scene frozen, ~5 captures per second. Each capture copies, from the SAME
@@ -666,6 +668,7 @@ public:
       game_device_data.rtao_capture.dynamic_enabled = g_rtao_dynamic;
       game_device_data.rtao_capture.cutouts_exact = g_rtao_cutouts_exact;
       game_device_data.rtao_capture.dedup_enabled = g_rtao_dedup;
+      game_device_data.rtao_capture.skinned_hold_frames = uint32_t(std::clamp(g_rtao_skinned_hold, 0, 600));
       game_device_data.rtao_capture.shadow_frame_meshes_enabled = g_rtdbg_shadow_openables;
       game_device_data.rtao_tlas.shadow_mode = g_rtdbg_shadow_young_long ? 1u : 0u;
       game_device_data.rtao_last_draw_frame = game_device_data.rtao_frame;
@@ -1149,7 +1152,26 @@ public:
                const std::string path = (std::filesystem::path(g_rtdiag.dir) / name).string();
                std::thread([csv = std::move(csv), path]() { std::ofstream(path) << csv; }).detach();
             }
-            add("casters_only=%d\n", int(g_rtsun_casters_only));
+            add("casters_only=%d\nskinned_hold=%d\n", int(g_rtsun_casters_only), g_rtao_skinned_hold);
+            // Per frame meshes of the last complete frame: per mesh, its events in order (see RTAO::FrameMeshEvent)
+            {
+               const std::vector<RTAO::FrameMeshEvent> trace = g.rtao_capture.GetLastFrameMeshTrace();
+               std::vector<std::pair<uint64_t, std::string>> per_mesh;
+               for (const RTAO::FrameMeshEvent& e : trace)
+               {
+                  auto it = std::find_if(per_mesh.begin(), per_mesh.end(), [&](const auto& p) { return p.first == e.key; });
+                  if (it == per_mesh.end())
+                  {
+                     per_mesh.emplace_back(e.key, e.skinned ? "skin" : "dyn");
+                     it = per_mesh.end() - 1;
+                  }
+                  char step[8];
+                  snprintf(step, sizeof(step), " %c%02X", e.event, e.context);
+                  it->second += step;
+               }
+               for (const auto& p : per_mesh)
+                  add("frame_mesh=%016llX %s\n", (unsigned long long)p.first, p.second.c_str());
+            }
             add("near_only=%d\nnear_slices=%d\nfar_skipped=%llu\n", int(g_rtao_shadow_near_only), g_rtao_shadow_near_slices, (unsigned long long)g_rtao_shadow_far_skipped.load());
             add("slice_draws=%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu\n", (unsigned long long)g_rtao_shadow_slice_draws[0].load(), (unsigned long long)g_rtao_shadow_slice_draws[1].load(),
                (unsigned long long)g_rtao_shadow_slice_draws[2].load(), (unsigned long long)g_rtao_shadow_slice_draws[3].load(), (unsigned long long)g_rtao_shadow_slice_draws[4].load(),
@@ -3381,6 +3403,7 @@ public:
       g_rtao_quality = std::clamp(g_rtao_quality, 0, int(RTAO_QUALITY_COUNT) - 1);
       reshade::get_config_value(runtime, NAME, "RTAOFastCutouts", g_rtao_fast_cutouts);
       reshade::get_config_value(runtime, NAME, "RTAODedup", g_rtao_dedup);
+      reshade::get_config_value(runtime, NAME, "RTAOSkinnedHoldFrames", g_rtao_skinned_hold);
       reshade::get_config_value(runtime, NAME, "RTAOBlasBudget", g_rtao_blas_budget);
       reshade::get_config_value(runtime, NAME, "RTAORecopyWrittenBuffers", g_rtao_recopy_written);
       reshade::get_config_value(runtime, NAME, "RTAOCutoutsExact", g_rtao_cutouts_exact);
@@ -3538,6 +3561,10 @@ public:
             reshade::set_config_value(runtime, NAME, "RTAODedup", g_rtao_dedup);
          if (ImGui::IsItemHovered())
             ImGui::SetTooltip("Captures an object once per frame even if several passes draw it (depth prepass, G-buffer): saves the per draw\ncapture work on the game's render threads and duplicate per frame BLASes of characters. Turn off if geometry goes missing.");
+         if (ImGui::SliderInt("RTAO: skinned mesh hold (frames)", &g_rtao_skinned_hold, 0, 120))
+            reshade::set_config_value(runtime, NAME, "RTAOSkinnedHoldFrames", g_rtao_skinned_hold);
+         if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("How many frames a skinned mesh (a character, a swinging window flap) keeps its last pose when a frame misses its\ndraw. A newer draw of the same mesh replaces it at once. 0: current frame only.");
          if (ImGui::Checkbox("RTAO cutouts: texture exact", &g_rtao_cutouts_exact))
             reshade::set_config_value(runtime, NAME, "RTAOCutoutsExact", g_rtao_cutouts_exact);
          if (ImGui::IsItemHovered())

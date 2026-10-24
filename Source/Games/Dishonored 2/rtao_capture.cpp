@@ -1397,15 +1397,26 @@ namespace RTAO
          identity = HashCombine(identity, draw.binding_version);
          identity |= 1; // Never 0
          const std::lock_guard lock(mutex);
-         if (frame_identities.count(identity))
+         auto seen = frame_identities.find(identity);
+         if (seen != frame_identities.end() && (!frame_mesh || seen->second == context))
          {
+            if (frame_mesh)
+               TraceMeshLocked(key, 'D', context, draw.vs->skinned);
             (frame_mesh ? stats.dedup_frame_meshes : stats.dedup_draws)++;
             return true; // Its instances are in this frame's records already
          }
       }
 
       if (frame_mesh)
-         return CaptureFrameDraw(context, draw, key, identity, index_start, index_size, dynamic_vertices);
+      {
+         const bool captured = CaptureFrameDraw(context, draw, key, identity, index_start, index_size, dynamic_vertices);
+         if (!captured)
+         {
+            const std::lock_guard lock(mutex);
+            TraceMeshLocked(key, 's', context, draw.vs->skinned);
+         }
+         return captured;
+      }
 
       // Texture exact cutouts: the draw's material (its alpha texture), whose mask is rendered at its first draw
       uint64_t material = 0;
@@ -1533,7 +1544,7 @@ namespace RTAO
          record.shadow_slice = draw.shadow_slice;
          local.push_back(record);
          if (identity)
-            frame_identities.insert(identity);
+            frame_identities.emplace(identity, context);
          stats.draws_captured++;
          stats.instances_captured += draw.instance_count;
          if (draw.shadow_view)
@@ -1835,9 +1846,12 @@ namespace RTAO
          record.shadow_view = draw.shadow_view;
          record.skinned = skinned;
          record.owner = uintptr_t(draw.vertex_buffer);
+         record.identity = identity;
+         record.context_id = ContextId(context);
          local.push_back(record);
          if (identity)
-            frame_identities.insert(identity);
+            frame_identities.emplace(identity, context);
+         TraceMeshLocked(key, 'c', context, skinned);
          stats.draws_captured++;
          stats.instances_captured++;
          stats.shadow_frame_meshes += draw.shadow_view;
@@ -1867,10 +1881,14 @@ namespace RTAO
          }
          else if (after_ao_pass && !record.shadow_view) // Shadow maps are drawn after the AO, and are opaque casters
          {
+            if (record.type == Rec::FrameMesh)
+               TraceMeshEventLocked({ record.mesh_key, 'a', record.context_id, record.skinned });
             stats.after_ao_records++; // Drawn after the AO took its depth: not in that depth, so not an occluder
          }
          else
          {
+            if (record.type == Rec::FrameMesh)
+               TraceMeshEventLocked({ record.mesh_key, 'x', record.context_id, record.skinned });
             executed.push_back(record);
          }
       }
@@ -1992,6 +2010,8 @@ namespace RTAO
       frame++;
       after_ao_pass = false;
       frame_identities.clear();
+      last_mesh_trace.swap(mesh_trace);
+      mesh_trace.clear();
       // Command lists the game finished but never executed (or released)
       for (auto it = list_records.begin(); it != list_records.end();)
       {
@@ -2287,6 +2307,7 @@ namespace RTAO
       //    characters sharing a mesh apart; if they swap order the refit still gives the right triangles, only a looser
       //    BVH until the periodic rebuild).
       uint64_t frame_draws = 0, frame_vertices = 0, frame_builds = 0, frame_refits = 0, frame_failed = 0;
+      std::vector<FrameMeshEvent> pass_trace;
       {
          const BuildContext ctx = { info.device, list, &retirer, info.submit_fence_value };
          frame_blases.BeginFrame();
@@ -2318,10 +2339,18 @@ namespace RTAO
             const D3D12_GPU_VIRTUAL_ADDRESS arena = vertex_arena12->GetGPUVirtualAddress();
             static const float identity[3][4] = { { 1, 0, 0, 0 }, { 0, 1, 0, 0 }, { 0, 0, 1, 0 } };
             std::unordered_map<uint64_t, uint32_t> ordinals;
+            std::unordered_set<uint64_t> identities;
+            const uint32_t skin_hold = skinned_hold_frames.load(std::memory_order_relaxed);
             for (const auto& record : work)
             {
                if (record.type != GeometryCapture::Rec::FrameMesh)
                   continue;
+               // The same draw captured on two contexts (see frame_identities): the first executed one
+               if (record.identity && !identities.insert(record.identity).second)
+               {
+                  pass_trace.push_back({ record.mesh_key, 'd', record.context_id, record.skinned });
+                  continue;
+               }
                const uint64_t key = HashCombine(record.mesh_key, 0x5C1A000000000000ull + ordinals[record.mesh_key]++);
                GpuMesh mesh;
                mesh.vertices = vertices + uint64_t(record.first_slot) * 12;
@@ -2339,13 +2368,17 @@ namespace RTAO
                // Movable objects (dynamic vertex buffers: openable windows, doors) keep their last pose while the game skips
                // drawing them (DynamicBlasSet::kRetainFrames); characters (skinned) are current-frame only
                const uint8_t source = uint8_t((record.shadow_view ? kInstanceSourceShadow : kInstanceSourceMain) | (record.skinned ? kInstanceFlagSkinned : 0));
-               const D3D12_GPU_VIRTUAL_ADDRESS blas = frame_blases.Update(ctx, key, mesh, refit, build_error, !record.skinned, source, record.mesh_key, record.owner);
+               // Movable objects (dynamic vertex buffers) are held until they move or unload. Skinned meshes (characters, and
+               // skinned props like swinging window flaps) only a few frames: a draw missed for a frame doesn't blink
+               const D3D12_GPU_VIRTUAL_ADDRESS blas = frame_blases.Update(ctx, key, mesh, refit, build_error, !record.skinned || skin_hold > 0, source, record.mesh_key, record.owner,
+                  record.skinned ? skin_hold : DynamicBlasSet::kRetainFrames);
                if (!blas)
                {
                   frame_failed++;
                   continue;
                }
                tlas.AddFrameInstance(blas, identity, kInstanceMaskOpaque, source);
+               pass_trace.push_back({ record.mesh_key, 'p', record.context_id, record.skinned });
                frame_draws++;
                frame_vertices += record.count;
                (refit ? frame_refits : frame_builds)++;
@@ -2371,6 +2404,8 @@ namespace RTAO
          return false;
 
       const std::lock_guard lock(mutex);
+      for (const FrameMeshEvent& e : pass_trace)
+         TraceMeshEventLocked(e);
       stats.frame_draws = frame_draws;
       stats.frame_vertices = frame_vertices;
       stats.frame_blas_builds += frame_builds;
@@ -2382,6 +2417,7 @@ namespace RTAO
       stats.hold_superseded = hold.superseded;
       stats.hold_owner_freed = hold.owner_freed;
       stats.hold_capped = hold.capped;
+      stats.hold_timed_out = hold.timed_out;
       stats.frame_blas_bytes = frame_blases.ResultBytes();
       for (uint64_t key : failed_keys)
       {

@@ -141,7 +141,8 @@ namespace RTAO
       void BeginFrame();
       // Records a build or refit into ctx.list (the vertices/indices must be readable by the build). Returns the BLAS
       // address, 0 on failure. Call EndFrame() after the frame's updates, before the TLAS build.
-      D3D12_GPU_VIRTUAL_ADDRESS Update(const BuildContext& ctx, uint64_t key, const GpuMesh& mesh, bool& refit, std::string& error, bool retain = false, uint8_t source = 0, uint64_t group = 0, uintptr_t owner = 0);
+      // "hold_frames": how long a retained entry may stay undrawn (UINT32_MAX: no limit, see kRetainFrames)
+      D3D12_GPU_VIRTUAL_ADDRESS Update(const BuildContext& ctx, uint64_t key, const GpuMesh& mesh, bool& refit, std::string& error, bool retain = false, uint8_t source = 0, uint64_t group = 0, uintptr_t owner = 0, uint32_t hold_frames = kRetainFrames);
       // The held entries of a freed vertex buffer go at the next EndFrame
       void DropOwners(const std::unordered_set<uintptr_t>& owners)
       {
@@ -154,7 +155,7 @@ namespace RTAO
       }
       struct HoldStats
       {
-         uint64_t superseded = 0, owner_freed = 0, capped = 0;
+         uint64_t superseded = 0, owner_freed = 0, capped = 0, timed_out = 0;
       };
       HoldStats GetHoldStats() const { return hold_stats; }
       // Retained entries not updated this frame (call after EndFrame): fn(blas address, source)
@@ -197,6 +198,7 @@ namespace RTAO
          uint8_t source = 0;
          uint64_t group = 0; // The object (its mesh key): a newer pose of it replaces a held one
          uintptr_t owner = 0; // Its vertex buffer
+         uint32_t hold_frames = kRetainFrames; // Undrawn frames it may be held
       };
       HoldStats hold_stats;
       size_t retained_count = 0; // Retained entries not drawn in the last frame

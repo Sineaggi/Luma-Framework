@@ -396,6 +396,9 @@ namespace
    // Window material textures (diagnostic capture): the textures bound to the colour pass of the window panes' shaders,
    // listed in textures.csv and each saved once as tex_<slot>_<srv>.png (512x512, the game's sampling of it)
    constexpr uint32_t kWindowPixelShaders[] = { 0x09D8B56Eu, 0xC2A93A3Du, 0x905A32E4u, 0xFC0455E5u };
+   // Textured windows: the window panes' own material shaders. C2A93A3D and 905A32E4 are general lit materials (roofs,
+   // walls: a roof mesh became a "window" the sun passed through), so only these two register panes.
+   constexpr uint32_t kWindowPaneShaders[] = { 0x09D8B56Eu, 0xFC0455E5u };
    // Textured windows (opt in, config "RTSunTexturedWindows"): the game keeps window panes out of its sun shadow; with
    // this on, a pane's own texture decides where the sun passes. "RTSunWindowPattern" (the strip shader's mode): 4 lead
    // from the normal map (default), 5 one minus the one channel map, 6 the one channel map, 7 one minus the diffuse
@@ -3218,7 +3221,7 @@ public:
          const std::shared_lock lock(g_rtao_shader_mutex);
          auto ph = g_rtao_pixel_shader_hashes.find(uint64_t(uintptr_t(ps.get())));
          ps_hash = ph != g_rtao_pixel_shader_hashes.end() ? ph->second : 0;
-         if (std::find(std::begin(kWindowPixelShaders), std::end(kWindowPixelShaders), ps_hash) == std::end(kWindowPixelShaders))
+         if (std::find(std::begin(kWindowPaneShaders), std::end(kWindowPaneShaders), ps_hash) == std::end(kWindowPaneShaders))
             return;
          auto layout_it = g_rtao_input_layouts.find(uint64_t(uintptr_t(layout.get())));
          if (layout_it == g_rtao_input_layouts.end())
@@ -3255,6 +3258,16 @@ public:
       material.pattern = pattern;
       if (!material.srv || !material.uv_buffer || (slot2 != UINT32_MAX && !material.srv2))
          return;
+      // Plain 2D textures only (the strip shader reads Texture2D)
+      for (ID3D11ShaderResourceView* view : { material.srv.get(), material.srv2.get() })
+      {
+         if (!view)
+            continue;
+         D3D11_SHADER_RESOURCE_VIEW_DESC view_desc = {};
+         view->GetDesc(&view_desc);
+         if (view_desc.ViewDimension != D3D11_SRV_DIMENSION_TEXTURE2D)
+            return;
+      }
       const std::lock_guard lock(g_window_mutex);
       if (g_windows.size() < 1024)
       {
@@ -4483,6 +4496,12 @@ public:
       ImGui::Checkbox("RT test: openables from the shadow map", &g_rtdbg_shadow_openables);
       if (ImGui::IsItemHovered())
          ImGui::SetTooltip("Off: openable windows/doors only enter the ray tracing scene from the camera's draws (not saved).");
+      if (ImGui::Checkbox("RT sun: casters from the local light shadow atlas too", &g_rtao_shadow_atlas_casters))
+         reshade::set_config_value(runtime, NAME, "RTAOShadowAtlasCasters", g_rtao_shadow_atlas_casters);
+      if (ImGui::IsItemHovered())
+         ImGui::SetTooltip("Off (default): only what the game draws into its sun shadow maps blocks the sun. On: the old rule, also slices 0 and 1 of\n"
+            "the game's other shadow array (local lights' tiles, and a cache of its own). A test: if a missing roof shadow comes back with this on,\n"
+            "that array holds sun content too. Applies to shadow draws from now on.");
       if (ImGui::Checkbox("RT sun: textured windows", &g_rtsun_textured_windows))
          reshade::set_config_value(runtime, NAME, "RTSunTexturedWindows", g_rtsun_textured_windows);
       if (ImGui::IsItemHovered())

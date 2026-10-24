@@ -393,6 +393,13 @@ namespace
    std::mutex g_draw_probe_mutex;
    std::map<std::string, uint64_t> g_draw_probe;
    std::atomic<bool> g_draw_probe_active = false;
+   // Window material textures (diagnostic capture): the textures bound to the colour pass of the window panes' shaders,
+   // listed in textures.csv and each saved once as tex_<slot>_<srv>.png (512x512, the game's sampling of it)
+   constexpr uint32_t kWindowPixelShaders[] = { 0x09D8B56Eu, 0xC2A93A3Du, 0x905A32E4u, 0xFC0455E5u };
+   std::mutex g_tex_probe_mutex;
+   std::map<std::string, uint64_t> g_tex_probe;
+   std::vector<std::pair<std::string, com_ptr<ID3D11ShaderResourceView>>> g_tex_dump_queue;
+   std::unordered_set<uintptr_t> g_tex_dumped;
    std::mutex g_copy_probe_mutex;
    std::map<std::string, uint64_t> g_copy_probe; // Copies between depth textures during a capture (copies.csv)
    // Shadow maps the game renders into a plain (non array) square depth texture >= 1024 (config "RTAOShadowFlatTargets"):
@@ -641,6 +648,7 @@ public:
       native_shaders_definitions.emplace(CompileTimeStringHash("DS2 RTAO Depth Pack PS"), ShaderDefinition{ "Luma_RTAO", reshade::api::pipeline_subobject_type::pixel_shader, nullptr, "depth_pack_ps" });
       native_shaders_definitions.emplace(CompileTimeStringHash("DS2 RTSun Shadow Copy PS"), ShaderDefinition{ "Luma_RTSunShadowCopy", reshade::api::pipeline_subobject_type::pixel_shader, nullptr, "shadow_copy_ps" });
       native_shaders_definitions.emplace(CompileTimeStringHash("DS2 RTSun Shadow Pack PS"), ShaderDefinition{ "Luma_RTSunShadowCopy", reshade::api::pipeline_subobject_type::pixel_shader, nullptr, "shadow_pack_ps" });
+      native_shaders_definitions.emplace(CompileTimeStringHash("DS2 Tex Dump PS"), ShaderDefinition{ "Luma_TexDump", reshade::api::pipeline_subobject_type::pixel_shader, nullptr, "tex_dump_ps" });
       native_shaders_definitions.emplace(CompileTimeStringHash("DS2 AO View PS"), ShaderDefinition{ "Luma_RTAO", reshade::api::pipeline_subobject_type::pixel_shader, nullptr, "ao_view_ps" });
       native_shaders_definitions.emplace(CompileTimeStringHash("DS2 RTAO Capture CS"), ShaderDefinition{ "Luma_RTAO", reshade::api::pipeline_subobject_type::compute_shader, nullptr, "capture_instances_cs" });
       native_shaders_definitions.emplace(CompileTimeStringHash("DS2 RTAO Skin CS"), ShaderDefinition{ "Luma_RTAO", reshade::api::pipeline_subobject_type::compute_shader, nullptr, "skin_vertices_cs" });
@@ -1034,12 +1042,62 @@ public:
             const std::lock_guard lock(g_draw_probe_mutex);
             g_draw_probe.clear();
          }
+         {
+            const std::lock_guard lock(g_tex_probe_mutex);
+            g_tex_probe.clear();
+            g_tex_dump_queue.clear();
+            g_tex_dumped.clear();
+         }
          g_draw_probe_active = true;
          g_rtdiag.status = "capturing into " + g_rtdiag.dir;
          reshade::log::message(reshade::log::level::info, ("RT diag: capture started, " + g_rtdiag.dir).c_str());
       }
       if (!g_rtdiag.active)
          return;
+
+      // Window material textures queued by the draw probe: 4 per frame into a 512x512 RGBA8 target, saved as PNG
+      {
+         std::vector<std::pair<std::string, com_ptr<ID3D11ShaderResourceView>>> todo;
+         {
+            const std::lock_guard lock(g_tex_probe_mutex);
+            while (!g_tex_dump_queue.empty() && todo.size() < 4)
+            {
+               todo.push_back(std::move(g_tex_dump_queue.back()));
+               g_tex_dump_queue.pop_back();
+            }
+         }
+         const auto copy_vs = device_data.native_vertex_shaders.find(CompileTimeStringHash("Copy VS"));
+         const auto dump_ps = device_data.native_pixel_shaders.find(CompileTimeStringHash("DS2 Tex Dump PS"));
+         if (!todo.empty() && copy_vs != device_data.native_vertex_shaders.end() && copy_vs->second && dump_ps != device_data.native_pixel_shaders.end() && dump_ps->second)
+         {
+            D3D11_TEXTURE2D_DESC desc = { 512, 512, 1, 1, DXGI_FORMAT_R8G8B8A8_UNORM, { 1, 0 }, D3D11_USAGE_DEFAULT, D3D11_BIND_RENDER_TARGET, 0, 0 };
+            com_ptr<ID3D11Texture2D> target, staging;
+            com_ptr<ID3D11RenderTargetView> rtv;
+            native_device->CreateTexture2D(&desc, nullptr, &target);
+            desc.Usage = D3D11_USAGE_STAGING;
+            desc.BindFlags = 0;
+            desc.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+            native_device->CreateTexture2D(&desc, nullptr, &staging);
+            if (target && staging && SUCCEEDED(native_device->CreateRenderTargetView(target.get(), nullptr, &rtv)))
+            {
+               for (auto& item : todo)
+               {
+                  DrawStateStack<DrawStateStackType::FullGraphics> draw_state_stack;
+                  draw_state_stack.Cache(context.get(), device_data.uav_max_count);
+                  DrawCustomPixelShader(context.get(), device_data.default_depth_stencil_state.get(), device_data.default_blend_state.get(), device_data.sampler_state_linear.get(), copy_vs->second.get(), dump_ps->second.get(), item.second.get(), rtv.get(), 512, 512);
+                  draw_state_stack.Restore(context.get());
+                  context->CopyResource(staging.get(), target.get());
+                  D3D11_MAPPED_SUBRESOURCE mapped = {};
+                  if (SUCCEEDED(context->Map(staging.get(), 0, D3D11_MAP_READ, 0, &mapped)))
+                  {
+                     const std::string file = (std::filesystem::path(g_rtdiag.dir) / (item.first + ".png")).string();
+                     stbi_write_png(file.c_str(), 512, 512, 4, mapped.pData, int(mapped.RowPitch));
+                     context->Unmap(staging.get(), 0);
+                  }
+               }
+            }
+         }
+      }
 
       const double t = std::chrono::duration<double>(now - g_rtdiag.start).count();
       const RTAO::CaptureStats stats = g.rtao_capture.GetStats();
@@ -1152,6 +1210,13 @@ public:
             for (const auto& pair : copies)
                copy_csv += pair.first + "," + std::to_string(pair.second) + "\n";
             std::ofstream(std::filesystem::path(g_rtdiag.dir) / "copies.csv") << copy_csv;
+            std::string tex_csv = "mesh_key,ps_hash,slot,resource,srv_format,view_dimension,width,height,mips,array,draws\n";
+            {
+               const std::lock_guard lock(g_tex_probe_mutex);
+               for (const auto& pair : g_tex_probe)
+                  tex_csv += pair.first + "," + std::to_string(pair.second) + "\n";
+            }
+            std::ofstream(std::filesystem::path(g_rtdiag.dir) / "textures.csv") << tex_csv;
          }
          std::ofstream(std::filesystem::path(g_rtdiag.dir) / "timeline.csv") << [&]() {
             std::string all;
@@ -3180,6 +3245,37 @@ public:
       D3D11_VIEWPORT viewport = {};
       UINT viewports = 1;
       context->RSGetViewports(&viewports, &viewport);
+      if (!depth_desc.DepthWriteMask && rtv_count > 0 && std::find(std::begin(kWindowPixelShaders), std::end(kWindowPixelShaders), ps_hash) != std::end(kWindowPixelShaders))
+      {
+         ID3D11ShaderResourceView* srvs[12] = {};
+         context->PSGetShaderResources(0, 12, srvs);
+         for (uint32_t slot = 0; slot < 12; slot++)
+         {
+            if (!srvs[slot])
+               continue;
+            D3D11_SHADER_RESOURCE_VIEW_DESC sd;
+            srvs[slot]->GetDesc(&sd);
+            com_ptr<ID3D11Resource> res;
+            srvs[slot]->GetResource(&res);
+            com_ptr<ID3D11Texture2D> t2d;
+            D3D11_TEXTURE2D_DESC td = {};
+            if (res && SUCCEEDED(res->QueryInterface(&t2d)))
+               t2d->GetDesc(&td);
+            char row[200];
+            snprintf(row, sizeof(row), "%016llX,%08X,%u,%llX,%d,%d,%u,%u,%u,%u", (unsigned long long)key, ps_hash, slot, (unsigned long long)uintptr_t(res.get()), int(sd.Format), int(sd.ViewDimension), td.Width, td.Height, td.MipLevels, td.ArraySize);
+            {
+               const std::lock_guard lock(g_tex_probe_mutex);
+               g_tex_probe[row]++;
+               if (sd.ViewDimension == D3D11_SRV_DIMENSION_TEXTURE2D && td.Width >= 16 && g_tex_dumped.size() < 48 && g_tex_dumped.insert(uintptr_t(res.get())).second)
+               {
+                  char name[96];
+                  snprintf(name, sizeof(name), "tex_%08X_t%u_%llX", ps_hash, slot, (unsigned long long)uintptr_t(res.get()));
+                  g_tex_dump_queue.emplace_back(name, com_ptr<ID3D11ShaderResourceView>(srvs[slot], true));
+               }
+            }
+            srvs[slot]->Release();
+         }
+      }
       const D3D11_RENDER_TARGET_BLEND_DESC& rt0 = blend_desc.RenderTarget[0];
       char row[400];
       snprintf(row, sizeof(row), "%016llX,%llX,%u,%u,%d,%08X,%08X,%d,%d,%d,%d,%d,%d,%d,%d,%u,%d,%d,%d,%.3f,%d,%.0f,%.0f,%.0f,%.0f,%d",

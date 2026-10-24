@@ -4299,15 +4299,6 @@ public:
             status = g_rtao_status;
          }
          ImGui::TextWrapped("RTAO status: %s", status.empty() ? "waiting for the SSAO pass" : status.c_str());
-         static const char* rtao_output_names[RTAO_OUTPUT_COUNT] = { "Ray traced AO", "Test pattern (interop check)", "Depth test AO (no ray tracing)", "BLAS coverage (debug)", "Ray traced AO, no denoiser" };
-         if (ImGui::Combo("RTAO Output", &g_rtao_debug_mode, rtao_output_names, RTAO_OUTPUT_COUNT))
-            reshade::set_config_value(runtime, NAME, "RTAOTestOutput", g_rtao_debug_mode);
-         if (ImGui::IsItemHovered())
-            ImGui::SetTooltip("BLAS coverage: white = captured geometry matches the depth buffer, grey = geometry missing from the ray tracing scene, black = geometry in front of what the depth shows (misplaced or extra).");
-         if (ImGui::SliderFloat("RTAO Radius", &g_rtao_radius, 0.05f, 10.f, "%.2f", ImGuiSliderFlags_Logarithmic))
-            g_rtao_radius = std::clamp(g_rtao_radius, 0.05f, 50.f);
-         if (ImGui::IsItemDeactivatedAfterEdit())
-            reshade::set_config_value(runtime, NAME, "RTAORadius", g_rtao_radius);
          static const char* rtao_quality_names[RTAO_QUALITY_COUNT] = { "Low (half resolution trace)", "Medium (half the rays)", "High" };
          if (ImGui::Combo("RTAO Quality", &g_rtao_quality, rtao_quality_names, RTAO_QUALITY_COUNT))
             reshade::set_config_value(runtime, NAME, "RTAOQuality", g_rtao_quality);
@@ -4318,11 +4309,19 @@ public:
             g_rtao_rays = std::clamp(g_rtao_rays, 1, 64);
          if (ImGui::IsItemDeactivatedAfterEdit())
             reshade::set_config_value(runtime, NAME, "RTAORays", g_rtao_rays);
-         static const char* capture_pass_names[] = { "Depth only draws", "All depth writing draws" };
-         if (ImGui::Combo("RTAO Capture", &g_rtao_capture_pass, capture_pass_names, IM_ARRAYSIZE(capture_pass_names)))
-            reshade::set_config_value(runtime, NAME, "RTAOCapturePass", g_rtao_capture_pass);
+         if (ImGui::SliderFloat("RTAO Radius", &g_rtao_radius, 0.05f, 10.f, "%.2f", ImGuiSliderFlags_Logarithmic))
+            g_rtao_radius = std::clamp(g_rtao_radius, 0.05f, 50.f);
+         if (ImGui::IsItemDeactivatedAfterEdit())
+            reshade::set_config_value(runtime, NAME, "RTAORadius", g_rtao_radius);
+         if (ImGui::SliderFloat("RTAO Strength", &g_rtao_strength, 0.25f, 4.f, "%.2f"))
+            g_rtao_strength = std::clamp(g_rtao_strength, 0.25f, 4.f);
+         if (ImGui::IsItemDeactivatedAfterEdit())
+            reshade::set_config_value(runtime, NAME, "RTAOStrength", g_rtao_strength);
          if (ImGui::IsItemHovered())
-            ImGui::SetTooltip("Which main view draws feed the ray tracing scene. Use \"All\" if the coverage view shows missing (grey) geometry.");
+            ImGui::SetTooltip("Deepens (> 1) or lightens (< 1) the ray traced AO: a power curve on the result. 1 = as traced, 2 = default.");
+         DrawResetButton(g_rtao_strength, 2.f, "RTAOStrength");
+
+         ImGui::SeparatorText("RTAO: What Occludes");
          if (ImGui::Checkbox("RTAO: skinned characters", &g_rtao_skinned))
             reshade::set_config_value(runtime, NAME, "RTAOSkinned", g_rtao_skinned);
          if (ImGui::IsItemHovered())
@@ -4331,17 +4330,6 @@ public:
             reshade::set_config_value(runtime, NAME, "RTAODynamic", g_rtao_dynamic);
          if (ImGui::IsItemHovered())
             ImGui::SetTooltip("Movable objects whose vertices the game rewrites every frame (openable doors, windows, cabinets):\ncopied at each draw and built into a per frame BLAS.");
-         if (ImGui::Checkbox("RTAO: shadow map casters", &g_rtao_shadow_casters))
-            reshade::set_config_value(runtime, NAME, "RTAOShadowCasters", g_rtao_shadow_casters);
-         if (ImGui::IsItemHovered())
-            ImGui::SetTooltip("Also captures what the game draws into its shadow maps: walls, roofs and window frames behind or beside the camera,\nwhich the camera never draws but which cast the sun's shadows into view (RT sun shadows). Characters are not taken from there.\nChanges apply to newly captured geometry; what is already in the scene ages out within a few seconds.");
-         if (ImGui::SliderFloat("RTAO Strength", &g_rtao_strength, 0.25f, 4.f, "%.2f"))
-            g_rtao_strength = std::clamp(g_rtao_strength, 0.25f, 4.f);
-         if (ImGui::IsItemDeactivatedAfterEdit())
-            reshade::set_config_value(runtime, NAME, "RTAOStrength", g_rtao_strength);
-         if (ImGui::IsItemHovered())
-            ImGui::SetTooltip("Deepens (> 1) or lightens (< 1) the ray traced AO: a power curve on the result. 1 = as traced, 2 = default.");
-         DrawResetButton(g_rtao_strength, 2.f, "RTAOStrength");
          if (ImGui::Checkbox("RTAO: wind meshes", &g_rtao_wind_meshes))
             reshade::set_config_value(runtime, NAME, "RTAOWindMeshes", g_rtao_wind_meshes);
          if (ImGui::IsItemHovered())
@@ -4350,30 +4338,49 @@ public:
             reshade::set_config_value(runtime, NAME, "RTAOCutouts", g_rtao_cutouts);
          if (ImGui::IsItemHovered())
             ImGui::SetTooltip("Alpha tested geometry (leaves, grates, fences, hair cards) in the ray tracing scene, as partially occluding cutouts (see the opacity below).\nChanges apply to newly captured geometry; what is already in the scene ages out within a few seconds.");
-         if (ImGui::SliderFloat("RTAO Cutout Opacity", &g_rtao_cutout_opacity, 0.f, 1.f, "%.2f"))
-            g_rtao_cutout_opacity = std::clamp(g_rtao_cutout_opacity, 0.f, 1.f);
-   if (ImGui::IsItemDeactivatedAfterEdit())
-            reshade::set_config_value(runtime, NAME, "RTAOCutoutOpacity", g_rtao_cutout_opacity);
-         if (ImGui::IsItemHovered())
-            ImGui::SetTooltip("How much alpha tested surfaces occlude: the chance that a ray crossing one stops there.\nWith \"texture exact\" on, only for the cutouts that have no alpha mask (yet).\n0 = left out, 1 = as solid as the rest (cheapest).");
-         DrawResetButton(g_rtao_cutout_opacity, 0.5f, "RTAOCutoutOpacity");
-         if (ImGui::Checkbox("RTAO: fast cutouts", &g_rtao_fast_cutouts))
-            reshade::set_config_value(runtime, NAME, "RTAOFastCutouts", g_rtao_fast_cutouts);
-         if (ImGui::IsItemHovered())
-            ImGui::SetTooltip("Decides once per ray whether cutouts are solid or absent (instead of at every crossed leaf), which skips the per triangle\ncandidate handling: cheaper in foliage (about a quarter of the trace there), slightly different AO under dense vegetation.\nWith \"texture exact\" on, the masks take precedence: the per ray coin only decides cutouts without a mask, so it saves nothing.");
-         if (ImGui::Checkbox("RTAO: skip repeated draws", &g_rtao_dedup))
-            reshade::set_config_value(runtime, NAME, "RTAODedup", g_rtao_dedup);
-         if (ImGui::IsItemHovered())
-            ImGui::SetTooltip("Captures an object once per frame even if several passes draw it (depth prepass, G-buffer): saves the per draw\ncapture work on the game's render threads and duplicate per frame BLASes of characters. Turn off if geometry goes missing.");
-         if (ImGui::SliderInt("RTAO: skinned mesh hold (frames)", &g_rtao_skinned_hold, 0, 120))
-            reshade::set_config_value(runtime, NAME, "RTAOSkinnedHoldFrames", g_rtao_skinned_hold);
-         if (ImGui::IsItemHovered())
-            ImGui::SetTooltip("How many frames a skinned mesh (a character, a swinging window flap) keeps its last pose when a frame misses its\ndraw. A newer draw of the same mesh replaces it at once. 0: current frame only.");
          if (ImGui::Checkbox("RTAO cutouts: texture exact", &g_rtao_cutouts_exact))
             reshade::set_config_value(runtime, NAME, "RTAOCutoutsExact", g_rtao_cutouts_exact);
          if (ImGui::IsItemHovered())
             ImGui::SetTooltip("Alpha tested surfaces occlude exactly where their texture is solid (leaf shaped AO), like the game's alpha test:\neach material's alpha is rendered once into a mask the rays test per hit.\nOff: every cutout uses the opacity above.");
+         if (ImGui::SliderFloat("RTAO Cutout Opacity", &g_rtao_cutout_opacity, 0.f, 1.f, "%.2f"))
+            g_rtao_cutout_opacity = std::clamp(g_rtao_cutout_opacity, 0.f, 1.f);
+         if (ImGui::IsItemDeactivatedAfterEdit())
+            reshade::set_config_value(runtime, NAME, "RTAOCutoutOpacity", g_rtao_cutout_opacity);
+         if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("How much alpha tested surfaces occlude: the chance that a ray crossing one stops there.\nWith \"texture exact\" on, only for the cutouts that have no alpha mask (yet).\n0 = left out, 1 = as solid as the rest (cheapest).");
+         DrawResetButton(g_rtao_cutout_opacity, 0.5f, "RTAOCutoutOpacity");
 
+         // Debug and tuning, collapsed
+         if (ImGui::TreeNode("RTAO debug"))
+         {
+            static const char* rtao_output_names[RTAO_OUTPUT_COUNT] = { "Ray traced AO", "Test pattern (interop check)", "Depth test AO (no ray tracing)", "BLAS coverage (debug)", "Ray traced AO, no denoiser" };
+            if (ImGui::Combo("RTAO Output", &g_rtao_debug_mode, rtao_output_names, RTAO_OUTPUT_COUNT))
+               reshade::set_config_value(runtime, NAME, "RTAOTestOutput", g_rtao_debug_mode);
+            if (ImGui::IsItemHovered())
+               ImGui::SetTooltip("BLAS coverage: white = captured geometry matches the depth buffer, grey = geometry missing from the ray tracing scene, black = geometry in front of what the depth shows (misplaced or extra).");
+            static const char* capture_pass_names[] = { "Depth only draws", "All depth writing draws" };
+            if (ImGui::Combo("RTAO Capture", &g_rtao_capture_pass, capture_pass_names, IM_ARRAYSIZE(capture_pass_names)))
+               reshade::set_config_value(runtime, NAME, "RTAOCapturePass", g_rtao_capture_pass);
+            if (ImGui::IsItemHovered())
+               ImGui::SetTooltip("Which main view draws feed the ray tracing scene. Use \"All\" if the coverage view shows missing (grey) geometry.");
+            if (ImGui::Checkbox("RTAO: shadow map casters", &g_rtao_shadow_casters))
+               reshade::set_config_value(runtime, NAME, "RTAOShadowCasters", g_rtao_shadow_casters);
+            if (ImGui::IsItemHovered())
+               ImGui::SetTooltip("Also captures what the game draws into its shadow maps: walls, roofs and window frames behind or beside the camera,\nwhich the camera never draws but which cast the sun's shadows into view (RT sun shadows). Characters are not taken from there.\nChanges apply to newly captured geometry; what is already in the scene ages out within a few seconds.");
+            if (ImGui::Checkbox("RTAO: fast cutouts", &g_rtao_fast_cutouts))
+               reshade::set_config_value(runtime, NAME, "RTAOFastCutouts", g_rtao_fast_cutouts);
+            if (ImGui::IsItemHovered())
+               ImGui::SetTooltip("Decides once per ray whether cutouts are solid or absent (instead of at every crossed leaf), which skips the per triangle\ncandidate handling: cheaper in foliage (about a quarter of the trace there), slightly different AO under dense vegetation.\nWith \"texture exact\" on, the masks take precedence: the per ray coin only decides cutouts without a mask, so it saves nothing.");
+            if (ImGui::Checkbox("RTAO: skip repeated draws", &g_rtao_dedup))
+               reshade::set_config_value(runtime, NAME, "RTAODedup", g_rtao_dedup);
+            if (ImGui::IsItemHovered())
+               ImGui::SetTooltip("Captures an object once per frame even if several passes draw it (depth prepass, G-buffer): saves the per draw\ncapture work on the game's render threads and duplicate per frame BLASes of characters. Turn off if geometry goes missing.");
+            if (ImGui::SliderInt("RTAO: skinned mesh hold (frames)", &g_rtao_skinned_hold, 0, 120))
+               reshade::set_config_value(runtime, NAME, "RTAOSkinnedHoldFrames", g_rtao_skinned_hold);
+            if (ImGui::IsItemHovered())
+               ImGui::SetTooltip("How many frames a skinned mesh (a character, a swinging window flap) keeps its last pose when a frame misses its\ndraw. A newer draw of the same mesh replaces it at once. 0: current frame only.");
+            ImGui::TreePop();
+         }
          auto& game_device_data = GetGameDeviceData(device_data);
          if (game_device_data.rtao_capture.IsInitialized() && ImGui::TreeNode("RTAO stats"))
          {

@@ -422,15 +422,28 @@ void main(uint3 id : SV_DispatchThreadID)
         RayQuery<RAY_FLAG_ACCEPT_FIRST_HIT_AND_END_SEARCH | RAY_FLAG_SKIP_PROCEDURAL_PRIMITIVES> q;
         q.TraceRayInline(Scene, flags_i, mask_i, ray);
         const uint seed = Hash(px.x * 0x9E3779B9u + Hash(px.y + Hash(Frame * 64 + i + 0x68E31DA4u)));
-        while (q.Proceed())
+        // Textured windows let a fraction through: their transmission (1 - the mask's opacity at the hit) multiplies into
+        // the ray, which goes on (no random pass/stop: one ray gives the smooth value, no fizzle)
+        float transmission = 1.0;
+        uint guard = 0;
+        while (q.Proceed() && guard++ < 256)
         {
-            if (q.CandidateType() == CANDIDATE_NON_OPAQUE_TRIANGLE &&
-                CandidateBlocks(q.CandidateInstanceID(), q.CandidateInstanceContributionToHitGroupIndex(), q.CandidateInstanceIndex(), q.CandidatePrimitiveIndex(),
+            if (q.CandidateType() != CANDIDATE_NON_OPAQUE_TRIANGLE)
+                continue;
+            const uint flags = q.CandidateInstanceContributionToHitGroupIndex();
+            if ((flags & kFlagWindow) != 0 && (q.CandidateInstanceID() & kInstanceIdCutoutBit) != 0)
+            {
+                float alpha_ref;
+                float opacity = CutoutAlphaSample(q.CandidateInstanceID(), q.CandidatePrimitiveIndex(), q.CandidateTriangleBarycentrics(), alpha_ref);
+                transmission *= opacity < 0.0 ? 1.0 : saturate(1.0 - opacity); // No mask yet: clear
+                continue;
+            }
+            if (CandidateBlocks(q.CandidateInstanceID(), flags, q.CandidateInstanceIndex(), q.CandidatePrimitiveIndex(),
                     q.CandidateTriangleBarycentrics(), q.CandidateTriangleRayT(), ray.Origin, ray.Direction, fallback_coin, seed, consult))
                 q.CommitNonOpaqueTriangleHit();
         }
         if (q.CommittedStatus() != COMMITTED_TRIANGLE_HIT)
-            lit += 1.0;
+            lit += transmission;
     }
     float vis = lit / float(rays);
     // Textured windows, sharpness: a thin lead line is thinner than the sun's penumbra over the window to receiver

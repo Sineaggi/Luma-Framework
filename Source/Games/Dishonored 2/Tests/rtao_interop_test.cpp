@@ -357,6 +357,16 @@ static void TestTlasRetention()
          shadow.BeginFrame();
       CHECK(shadow.RetainedCount() >= 50 && shadow.RetainedCount() <= 50 + 40 * (RTAO::TlasBuilder::kDynamicRetainFrames + 2), "after the particles stop, the static burst stays (retained %zu)", shadow.RetainedCount());
    }
+   // A textured window (camera only, window flag) is kept like static shadow map content when out of view
+   {
+      RTAO::TlasBuilder windows;
+      const float pane[3][4] = { { 1, 0, 0, 5 }, { 0, 1, 0, 0 }, { 0, 0, 1, 0 } };
+      windows.BeginFrame();
+      windows.AddInstance(77, 9, pane, RTAO::kInstanceMaskCutout, 0, uint8_t(RTAO::kInstanceSourceMain | RTAO::kInstanceFlagWindow));
+      for (uint32_t i = 0; i < RTAO::TlasBuilder::kRetainFrames + 100; i++)
+         windows.BeginFrame();
+      CHECK(windows.RetainedCount() == 1, "a textured window out of view must be kept (retained %zu)", windows.RetainedCount());
+   }
    printf("TLAS retention: ok\n");
 }
 
@@ -2387,6 +2397,25 @@ static void TestCutoutTextures(ID3D11Device* device, ID3D11DeviceContext* contex
          sun_settings.ray_count = 4;
          sun_on = false;
          draw = saved;
+      }
+      // One ray per pixel, one frame: the transmission is multiplied in (no random pass/stop), so the half density black
+      // glass gives exactly half the light everywhere
+      {
+         draw.ps = &window_ps;
+         draw.alpha_srv = normal_srv;
+         draw.alpha_srv2 = glass_srv;
+         draw.alpha_param = 0.5f;
+         draw.material_cb = nullptr;
+         draw.window = true;
+         sun_on = true;
+         sun_settings.ray_count = 1;
+         float l = 0.f, r = 0.f;
+         measure_sun(l, r);
+         sun_settings.ray_count = 4;
+         sun_on = false;
+         draw = saved;
+         printf("RT sun through the stained glass, 1 ray per pixel: %.3f / %.3f\n", l, r);
+         CHECK(l > 0.98f && r > 0.47f && r < 0.53f, "one ray must give the glass's transmission without noise (%.3f / %.3f)", l, r);
       }
       printf("RT sun through a stained glass window (pattern 8), left (white glass) / right (black glass): density 1 %.3f / %.3f, density 0.5 %.3f / %.3f\n",
          results[0][0], results[0][1], results[1][0], results[1][1]);

@@ -593,7 +593,9 @@ namespace RTAO
          {
             auto d = shadow ? dynamic_latest.find(instance.blas_key) : dynamic_latest.end();
             const bool dynamic = d != dynamic_latest.end() && instance.last_frame + kDynamicRetainFrames < d->second; // Older than its mesh's latest draw
-            shadow_static = shadow && !instance.moved && !dynamic;
+            // Textured windows too: the pane is drawn by the camera only, and a window out of view for a few seconds
+            // must not drop out (its glass shadow would blink back to full light)
+            shadow_static = (shadow || (instance.sources & kInstanceFlagWindow)) && !instance.moved && !dynamic;
             promoted = shadow_static || instance.seen_frames >= promote_frames;
             max_age = shadow_static ? UINT32_MAX : (instance.moved || dynamic ? 0 : (promoted ? retain_frames : young_retain_frames));
             s.dynamic_dropped += dynamic;

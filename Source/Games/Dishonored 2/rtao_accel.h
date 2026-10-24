@@ -212,6 +212,8 @@ namespace RTAO
       static constexpr uint32_t kShadowPromoteFrames = 3;
       static constexpr uint32_t kShadowRetainFrames = 7200;
       static constexpr uint32_t kShadowYoungRetainFrames = 4;
+      // A retained instance whose BLAS has been missing this many builds (mesh freed, e.g. a level change) is dropped
+      static constexpr uint32_t kMissingBlasFrames = 120;
 
       ~TlasBuilder() { Clear(nullptr, 0); }
 
@@ -250,6 +252,7 @@ namespace RTAO
          uint32_t cutout_record;
          uint8_t mask;
          uint8_t sources;
+         uint32_t missing_frames; // Consecutive builds its BLAS was missing
       };
       RetentionStats retention_stats;
       uint32_t added_new = 0;
@@ -259,6 +262,7 @@ namespace RTAO
       uint32_t frame = 0;
       uint32_t last_cutout_count = 0;
       uint32_t last_missing_blas = 0;
+      uint32_t last_dropped_missing = 0;
 
       static constexpr uint32_t kSlots = 3; // Matches Interop's frames in flight
       ID3D12Resource* instance_upload[kSlots] = {};

@@ -508,6 +508,7 @@ namespace RTAO
       {
          instance.seen_frames = 1;
          instance.sources = 0;
+         instance.missing_frames = 0;
          added_new++;
       }
       else if (instance.last_frame != frame)
@@ -552,18 +553,31 @@ namespace RTAO
       frame_slot %= kSlots;
       last_cutout_count = 0;
       last_missing_blas = 0;
+      last_dropped_missing = 0;
       {
          const std::lock_guard lock(mutex);
          descs.clear();
          descs.reserve(instances.size() + frame_instances.size());
-         for (const auto& pair : instances)
+         for (auto it = instances.begin(); it != instances.end();)
          {
+            auto& pair = *it;
             const D3D12_GPU_VIRTUAL_ADDRESS blas = blases.Get(pair.second.blas_key);
             if (!blas)
             {
+               // Not built yet, or its mesh is gone (the game freed the buffers, e.g. the menu's scene after a level
+               // load): dropped once it has been missing for kMissingBlasFrames
+               if (++it->second.missing_frames > kMissingBlasFrames)
+               {
+                  it = instances.erase(it);
+                  last_dropped_missing++;
+                  continue;
+               }
                last_missing_blas++;
-               continue; // Not built (yet)
+               ++it;
+               continue;
             }
+            it->second.missing_frames = 0;
+            ++it;
             D3D12_RAYTRACING_INSTANCE_DESC desc = {};
             std::memcpy(desc.Transform, pair.second.transform, sizeof(desc.Transform));
             desc.InstanceID = uint32_t(descs.size()) & (kInstanceIdCutoutBit - 1);

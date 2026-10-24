@@ -781,6 +781,8 @@ namespace RTAO
             const bool camera_only = !(pair.second.sources & (kInstanceSourceShadow | kInstanceFlagWindow));
             if (camera_only)
                desc.InstanceMask = (pair.second.mask & kInstanceMaskCutout) ? kInstanceMaskCameraOnlyCutout : kInstanceMaskCameraOnly;
+            if (pair.second.sources & kInstanceFlagWindow)
+               desc.InstanceMask |= kInstanceMaskWindow;
             desc.Flags = D3D12_RAYTRACING_INSTANCE_FLAG_TRIANGLE_CULL_DISABLE |
                ((camera_only && camera_only_non_opaque) ? D3D12_RAYTRACING_INSTANCE_FLAG_FORCE_NON_OPAQUE : D3D12_RAYTRACING_INSTANCE_FLAG_FORCE_OPAQUE);
             if (pair.second.mask & kInstanceMaskCutout)

@@ -459,8 +459,11 @@ cbuffer AlphaStripParams : register(b0)
                        // BC5 SNORM normal map (raised = lead), 5 one minus channel x, 6 channel x, 7 one minus the luminance
     uint AlphaSourceMips; // Mips in the view
     float2 AlphaSourceSize; // Size of the view's most detailed mip
+    float GlassDensity; // Mode 8: how much the glass texture (AlphaSource2) holds back the light (0: clear glass, 1: as its luminance)
+    float3 StripPad;
 };
 Texture2D<float4> AlphaSource : register(t0);
+Texture2D<float4> AlphaSource2 : register(t1); // Mode 8: the window's glass texture (emissive or diffuse)
 SamplerState AlphaSampler : register(s0); // Linear, wrap
 RWTexture2D<unorm float> AlphaTile : register(u0);
 
@@ -473,6 +476,24 @@ void alpha_strip_cs(uint3 id : SV_DispatchThreadID)
     float sample_lod = min(lod, last);
     // Taps per axis to cover what the missing mips would have averaged (1 when the view has the mip)
     uint taps = (uint)clamp(exp2(ceil(lod - sample_lod)), 1.0, 4.0);
+    // Window lead from a normal map (mode 4): the thin lead lines must survive the reduction to the tile, so the most
+    // detailed mip is read over the tile texel's footprint (up to 8x8 taps) and the maximum is kept (any lead counts)
+    const bool keep_max = AlphaChannel == 4 || AlphaChannel == 8;
+    // Mode 8: the glass texture's luminance, relative to its average (its last mip), at its mip closest to the tile
+    float glass_lod = 0.0, glass_avg = 1.0;
+    if (AlphaChannel == 8)
+    {
+        uint gw, gh, gmips;
+        AlphaSource2.GetDimensions(0, gw, gh, gmips);
+        glass_lod = max(log2(max(float(gw), float(gh)) / tile), 0.0);
+        glass_avg = max(dot(saturate(AlphaSource2.SampleLevel(AlphaSampler, float2(0.5, 0.5), float(gmips - 1)).rgb), float3(0.299, 0.587, 0.114)), 1e-4);
+    }
+    float glass_sum = 0.0;
+    if (keep_max)
+    {
+        sample_lod = 0.0;
+        taps = (uint)clamp(exp2(ceil(lod)), 1.0, 8.0);
+    }
     float value = 0.0;
     [loop] for (uint y = 0; y < taps; y++)
     {
@@ -481,7 +502,7 @@ void alpha_strip_cs(uint3 id : SV_DispatchThreadID)
             float2 uv = (float2(id.xy) + (float2(x, y) + 0.5) / float(taps)) / tile;
             float4 texel = AlphaSource.SampleLevel(AlphaSampler, uv, sample_lod);
             float v;
-            if (AlphaChannel == 4)
+            if (AlphaChannel == 4 || AlphaChannel == 8)
                 v = saturate(length(texel.xy) * 2.0);
             else if (AlphaChannel == 5)
                 v = 1.0 - texel.x;
@@ -491,8 +512,17 @@ void alpha_strip_cs(uint3 id : SV_DispatchThreadID)
                 v = 1.0 - dot(saturate(texel.rgb), float3(0.299, 0.587, 0.114));
             else
                 v = AlphaChannel == 0 ? texel.x : (AlphaChannel == 1 ? texel.y : (AlphaChannel == 2 ? texel.z : texel.w));
-            value += v;
+            value = keep_max ? max(value, v) : value + v;
+            if (AlphaChannel == 8)
+            {
+                float lum = dot(saturate(AlphaSource2.SampleLevel(AlphaSampler, uv, glass_lod).rgb), float3(0.299, 0.587, 0.114));
+                glass_sum += lerp(1.0, saturate(lum / (2.0 * glass_avg)), saturate(GlassDensity));
+            }
         }
     }
-    AlphaTile[id.xy] = value / float(taps * taps);
+    // Stored: the opacity (mode 8: 1 - no lead x the glass transmission)
+    float opacity = keep_max ? value : value / float(taps * taps);
+    if (AlphaChannel == 8)
+        opacity = 1.0 - (1.0 - value) * (glass_sum / float(taps * taps));
+    AlphaTile[id.xy] = opacity;
 }

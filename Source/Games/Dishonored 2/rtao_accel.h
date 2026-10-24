@@ -33,6 +33,7 @@ namespace RTAO
    // they occlude the AO but the RT sun can leave them out, like the game's own shadows (RTSun "shadow casters only")
    constexpr uint8_t kInstanceMaskCameraOnly = 0x04;
    constexpr uint8_t kInstanceMaskCameraOnlyCutout = 0x08;
+   constexpr uint8_t kInstanceMaskWindow = 0x10; // Textured windows (also kInstanceMaskCutout): the RT sun's window sharpness ray
    constexpr uint32_t kInstanceIdCutoutBit = 1u << 23;
    // The low 23 bits of a cutout's InstanceID: its texture exact cutout record (rtao_alpha.h), or this (none: the trace
    // falls back to the stochastic opacity)

@@ -62,7 +62,8 @@ namespace RTSun
       uint32_t shadow_pad;
       float shadow_bias_constant;
       float shadow_bias_slope;
-      uint32_t bias_pad[2];
+      float window_sharpness;
+      uint32_t bias_pad;
    };
    static_assert(sizeof(SunConstants) == 320);
 
@@ -123,6 +124,8 @@ namespace RTSun
       // The game's shadow map rasterizer bias (depth units, and the slope factor): the reproduction allows for it
       float shadow_bias_constant = 0.f;
       float shadow_bias_slope = 0.f;
+      // Textured windows: weight of the extra hard ray against the windows (0: off, 1: lead lines fully dark)
+      float window_sharpness = 0.f;
       // Diagnostics: trace the game's shadow map texels against our scene (needs the shadow target; GetShadowRepro)
       bool shadow_repro = false;
    };

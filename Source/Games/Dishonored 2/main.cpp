@@ -402,10 +402,16 @@ namespace
    // luminance. The colour pass of the window shaders registers, per mesh, the pattern's texture and the UVs; the
    // mesh's motion vector pass draw (its geometry capture) then becomes a cutout with that mask.
    bool g_rtsun_textured_windows = false;
-   int g_rtsun_window_pattern = 4;
+   // 4 lead only (normal map), 5/6 the one channel map, 7 diffuse luminance, 8 lead x glass from the emissive texture
+   // (the stained glass as lit from behind, default), 9 lead x glass from the diffuse texture
+   int g_rtsun_window_pattern = 8;
+   float g_rtsun_glass_density = 0.6f; // Config "RTSunGlassDensity": how much the glass texture holds back the light
+   float g_rtsun_window_sharpness = 0.f; // Config "RTSunWindowSharpness": RTSun::SunSettings::window_sharpness
    struct WindowMaterial
    {
       com_ptr<ID3D11ShaderResourceView> srv;
+      com_ptr<ID3D11ShaderResourceView> srv2; // Patterns 8/9: the glass texture
+      float density = 0.f;
       com_ptr<ID3D11Buffer> uv_buffer;
       UINT uv_stride = 0, uv_offset = 0, uv_element_offset = 0;
       DXGI_FORMAT uv_format = DXGI_FORMAT_UNKNOWN;
@@ -414,7 +420,7 @@ namespace
    std::mutex g_window_mutex;
    std::unordered_map<uint64_t, WindowMaterial> g_windows;
    std::atomic<uint64_t> g_window_registered = 0, g_window_captured = 0;
-   RTAO::PixelShaderInfo g_window_ps[8]; // Per pattern mode: texture exact, reference 0.5, TEXCOORD0 as is
+   RTAO::PixelShaderInfo g_window_ps[10]; // Per pattern mode: texture exact, reference 0.5, TEXCOORD0 as is (9 uses mode 8)
    std::mutex g_tex_probe_mutex;
    std::map<std::string, uint64_t> g_tex_probe;
    std::vector<std::pair<std::string, com_ptr<ID3D11ShaderResourceView>>> g_tex_dump_queue;
@@ -1770,6 +1776,7 @@ public:
          const double r = depth_format == DXGI_FORMAT_D16_UNORM ? 1.0 / 65535.0 : (depth_format == DXGI_FORMAT_D24_UNORM_S8_UINT ? 1.0 / 16777215.0 : 1.0 / 16777216.0);
          out.shadow_bias_constant = float(double(g_shadow_depth_bias.load()) * r);
          out.shadow_bias_slope = g_shadow_slope_bias.load();
+         out.window_sharpness = g_rtsun_textured_windows ? std::clamp(g_rtsun_window_sharpness, 0.f, 1.f) : 0.f;
       }
       const int output = std::clamp(g_rtsun_output, 0, int(RTSun::Output::Count) - 1);
       out.output = RTSun::Output(output);
@@ -3220,26 +3227,33 @@ public:
       }
       if (!layout_info.texcoord0.present || layout_info.texcoord0.per_instance)
          return;
-      const uint32_t pattern = uint32_t(std::clamp(g_rtsun_window_pattern, 4, 7));
+      const uint32_t pattern = uint32_t(std::clamp(g_rtsun_window_pattern, 4, 9));
       // Texture slots of the window shaders (their reflection): normal t3, one channel map t4, diffuse t6 (FC0455E5: t5)
       const uint32_t diffuse_slot = ps_hash == 0xFC0455E5u ? 5 : 6;
-      const uint32_t slot = pattern == 4 ? 3 : (pattern == 7 ? diffuse_slot : 4);
+      // Emissive: t5 (FC0455E5 has none bound: its diffuse instead)
+      const uint32_t emissive_slot = ps_hash == 0xFC0455E5u ? diffuse_slot : 5;
+      const uint32_t slot = (pattern == 4 || pattern >= 8) ? 3 : (pattern == 7 ? diffuse_slot : 4);
+      const uint32_t slot2 = pattern == 8 ? emissive_slot : (pattern == 9 ? diffuse_slot : UINT32_MAX);
+      const float density = std::clamp(g_rtsun_glass_density, 0.f, 1.f);
       const uint64_t key = DrawMeshKey(context, layout_info, index_count, first_index, vertex_offset);
       if (!key)
          return;
       {
          const std::lock_guard lock(g_window_mutex);
          auto it = g_windows.find(key);
-         if (it != g_windows.end() && it->second.pattern == pattern)
+         if (it != g_windows.end() && it->second.pattern == pattern && it->second.density == density)
             return;
       }
       WindowMaterial material;
       context->PSGetShaderResources(slot, 1, &material.srv);
+      if (slot2 != UINT32_MAX)
+         context->PSGetShaderResources(slot2, 1, &material.srv2);
+      material.density = density;
       context->IAGetVertexBuffers(layout_info.texcoord0.slot, 1, &material.uv_buffer, &material.uv_stride, &material.uv_offset);
       material.uv_element_offset = layout_info.texcoord0.offset;
       material.uv_format = layout_info.texcoord0.format;
       material.pattern = pattern;
-      if (!material.srv || !material.uv_buffer)
+      if (!material.srv || !material.uv_buffer || (slot2 != UINT32_MAX && !material.srv2))
          return;
       const std::lock_guard lock(g_window_mutex);
       if (g_windows.size() < 1024)
@@ -3691,12 +3705,14 @@ public:
             if (key && it != g_windows.end())
                window_material = it->second;
          }
-         if (window_material.srv && window_material.uv_buffer && window_material.pattern >= 4 && window_material.pattern <= 7)
+         if (window_material.srv && window_material.uv_buffer && window_material.pattern >= 4 && window_material.pattern <= 9)
          {
             draw.cutout = true;
             draw.window = true;
             draw.ps = &g_window_ps[window_material.pattern];
             draw.alpha_srv = window_material.srv.get();
+            draw.alpha_srv2 = window_material.srv2.get();
+            draw.alpha_param = window_material.density;
             draw.material_cb = nullptr;
             draw.uv.buffer = window_material.uv_buffer.get();
             draw.uv.stride = window_material.uv_stride;
@@ -4144,13 +4160,15 @@ public:
       reshade::get_config_value(runtime, NAME, "RTAOShadowAtlasCasters", g_rtao_shadow_atlas_casters);
       reshade::get_config_value(runtime, NAME, "RTSunTexturedWindows", g_rtsun_textured_windows);
       reshade::get_config_value(runtime, NAME, "RTSunWindowPattern", g_rtsun_window_pattern);
-      for (uint32_t mode = 0; mode < 8; mode++)
+      reshade::get_config_value(runtime, NAME, "RTSunWindowSharpness", g_rtsun_window_sharpness);
+      reshade::get_config_value(runtime, NAME, "RTSunGlassDensity", g_rtsun_glass_density);
+      for (uint32_t mode = 0; mode < 10; mode++)
       {
          RTAO::PixelShaderInfo& info = g_window_ps[mode];
          info.discard = true;
          info.alpha_tested = true;
          info.texture_exact = true;
-         info.alpha_channel = mode;
+         info.alpha_channel = mode == 9 ? 8 : mode; // 9: mode 8 with the diffuse as the glass
          info.alpha_ref = 0.5f;
          info.alpha_ref_exact = true;
       }
@@ -4469,10 +4487,19 @@ public:
          reshade::set_config_value(runtime, NAME, "RTSunTexturedWindows", g_rtsun_textured_windows);
       if (ImGui::IsItemHovered())
          ImGui::SetTooltip("The game leaves window panes out of its sun shadows. On: a pane's own texture decides where sunlight passes\n(the lead of a leaded window blocks, the glass lets it through). Not the game's look: an addition.");
-      if (ImGui::SliderInt("RT sun: window pattern source", &g_rtsun_window_pattern, 4, 7))
+      if (ImGui::SliderFloat("RT sun: window pattern sharpness", &g_rtsun_window_sharpness, 0.f, 1.f, "%.2f"))
+         reshade::set_config_value(runtime, NAME, "RTSunWindowSharpness", g_rtsun_window_sharpness);
+      if (ImGui::IsItemHovered())
+         ImGui::SetTooltip("Thin lead lines are thinner than the sun's penumbra, so they only half shade the floor (physically right, but subtle).\n"
+            "Above 0, one more hard ray toward the sun's center, against the windows only, darkens the lead lines by this much (stylised).");
+      if (ImGui::SliderFloat("RT sun: window glass density", &g_rtsun_glass_density, 0.f, 1.f, "%.2f"))
+         reshade::set_config_value(runtime, NAME, "RTSunGlassDensity", g_rtsun_glass_density);
+      if (ImGui::IsItemHovered())
+         ImGui::SetTooltip("Patterns 8/9: how much the stained glass texture holds back the sunlight (0: clear glass, only the lead casts;\n1: darker panes let through as little as they look). Takes effect for windows seen after the change.");
+      if (ImGui::SliderInt("RT sun: window pattern source", &g_rtsun_window_pattern, 4, 9))
          reshade::set_config_value(runtime, NAME, "RTSunWindowPattern", g_rtsun_window_pattern);
       if (ImGui::IsItemHovered())
-         ImGui::SetTooltip("4: lead from the normal map, 5: one minus the one channel map, 6: the one channel map, 7: one minus the diffuse brightness.\nTakes effect for windows seen after the change.");
+         ImGui::SetTooltip("8: lead (normal map) x stained glass (emissive texture), 9: lead x glass (diffuse texture), 4: lead only,\n5: one minus the one channel map, 6: the one channel map, 7: one minus the diffuse brightness. Takes effect for windows seen after the change.");
       if (ImGui::Checkbox("RT sun: shadow map check", &g_rtsun_shadow_consult))
          reshade::set_config_value(runtime, NAME, "RTSunShadowMapCheck", g_rtsun_shadow_consult);
       if (ImGui::IsItemHovered())

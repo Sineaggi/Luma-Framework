@@ -58,7 +58,9 @@ float2 CutoutDecodeUV(uint address, uint code)
 }
 
 // 1: the candidate is solid at the hit point, 0: it is a hole there, -1: no mask for it (the caller's stochastic fallback)
-int CutoutAlphaTest(uint instance_id, uint primitive, float2 barycentrics)
+// reference_override >= 0: compared instead of the record's reference (textured windows: a per ray random number, so an
+// opacity of 0.3 stops 30% of the rays)
+int CutoutAlphaTest(uint instance_id, uint primitive, float2 barycentrics, float reference_override = -1.0)
 {
     uint id = instance_id & kNoCutoutRecord;
     if (CutoutExact == 0 || id == kNoCutoutRecord)
@@ -94,7 +96,7 @@ int CutoutAlphaTest(uint instance_id, uint primitive, float2 barycentrics)
     float2 uv = uv0 * (1.0 - barycentrics.x - barycentrics.y) + uv1 * barycentrics.x + uv2 * barycentrics.y;
     uv = uv * r.ScaleBias.xy + r.ScaleBias.zw;
     float alpha = CutoutAtlas.SampleLevel(CutoutSampler, float3(uv, float(slice)), 0.0);
-    bool solid = alpha >= r.AlphaRef;
+    bool solid = alpha >= (reference_override >= 0.0 ? reference_override : r.AlphaRef);
     g_cutout_exact_tests++;
     g_cutout_exact_hits += solid ? 1u : 0u;
     return solid ? 1 : 0;

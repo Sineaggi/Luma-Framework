@@ -64,8 +64,10 @@ namespace RTAO
          uint32_t channel;
          uint32_t source_mips;
          float source_size[2];
+         float glass_density;
+         float pad[3];
       };
-      static_assert(sizeof(StripParams) == 16);
+      static_assert(sizeof(StripParams) == 32);
    }
 
    bool CutoutMaterials::Init(ID3D11Device* device, Interop& interop, ID3D11ComputeShader* cs, std::string& error)
@@ -159,7 +161,7 @@ namespace RTAO
       version++;
    }
 
-   uint64_t CutoutMaterials::AcquireMaterial(ID3D11ShaderResourceView* srv, uint32_t channel, uint32_t& tile)
+   uint64_t CutoutMaterials::AcquireMaterial(ID3D11ShaderResourceView* srv, uint32_t channel, uint32_t& tile, ID3D11ShaderResourceView* srv2, float param)
    {
       tile = kNoTile;
       if (!srv)
@@ -169,7 +171,15 @@ namespace RTAO
       if (!texture)
          return 0;
       texture->Release(); // Identity only (the SRV keeps it alive for the draw)
-      const uint64_t key = MaterialKey(texture, channel);
+      uint64_t key = MaterialKey(texture, channel);
+      if (srv2)
+      {
+         ID3D11Resource* texture2 = nullptr;
+         srv2->GetResource(&texture2);
+         if (texture2)
+            texture2->Release();
+         key = HashCombine(HashCombine(key, uint64_t(uintptr_t(texture2))), uint64_t(FloatBits(param)));
+      }
 
       const std::lock_guard lock(mutex);
       if (!atlas12)
@@ -221,7 +231,7 @@ namespace RTAO
       return key;
    }
 
-   bool CutoutMaterials::RecordStrip(ID3D11DeviceContext* context, ID3D11ShaderResourceView* srv, uint32_t channel, uint32_t tile)
+   bool CutoutMaterials::RecordStrip(ID3D11DeviceContext* context, ID3D11ShaderResourceView* srv, uint32_t channel, uint32_t tile, ID3D11ShaderResourceView* srv2, float param)
    {
       if (!strip_cs || tile >= kStripTiles)
          return false;
@@ -250,6 +260,7 @@ namespace RTAO
       params.source_mips = srv_desc.Texture2D.MipLevels == UINT(-1) ? available : (std::min)(uint32_t(srv_desc.Texture2D.MipLevels), available);
       params.source_size[0] = float((std::max)(texture_desc.Width >> most_detailed, 1u));
       params.source_size[1] = float((std::max)(texture_desc.Height >> most_detailed, 1u));
+      params.glass_density = param;
 
       ID3D11ComputeShader* old_cs = nullptr;
       context->CSGetShader(&old_cs, nullptr, nullptr);
@@ -257,6 +268,8 @@ namespace RTAO
       context->CSGetConstantBuffers(0, 1, &old_cb);
       ID3D11ShaderResourceView* old_srv = nullptr;
       context->CSGetShaderResources(0, 1, &old_srv);
+      ID3D11ShaderResourceView* old_srv2 = nullptr;
+      context->CSGetShaderResources(1, 1, &old_srv2);
       ID3D11SamplerState* old_sampler = nullptr;
       context->CSGetSamplers(0, 1, &old_sampler);
       ID3D11UnorderedAccessView* old_uav = nullptr;
@@ -271,6 +284,8 @@ namespace RTAO
          context->CSSetShader(strip_cs, nullptr, 0);
          context->CSSetConstantBuffers(0, 1, &params_cb);
          context->CSSetShaderResources(0, 1, &srv);
+         ID3D11ShaderResourceView* second = srv2 ? srv2 : srv;
+         context->CSSetShaderResources(1, 1, &second);
          context->CSSetSamplers(0, 1, &sampler);
          UINT initial_count = UINT(-1);
          context->CSSetUnorderedAccessViews(0, 1, &tile_uav, &initial_count);
@@ -281,12 +296,14 @@ namespace RTAO
       context->CSSetShader(old_cs, nullptr, 0);
       context->CSSetConstantBuffers(0, 1, &old_cb);
       context->CSSetShaderResources(0, 1, &old_srv);
+      context->CSSetShaderResources(1, 1, &old_srv2);
       context->CSSetSamplers(0, 1, &old_sampler);
       UINT keep_count = UINT(-1);
       context->CSSetUnorderedAccessViews(0, 1, &old_uav, &keep_count);
       SafeRelease(old_cs);
       SafeRelease(old_cb);
       SafeRelease(old_srv);
+      SafeRelease(old_srv2);
       SafeRelease(old_sampler);
       SafeRelease(old_uav);
       if (!dispatched)

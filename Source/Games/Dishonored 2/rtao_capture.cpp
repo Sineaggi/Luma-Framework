@@ -1453,10 +1453,10 @@ namespace RTAO
          if ((kind == 1 || kind == 2 || kind == 3 || kind == 6) && components >= 2) // float, unorm, snorm, half (rtao_cutout.hlsli)
          {
             uint32_t tile = CutoutMaterials::kNoTile;
-            material = cutouts.AcquireMaterial(draw.alpha_srv, draw.ps->alpha_channel, tile);
+            material = cutouts.AcquireMaterial(draw.alpha_srv, draw.ps->alpha_channel, tile, draw.alpha_srv2, draw.alpha_param);
             if (tile != CutoutMaterials::kNoTile)
             {
-               if (cutouts.RecordStrip(context, draw.alpha_srv, draw.ps->alpha_channel, tile))
+               if (cutouts.RecordStrip(context, draw.alpha_srv, draw.ps->alpha_channel, tile, draw.alpha_srv2, draw.alpha_param))
                {
                   std::vector<Rec> strip(1, Rec{});
                   strip[0].type = Rec::AlphaStrip;

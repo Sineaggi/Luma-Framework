@@ -65,7 +65,7 @@ static const uint kDebugBlockerAll = 8; // The same with every instance (the cas
 static const uint kDebugBlocker = 7;    // One hard shadow ray: TLAS index + 1 of the closest blocker, 0 if lit (16 bit id)
 static const uint kDebugSceneSun = 6;  // From the sun, orthographic, a 60 m tall area around the camera, 40 m up the light to 40 m past it
 // Must match rtao_accel.h
-static const uint kSourceMain = 0x01, kSourceShadow = 0x02, kFlagFrameMesh = 0x04, kFlagMvp = 0x08, kFlagSkinned = 0x10, kFlagCameraOnly = 0x20;
+static const uint kSourceMain = 0x01, kSourceShadow = 0x02, kFlagFrameMesh = 0x04, kFlagMvp = 0x08, kFlagSkinned = 0x10, kFlagCameraOnly = 0x20, kFlagWindow = 0x40;
 
 float LoadShadowValue(uint2 p)
 {
@@ -132,7 +132,9 @@ bool CandidateBlocks(uint instance_id, uint flags, uint instance_index, uint pri
 {
     if ((instance_id & kInstanceIdCutoutBit) != 0)
     {
-        int solid = CutoutAlphaTest(instance_id, primitive, bary);
+        // Textured windows: graded, against a random reference per ray (seed 0: the hard rays, 0.5)
+        const float reference = (flags & kFlagWindow) != 0 ? (seed != 0 ? (float(Hash(seed ^ 0x2F6B4A1Du ^ (instance_index * 0x9E3779B9u)) & 0xFFFF) + 0.5) / 65536.0 : 0.5) : -1.0;
+        int solid = CutoutAlphaTest(instance_id, primitive, bary, reference);
         if (solid < 0 && fallback_coin >= 0)
             solid = fallback_coin;
         if (solid < 0)
@@ -430,6 +432,30 @@ void main(uint3 id : SV_DispatchThreadID)
         if (q.CommittedStatus() != COMMITTED_TRIANGLE_HIT)
             lit += 1.0;
     }
+    float vis = lit / float(rays);
+    // Textured windows, sharpness: a thin lead line is thinner than the sun's penumbra over the window to receiver
+    // distance, so the soft rays only half shade it. One more hard ray toward the light's center, against the windows
+    // only, darkens the pixel by WindowSharpness where it meets lead (a stylised crisper pattern, 0: off)
+    if (WindowSharpness > 0.0 && vis > 0.0)
+    {
+        RayDesc ray;
+        ray.Origin = origin;
+        ray.Direction = L;
+        ray.TMin = 0.0;
+        ray.TMax = TMax;
+        RayQuery<RAY_FLAG_ACCEPT_FIRST_HIT_AND_END_SEARCH | RAY_FLAG_SKIP_PROCEDURAL_PRIMITIVES> q;
+        q.TraceRayInline(Scene, RAY_FLAG_NONE, kInstanceMaskWindow, ray);
+        uint guard = 0;
+        while (q.Proceed() && guard++ < 64)
+        {
+            if (q.CandidateType() == CANDIDATE_NON_OPAQUE_TRIANGLE &&
+                CandidateBlocks(q.CandidateInstanceID(), q.CandidateInstanceContributionToHitGroupIndex(), q.CandidateInstanceIndex(), q.CandidatePrimitiveIndex(),
+                    q.CandidateTriangleBarycentrics(), q.CandidateTriangleRayT(), ray.Origin, ray.Direction, 1, 0, false))
+                q.CommitNonOpaqueTriangleHit();
+        }
+        if (q.CommittedStatus() == COMMITTED_TRIANGLE_HIT)
+            vis *= 1.0 - saturate(WindowSharpness);
+    }
     CutoutFlushCounters();
-    VisRaw[px] = lit / float(rays);
+    VisRaw[px] = vis;
 }

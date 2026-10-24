@@ -21,13 +21,14 @@ cbuffer SunConstants : register(b0)
     // The game's shadow map decides whether a camera only object blocks (rtsun_trace.hlsl GameShadowConfirms)
     uint ShadowConsult; uint ShadowPacked; uint ShadowReversed; float ShadowTolerance; // Tolerance in world units
     uint2 ShadowSize;   uint ShadowCascades; uint ShadowPad;                          // One cascade's size, how many are stacked
-    float ShadowBiasConstant; float ShadowBiasSlope; uint2 BiasPad;                  // The game's shadow rasterizer bias (depth units, slope factor)
+    float ShadowBiasConstant; float ShadowBiasSlope; float WindowSharpness; uint BiasPad; // The game's shadow rasterizer bias (depth units, slope factor); textured windows: weight of the hard window ray
 };
 
 // Must match rtao_accel.h
 static const uint kInstanceMaskCutout = 0x02;
 static const uint kInstanceMaskCameraOnly = 0x04;
 static const uint kInstanceMaskCameraOnlyCutout = 0x08;
+static const uint kInstanceMaskWindow = 0x10;
 static const uint kInstanceIdCutoutBit = 1u << 23;
 
 static const uint kFilterOff = 0;

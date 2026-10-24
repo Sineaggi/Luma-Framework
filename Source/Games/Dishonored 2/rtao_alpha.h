@@ -112,9 +112,10 @@ namespace RTAO
       // ---- D3D11 side (draw threads)
       // The material of a cutout draw (key 0: none, e.g. not initialized). "tile" receives a strip tile to render its mask
       // into now with RecordStrip (kNoTile: nothing to render).
-      uint64_t AcquireMaterial(ID3D11ShaderResourceView* srv, uint32_t channel, uint32_t& tile);
+      // srv2 / param: mode 8 (textured windows): the glass texture and its density (part of the material's identity)
+      uint64_t AcquireMaterial(ID3D11ShaderResourceView* srv, uint32_t channel, uint32_t& tile, ID3D11ShaderResourceView* srv2 = nullptr, float param = 0.f);
       // Records the mask render into "tile" on "context" (no lock: only this context's state is touched)
-      bool RecordStrip(ID3D11DeviceContext* context, ID3D11ShaderResourceView* srv, uint32_t channel, uint32_t tile);
+      bool RecordStrip(ID3D11DeviceContext* context, ID3D11ShaderResourceView* srv, uint32_t channel, uint32_t tile, ID3D11ShaderResourceView* srv2 = nullptr, float param = 0.f);
       // RecordStrip failed, or its record will never execute: the material is rendered again at a later draw
       void AbandonStrip(uint64_t material, uint32_t tile);
       // The strip's D3D11 work has executed (its command list ran): copy it at the next D3D12 pass

@@ -736,6 +736,7 @@ namespace RTSun
       constants.shadow_cascades = kShadowCascades;
       constants.shadow_bias_constant = settings.shadow_bias_constant;
       constants.shadow_bias_slope = settings.shadow_bias_slope;
+      constants.window_sharpness = settings.window_sharpness;
       std::memcpy(constants_mapped + slot * kConstantsStride, &constants, sizeof(constants));
 
       D3D12_GPU_DESCRIPTOR_HANDLE table = heap->GetGPUDescriptorHandleForHeapStart();

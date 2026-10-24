@@ -2340,6 +2340,101 @@ static void TestCutoutTextures(ID3D11Device* device, ID3D11DeviceContext* contex
       normal_texture->Release();
    }
 
+   // Textured windows, pattern 8: no lead (flat normal map) and a glass texture white where u < 0.5, black elsewhere.
+   // The glass transmission is its luminance relative to twice its average (0.5 here): 1 on the white half, 0 on the
+   // black one at density 1, half way at density 0.5. Graded through a random reference per ray, over 4 rays x frames.
+   {
+      std::vector<int8_t> flat(64 * 64 * 2, 0);
+      D3D11_TEXTURE2D_DESC normal_desc = { 64, 64, 1, 1, DXGI_FORMAT_R8G8_SNORM, { 1, 0 }, D3D11_USAGE_DEFAULT, D3D11_BIND_SHADER_RESOURCE, 0, 0 };
+      D3D11_SUBRESOURCE_DATA normal_data = { flat.data(), 64 * 2, 0 };
+      ID3D11Texture2D* normal_texture = nullptr;
+      device->CreateTexture2D(&normal_desc, &normal_data, &normal_texture);
+      ID3D11ShaderResourceView* normal_srv = nullptr;
+      device->CreateShaderResourceView(normal_texture, nullptr, &normal_srv);
+      // The glass texture with its full mip chain (the strip reads its average from the last mip)
+      D3D11_TEXTURE2D_DESC glass_desc = { 64, 64, 0, 1, DXGI_FORMAT_R8G8B8A8_UNORM, { 1, 0 }, D3D11_USAGE_DEFAULT, D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_RENDER_TARGET, 0, D3D11_RESOURCE_MISC_GENERATE_MIPS };
+      ID3D11Texture2D* glass_texture = nullptr;
+      device->CreateTexture2D(&glass_desc, nullptr, &glass_texture);
+      std::vector<uint32_t> glass(64 * 64);
+      for (int y = 0; y < 64; y++)
+         for (int x = 0; x < 64; x++)
+            glass[y * 64 + x] = x < 32 ? 0xFFFFFFFFu : 0xFF000000u;
+      context->UpdateSubresource(glass_texture, 0, nullptr, glass.data(), 64 * 4, 0);
+      ID3D11ShaderResourceView* glass_srv = nullptr;
+      device->CreateShaderResourceView(glass_texture, nullptr, &glass_srv);
+      context->GenerateMips(glass_srv);
+      RTAO::PixelShaderInfo window_ps;
+      window_ps.discard = window_ps.alpha_tested = window_ps.texture_exact = true;
+      window_ps.alpha_channel = 8;
+      window_ps.alpha_ref = 0.5f;
+      const RTAO::DrawInfo saved = draw;
+      float results[2][2] = {};
+      const float densities[2] = { 1.f, 0.5f };
+      for (int k = 0; k < 2; k++)
+      {
+         draw.ps = &window_ps;
+         draw.alpha_srv = normal_srv;
+         draw.alpha_srv2 = glass_srv;
+         draw.alpha_param = densities[k];
+         draw.material_cb = nullptr;
+         draw.window = true;
+         sun_on = true;
+         sun_settings.cutout_exact = true;
+         sun_settings.ray_count = 8;
+         float warm_left = 0.f, warm_right = 0.f;
+         measure_sun(warm_left, warm_right); // The new material's mask is rendered and copied during the first frames
+         measure_sun(results[k][0], results[k][1]);
+         sun_settings.ray_count = 4;
+         sun_on = false;
+         draw = saved;
+      }
+      printf("RT sun through a stained glass window (pattern 8), left (white glass) / right (black glass): density 1 %.3f / %.3f, density 0.5 %.3f / %.3f\n",
+         results[0][0], results[0][1], results[1][0], results[1][1]);
+      CHECK(results[0][0] > 0.9f && results[0][1] < 0.1f, "stained glass, density 1: light through the white glass, none through the black (%.3f / %.3f)", results[0][0], results[0][1]);
+      CHECK(results[1][0] > 0.9f && results[1][1] > 0.35f && results[1][1] < 0.65f, "stained glass, density 0.5: the black glass lets half through (%.3f / %.3f)", results[1][0], results[1][1]);
+      glass_srv->Release();
+      glass_texture->Release();
+      normal_srv->Release();
+      normal_texture->Release();
+   }
+
+   // Textured windows: thin lead (1 texel lines every 32 texels of a 1024x1024 normal map, like a window's tracery) must
+   // survive the reduction to the 256x256 mask (the maximum over the footprint, not the average, which would erase them)
+   {
+      const UINT N = 1024;
+      std::vector<int8_t> lines(size_t(N) * N * 2, 0);
+      for (UINT y = 0; y < N; y++)
+         for (UINT x = 0; x < N; x++)
+            if (x % 32 == 0 || y % 32 == 0)
+               lines[(size_t(y) * N + x) * 2] = 120;
+      D3D11_TEXTURE2D_DESC desc = { N, N, 1, 1, DXGI_FORMAT_R8G8_SNORM, { 1, 0 }, D3D11_USAGE_DEFAULT, D3D11_BIND_SHADER_RESOURCE, 0, 0 };
+      D3D11_SUBRESOURCE_DATA data = { lines.data(), N * 2, 0 };
+      ID3D11Texture2D* texture = nullptr;
+      device->CreateTexture2D(&desc, &data, &texture);
+      ID3D11ShaderResourceView* srv = nullptr;
+      device->CreateShaderResourceView(texture, nullptr, &srv);
+      RTAO::PixelShaderInfo window_ps;
+      window_ps.discard = window_ps.alpha_tested = window_ps.texture_exact = true;
+      window_ps.alpha_channel = 4;
+      window_ps.alpha_ref = 0.5f;
+      const RTAO::DrawInfo saved = draw;
+      draw.ps = &window_ps;
+      draw.alpha_srv = srv;
+      draw.material_cb = nullptr;
+      draw.window = true;
+      sun_on = true;
+      sun_settings.cutout_exact = true;
+      float warm_l = 0.f, warm_r = 0.f, left = 0.f, right = 0.f;
+      measure_sun(warm_l, warm_r);
+      measure_sun(left, right);
+      sun_on = false;
+      draw = saved;
+      printf("RT sun through a window with thin lead lines (1 texel in 32 of 1024): left %.3f, right %.3f (1.000: the lines were lost)\n", left, right);
+      CHECK(left < 0.98f && right < 0.98f, "thin lead lines must survive the mask reduction (%.3f / %.3f)", left, right);
+      srv->Release();
+      texture->Release();
+   }
+
    CHECK(interop.WaitForIdle(5000), "WaitForIdle");
    retirer.ReleaseAll();
    sun.Shutdown(nullptr, 0);

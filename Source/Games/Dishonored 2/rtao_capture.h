@@ -214,6 +214,8 @@ namespace RTAO
       uint32_t per_view_cb_first_constant = 0, per_view_cb_num_constants = 0;
       bool cutout = false; // Alpha tested (the bound pixel shader): its instances go into the TLAS as cutouts (kInstanceMaskCutout)
       bool window = false; // A textured window (RTSunTexturedWindows): a cutout of its glass/lead pattern that the sun sees
+      ID3D11ShaderResourceView* alpha_srv2 = nullptr; // Textured windows, pattern 8: the glass texture
+      float alpha_param = 0.f; // Its density
       // Skinned shaders only (vs->skinned)
       struct Stream
       {

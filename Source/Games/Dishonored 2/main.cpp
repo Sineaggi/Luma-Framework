@@ -180,6 +180,13 @@ namespace
    bool g_rtao_shadow_casters = true;
    std::atomic<uint64_t> g_rtao_shadow_view_draws = 0; // Indexed draws into shadow maps seen (captured or not)
    std::atomic<uint64_t> g_rtao_shadow_indirect_draws = 0; // Indirect (GPU culled) draws into shadow maps: not captured
+   // Shadow map draws by array slice (the DSV's first slice: one cascade per slice), and those left out as far slices
+   std::atomic<uint64_t> g_rtao_shadow_slice_draws[8] = {}, g_rtao_shadow_far_skipped = 0;
+   // Shadow map casters only from the first slices (config "RTAOShadowNearSlices"): the game draws simplified copies of
+   // the world (other LODs, no window openings) into its far cascades, which must not enter the ray tracing scene (the
+   // near cascade, used for the view, has the detailed geometry). "RTAOShadowNearOnly" off takes every slice (test).
+   int g_rtao_shadow_near_slices = 2;
+   bool g_rtao_shadow_near_only = true;
    // Shadow map draws per frame (at present): frames with none, the most in one frame, over the current log window
    uint64_t g_rtao_shadow_draws_at_present = 0;
    uint32_t g_rtao_shadow_zero_frames = 0, g_rtao_shadow_frames = 0;
@@ -241,7 +248,7 @@ namespace
    bool g_rtao_freeze_scene = false;
    // Popping tests (not saved): openables taken from shadow map draws; shadow map objects not confirmed yet kept 64 frames, not 4
    bool g_rtdbg_shadow_openables = true;
-   bool g_rtdbg_shadow_young_long = false; // Debug, not saved: trace the last TLAS again every frame (no capture, no rebuild)
+   bool g_rtdbg_shadow_young_long = false; // "old shadow map retention" (TlasBuilder::shadow_mode 1) // Debug, not saved: trace the last TLAS again every frame (no capture, no rebuild)
    int g_rtao_blas_budget = 64; // New static BLASes built per frame (config "RTAOBlasBudget")
    // Map(WRITE_DISCARD) of game buffers, per recording thread: buffer -> unique id of its last discard. Part of a draw's
    // identity for the dedup, so a per instance buffer rewritten between two draws never makes them look the same.
@@ -311,8 +318,8 @@ namespace
       uint32_t index = 0; // Captures taken
       uint32_t frame = 0;
       int phase = 0; // 0 as is, 1 scene frozen
-      bool saved_freeze = false, saved_openables = true, saved_young_long = false;
-      // Test matrix: combo bit 0 = openables from the shadow map OFF, bit 1 = keep shadow map objects longer ON
+      bool saved_freeze = false, saved_openables = true, saved_young_long = false, saved_near_only = true;
+      // Test matrix: combo bit 0 = the old shadow map retention, bit 1 = shadow map casters from every slice (not near only)
       int combo = 0;
       std::chrono::steady_clock::time_point switch_time;
       std::atomic<bool> reset_history = false; // The sun denoiser's history, at a switch (consumed by PrepareRTSun)
@@ -322,6 +329,7 @@ namespace
       std::string pending_meta;
       std::vector<std::string> timeline;
       uint32_t last_bound = 0, last_stale = 0;
+      uint64_t last_slices[8] = {};
       RTDiagStage stages[7] = {
          { "game_shadow", RTDiag::Kind::Gray, 1 }, // The game's own screen shadow (y of its target)
          { "rt_raw", RTDiag::Kind::Gray, 0 },
@@ -647,7 +655,7 @@ public:
       game_device_data.rtao_capture.cutouts_exact = g_rtao_cutouts_exact;
       game_device_data.rtao_capture.dedup_enabled = g_rtao_dedup;
       game_device_data.rtao_capture.shadow_frame_meshes_enabled = g_rtdbg_shadow_openables;
-      game_device_data.rtao_tlas.shadow_young_retain_frames = g_rtdbg_shadow_young_long ? 64u : RTAO::TlasBuilder::kShadowYoungRetainFrames;
+      game_device_data.rtao_tlas.shadow_mode = g_rtdbg_shadow_young_long ? 1u : 0u;
       game_device_data.rtao_last_draw_frame = game_device_data.rtao_frame;
       g_rtao_main_depth_width = depth_desc.Width;
       g_rtao_main_depth_height = depth_desc.Height;
@@ -893,10 +901,13 @@ public:
          g_rtdiag.saved_freeze = g_rtao_freeze_scene;
          g_rtdiag.saved_openables = g_rtdbg_shadow_openables;
          g_rtdiag.saved_young_long = g_rtdbg_shadow_young_long;
+         g_rtdiag.saved_near_only = g_rtao_shadow_near_only;
          g_rtdiag.combo = -1;
          g_rtdiag.pending_set = -1;
          g_rtdiag.timeline.clear();
-         g_rtdiag.timeline.push_back("frame,t_ms,phase,combo,frozen,screen_shadows_rt,screen_shadows_game,tlas_instances,retained,new,evicted_promoted,evicted_young,frame_meshes,movables_kept,cam_x,cam_y,cam_z,fwd_x,fwd_y,fwd_z");
+         g_rtdiag.timeline.push_back("frame,t_ms,phase,combo,frozen,screen_shadows_rt,screen_shadows_game,tlas_instances,retained,new,evicted_promoted,evicted_young,frame_meshes,movables_kept,cam_x,cam_y,cam_z,fwd_x,fwd_y,fwd_z,slice0,slice1,slice2,slice3,slice4,slice5,slice6,slice7");
+         for (int i = 0; i < 8; i++)
+            g_rtdiag.last_slices[i] = g_rtao_shadow_slice_draws[i];
          g_rtdiag.last_bound = g.rtsun_bound_draws;
          g_rtdiag.last_stale = g.rtsun_stale_draws;
          g_rtdiag.active = true;
@@ -918,7 +929,14 @@ public:
          snprintf(line, sizeof(line), "%u,%.1f,%d,%d,%d,%u,%u,%u,%u,%u,%u,%u,%llu,%llu,%.3f,%.3f,%.3f,%.4f,%.4f,%.4f", g_rtdiag.frame, t * 1000.0, g_rtdiag.phase, g_rtdiag.combo, int(g_rtao_freeze_scene),
             bound_now, stale_now, g.rtao_tlas_instances.load(), r.promoted + r.young, r.added_new, r.evicted_promoted, r.evicted_young, (unsigned long long)stats.frame_draws,
             (unsigned long long)stats.frame_retained, g.rtdiag_cam_pos[0], g.rtdiag_cam_pos[1], g.rtdiag_cam_pos[2], g.rtdiag_cam_fwd[0], g.rtdiag_cam_fwd[1], g.rtdiag_cam_fwd[2]);
-         g_rtdiag.timeline.push_back(line);
+         std::string row = line;
+         for (int i = 0; i < 8; i++)
+         {
+            const uint64_t total = g_rtao_shadow_slice_draws[i];
+            row += "," + std::to_string(total - g_rtdiag.last_slices[i]);
+            g_rtdiag.last_slices[i] = total;
+         }
+         g_rtdiag.timeline.push_back(row);
       }
 
       // Read back the pending capture (copied at least one present ago) and write it on a worker thread
@@ -983,6 +1001,7 @@ public:
          g_rtao_freeze_scene = g_rtdiag.saved_freeze;
          g_rtdbg_shadow_openables = g_rtdiag.saved_openables;
          g_rtdbg_shadow_young_long = g_rtdiag.saved_young_long;
+         g_rtao_shadow_near_only = g_rtdiag.saved_near_only;
          g_rtdiag.active = false;
          std::ofstream(std::filesystem::path(g_rtdiag.dir) / "timeline.csv") << [&]() {
             std::string all;
@@ -1008,11 +1027,13 @@ public:
          g_rtdiag.switch_time = now;
          g_rtdiag.reset_history = true;
          g.rtao_capture.drop_retained_request = true;
+         g.rtao_tlas.drop_shadow_request = true; // No combo inherits another's shadow map objects
       }
       g_rtdiag.combo = combo;
       g_rtdiag.phase = frozen ? 1 : 0;
-      g_rtdbg_shadow_openables = frozen ? g_rtdiag.saved_openables : (combo & 1) == 0;
-      g_rtdbg_shadow_young_long = frozen ? g_rtdiag.saved_young_long : (combo & 2) != 0;
+      g_rtdbg_shadow_openables = g_rtdiag.saved_openables;
+      g_rtdbg_shadow_young_long = frozen ? g_rtdiag.saved_young_long : (combo & 1) != 0;
+      g_rtao_shadow_near_only = frozen ? g_rtdiag.saved_near_only : (combo & 2) == 0;
       g_rtao_freeze_scene = frozen ? true : g_rtdiag.saved_freeze;
 
       // A capture: copy every stage of this frame into the free staging set
@@ -1102,6 +1123,29 @@ public:
             add("tlas_instances=%u\nretained=%u\npromoted=%u\nyoung=%u\nmain_only=%u\nshadow_only=%u\nboth=%u\nnew=%u\nevicted=%u\n", g.rtao_tlas_instances.load(), r.promoted + r.young, r.promoted, r.young,
                r.main_only, r.shadow_only, r.both, r.added_new, r.evicted_promoted + r.evicted_young);
             add("frame_meshes=%llu\nmovables_kept=%llu\n", (unsigned long long)stats.frame_draws, (unsigned long long)stats.frame_retained);
+            float fars[4] = {};
+            g.rtsun_light.GetSliceFars(fars);
+            add("slice_fars=%.4g,%.4g,%.4g,%.4g\n", fars[0], fars[1], fars[2], fars[3]);
+            // Every retained TLAS instance of this frame, for the duplicate check (cNNNN_instances.csv)
+            {
+               std::string csv = "blas_key,sources,min_slice,x,y,z,index_count,vertex_count,first_frame,last_frame,seen_frames\n";
+               char row[192];
+               for (const auto& i : g.rtao_tlas.Snapshot())
+               {
+                  uint32_t indices = 0, vertices = 0;
+                  g.rtao_capture.GetMeshSize(i.blas_key, indices, vertices);
+                  snprintf(row, sizeof(row), "%016llX,%u,%u,%.3f,%.3f,%.3f,%u,%u,%u,%u,%u\n", (unsigned long long)i.blas_key, i.sources, i.min_slice, i.pos[0], i.pos[1], i.pos[2], indices, vertices, i.first_frame, i.last_frame, i.seen_frames);
+                  csv += row;
+               }
+               char name[32];
+               snprintf(name, sizeof(name), "c%04u_instances.csv", g_rtdiag.index);
+               const std::string path = (std::filesystem::path(g_rtdiag.dir) / name).string();
+               std::thread([csv = std::move(csv), path]() { std::ofstream(path) << csv; }).detach();
+            }
+            add("near_only=%d\nnear_slices=%d\nfar_skipped=%llu\n", int(g_rtao_shadow_near_only), g_rtao_shadow_near_slices, (unsigned long long)g_rtao_shadow_far_skipped.load());
+            add("slice_draws=%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu\n", (unsigned long long)g_rtao_shadow_slice_draws[0].load(), (unsigned long long)g_rtao_shadow_slice_draws[1].load(),
+               (unsigned long long)g_rtao_shadow_slice_draws[2].load(), (unsigned long long)g_rtao_shadow_slice_draws[3].load(), (unsigned long long)g_rtao_shadow_slice_draws[4].load(),
+               (unsigned long long)g_rtao_shadow_slice_draws[5].load(), (unsigned long long)g_rtao_shadow_slice_draws[6].load(), (unsigned long long)g_rtao_shadow_slice_draws[7].load());
             add("test_shadow_openables=%d\ntest_shadow_young_long=%d\ncombo=%d\nsettle=%d\n", int(g_rtdbg_shadow_openables), int(g_rtdbg_shadow_young_long), g_rtdiag.combo,
                int(std::chrono::duration<double>(now - g_rtdiag.switch_time).count() < kRTDiagSettle));
             // Per frame mesh probes: key, flags (1 from a shadow map, 2 skinned), vertex 0 world position
@@ -2566,7 +2610,7 @@ public:
 
    // A shadow map draw: depth only (no render target) with depth writes on, into a depth texture array (the sun's
    // cascades, the local lights' atlas) that isn't the main view's depth. Whatever is drawn there is world geometry.
-   static bool IsShadowViewDepthWrite(ID3D11DeviceContext* context)
+   static bool IsShadowViewDepthWrite(ID3D11DeviceContext* context, uint32_t* out_slice = nullptr)
    {
       com_ptr<ID3D11RenderTargetView> rtv;
       com_ptr<ID3D11DepthStencilView> dsv;
@@ -2592,6 +2636,11 @@ public:
          if (!state_desc.DepthEnable || state_desc.DepthWriteMask != D3D11_DEPTH_WRITE_MASK_ALL)
             return false;
       }
+      D3D11_DEPTH_STENCIL_VIEW_DESC dsv_desc;
+      dsv->GetDesc(&dsv_desc);
+      const uint32_t slice = dsv_desc.ViewDimension == D3D11_DSV_DIMENSION_TEXTURE2DARRAY ? dsv_desc.Texture2DArray.FirstArraySlice : 0;
+      if (out_slice)
+         *out_slice = slice;
       g_rtao_shadow_view_width.store(desc.Width, std::memory_order_relaxed);
       g_rtao_shadow_view_height.store(desc.Height, std::memory_order_relaxed);
       g_rtao_shadow_view_slices.store(desc.ArraySize, std::memory_order_relaxed);
@@ -2633,10 +2682,19 @@ public:
       auto* context = reinterpret_cast<ID3D11DeviceContext*>(cmd_list->get_native());
       // Main view draws, or shadow map draws (sun casters out of view). Shadow map draws feed no main view diagnostics.
       bool shadow_view = false;
+      uint32_t shadow_slice = 0xFF;
       if (!IsMainViewDepthWrite(context, g_rtao_capture_pass == 0))
       {
-         if (!g_rtao_shadow_casters || !IsShadowViewDepthWrite(context))
+         uint32_t slice = 0;
+         if (!g_rtao_shadow_casters || !IsShadowViewDepthWrite(context, &slice))
             return false;
+         g_rtao_shadow_slice_draws[(std::min)(slice, 7u)]++;
+         shadow_slice = slice;
+         if (g_rtao_shadow_near_only && slice >= uint32_t((std::max)(g_rtao_shadow_near_slices, 1)))
+         {
+            g_rtao_shadow_far_skipped++;
+            return false;
+         }
          shadow_view = true;
          g_rtao_shadow_view_draws++;
       }
@@ -2740,6 +2798,7 @@ public:
       RTAO::DrawInfo draw;
       draw.vs = &vs_info;
       draw.shadow_view = shadow_view;
+      draw.shadow_slice = uint8_t((std::min)(shadow_slice, 0xFEu));
       draw.position_format = layout_info.position_format;
       draw.position_offset = layout_info.position_offset;
       draw.index_count = index_count;
@@ -3241,6 +3300,8 @@ public:
       reshade::get_config_value(runtime, NAME, "RTAOSkinned", g_rtao_skinned);
       reshade::get_config_value(runtime, NAME, "RTAODynamic", g_rtao_dynamic);
       reshade::get_config_value(runtime, NAME, "RTAOShadowCasters", g_rtao_shadow_casters);
+      reshade::get_config_value(runtime, NAME, "RTAOShadowNearSlices", g_rtao_shadow_near_slices);
+      reshade::get_config_value(runtime, NAME, "RTAOShadowNearOnly", g_rtao_shadow_near_only);
       reshade::get_config_value(runtime, NAME, "RTAOStrength", g_rtao_strength);
       g_rtao_strength = std::clamp(g_rtao_strength, 0.25f, 4.f);
       g_rtao_radius = std::clamp(g_rtao_radius, 0.05f, 50.f);
@@ -3544,9 +3605,17 @@ public:
       ImGui::Checkbox("RT test: openables from the shadow map", &g_rtdbg_shadow_openables);
       if (ImGui::IsItemHovered())
          ImGui::SetTooltip("Off: openable windows/doors only enter the ray tracing scene from the camera's draws (not saved).");
-      ImGui::Checkbox("RT test: keep shadow map objects longer", &g_rtdbg_shadow_young_long);
+      if (ImGui::Checkbox("RT: shadow map casters from near slices only", &g_rtao_shadow_near_only))
+         reshade::set_config_value(runtime, NAME, "RTAOShadowNearOnly", g_rtao_shadow_near_only);
       if (ImGui::IsItemHovered())
-         ImGui::SetTooltip("On: objects seen in the shadow map but not confirmed yet are kept 64 frames instead of 4 (not saved).");
+         ImGui::SetTooltip("The game draws simplified copies of buildings (no proper window openings) into its far shadow cascades.\nOn: only the near cascades' draws enter the ray tracing scene.");
+      if (ImGui::SliderInt("RT: near shadow slices", &g_rtao_shadow_near_slices, 1, 8))
+         g_rtao_shadow_near_slices = std::clamp(g_rtao_shadow_near_slices, 1, 8);
+      if (ImGui::IsItemDeactivatedAfterEdit())
+         reshade::set_config_value(runtime, NAME, "RTAOShadowNearSlices", g_rtao_shadow_near_slices);
+      ImGui::Checkbox("RT test: old shadow map retention", &g_rtdbg_shadow_young_long);
+      if (ImGui::IsItemHovered())
+         ImGui::SetTooltip("On: the previous rule (3 sightings to keep a shadow map object, else dropped after 4 frames) instead of keeping static ones until unloaded (not saved).");
       ImGui::Checkbox("RT debug: freeze ray tracing scene", &g_rtao_freeze_scene);
       if (ImGui::IsItemHovered())
          ImGui::SetTooltip("Keeps tracing the current ray tracing scene (no new geometry, no removals) until unchecked. Not saved.\n"

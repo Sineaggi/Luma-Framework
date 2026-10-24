@@ -461,18 +461,80 @@ namespace RTAO
       RetentionStats s;
       s.added_new = added_new;
       added_new = 0;
+      if (drop_shadow_request.exchange(false))
+         std::erase_if(instances, [](const auto& pair) { return (pair.second.sources & (kInstanceSourceMain | kInstanceSourceShadow)) == kInstanceSourceShadow; });
+      const bool batch = added_new_shadow >= kShadowBatch; // The last readback brought a shadow map redraw of the world
+      added_new_shadow = 0;
+      if (batch)
+         for (uint64_t key : batch_candidates)
+         {
+            auto it = instances.find(key);
+            if (it != instances.end())
+               it->second.batch = true;
+         }
+      batch_candidates.clear();
 
+      // Shadow map instances (shadow_mode 0): the game keeps what it drew into its shadow maps and redraws parts of them only
+      // now and then, so a shadow map instance whose position never changed is static world, kept until its mesh is
+      // unloaded (Build: kMissingBlasFrames) or the cap. A moving object gets a new key (its transform) each frame: its new
+      // copy shows up next to the previous one, which stopped being drawn. That previous copy is then dropped here. The
+      // copies a redraw batch brings are never taken for moves (two copies of a mesh side by side in the world).
+      if (shadow_mode == 0)
+      {
+         std::unordered_map<uint64_t, std::vector<uint64_t>> stale_by_mesh; // Shadow copies last drawn 2..kMovingWindow frames ago
+         for (const auto& [key, instance] : instances)
+            if ((instance.sources & kInstanceSourceShadow) && !instance.moved && frame - instance.last_frame >= 2 && frame - instance.last_frame <= kMovingWindowFrames)
+               stale_by_mesh[instance.blas_key].push_back(key);
+         if (!stale_by_mesh.empty())
+            for (auto& [key, instance] : instances)
+            {
+               // New in the shadow maps in the last readback (a moving object the camera also sees is created by the main
+               // view a frame before its shadow map draw arrives)
+               if (instance.shadow_first_frame != frame - 1 || instance.batch)
+                  continue;
+               auto list = stale_by_mesh.find(instance.blas_key);
+               if (list == stale_by_mesh.end())
+                  continue;
+               for (uint64_t old_key : list->second)
+               {
+                  auto old = instances.find(old_key);
+                  if (old == instances.end() || old->second.moved)
+                     continue;
+                  float d2 = 0.f;
+                  for (int a = 0; a < 3; a++)
+                  {
+                     const float d = instance.transform[a][3] - old->second.transform[a][3];
+                     d2 += d * d;
+                  }
+                  if (d2 <= kMovingDistance * kMovingDistance)
+                  {
+                     old->second.moved = true; // Dropped below
+                     s.moved++;
+                  }
+               }
+            }
+      }
+
+      size_t shadow_static_count = 0;
       for (auto it = instances.begin(); it != instances.end();)
       {
          const Instance& instance = it->second;
-         // Seen in a shadow map: a static caster is drawn there every frame (in game: no frame without shadow map draws), so
-         // kShadowPromoteFrames sightings confirm it, then it is kept kShadowRetainFrames (casters out of the camera's
-         // view). A moving object gets a new key every frame and is seen at most twice per key (the main view, then the
-         // shadow maps a frame later): it never gets there and ages out after kShadowYoungRetainFrames, no trail.
          const bool shadow = (instance.sources & kInstanceSourceShadow) != 0;
-         const bool shadow_static = shadow && instance.seen_frames >= kShadowPromoteFrames;
-         const bool promoted = shadow_static || instance.seen_frames >= promote_frames;
-         const uint32_t max_age = shadow_static ? (std::max)(retain_frames, kShadowRetainFrames) : (promoted ? retain_frames : (shadow ? shadow_young_retain_frames : young_retain_frames));
+         bool shadow_static, promoted;
+         uint32_t max_age;
+         if (shadow_mode == 0)
+         {
+            shadow_static = shadow && !instance.moved;
+            promoted = shadow_static || instance.seen_frames >= promote_frames;
+            max_age = shadow_static ? UINT32_MAX : (instance.moved ? 0 : (promoted ? retain_frames : young_retain_frames));
+         }
+         else
+         {
+            // Old rule (test toggle): kShadowPromoteFrames sightings, else kShadowYoungRetainFrames
+            shadow_static = shadow && instance.seen_frames >= kShadowPromoteFrames;
+            promoted = shadow_static || instance.seen_frames >= promote_frames;
+            max_age = shadow_static ? (std::max)(retain_frames, kShadowRetainFrames) : (promoted ? retain_frames : (shadow ? shadow_young_retain_frames : young_retain_frames));
+         }
          if (frame - instance.last_frame > max_age)
          {
             (promoted ? s.evicted_promoted : s.evicted_young)++;
@@ -481,6 +543,7 @@ namespace RTAO
          }
          (promoted ? s.promoted : s.young)++;
          s.shadow_young += shadow && !promoted;
+         shadow_static_count += shadow_static;
          const uint8_t sources = it->second.sources & (kInstanceSourceMain | kInstanceSourceShadow);
          if (sources == (kInstanceSourceMain | kInstanceSourceShadow))
             s.both++;
@@ -490,6 +553,21 @@ namespace RTAO
             s.main_only++;
          ++it;
       }
+      // Cap: past kMaxShadowStatic static shadow map instances, the ones drawn longest ago go
+      if (shadow_static_count > kMaxShadowStatic)
+      {
+         std::vector<std::pair<uint32_t, uint64_t>> oldest;
+         for (const auto& [key, instance] : instances)
+            if ((instance.sources & kInstanceSourceShadow) && !instance.moved)
+               oldest.emplace_back(instance.last_frame, key);
+         const size_t excess = oldest.size() - kMaxShadowStatic;
+         std::nth_element(oldest.begin(), oldest.begin() + excess, oldest.end());
+         for (size_t i = 0; i < excess; i++)
+            instances.erase(oldest[i].second);
+         s.capped = uint32_t(excess);
+         shadow_static_count -= excess;
+      }
+      s.shadow_static = uint32_t(shadow_static_count);
       retention_stats = s;
    }
 
@@ -499,7 +577,17 @@ namespace RTAO
       return retention_stats;
    }
 
-   void TlasBuilder::AddInstance(uint64_t instance_key, uint64_t blas_key, const float object_to_world[3][4], uint8_t mask, uint32_t cutout_record, uint8_t source)
+   std::vector<TlasBuilder::InstanceInfo> TlasBuilder::Snapshot()
+   {
+      const std::lock_guard lock(mutex);
+      std::vector<InstanceInfo> out;
+      out.reserve(instances.size());
+      for (const auto& [key, i] : instances)
+         out.push_back({ i.blas_key, i.sources, i.min_slice, { i.transform[0][3], i.transform[1][3], i.transform[2][3] }, i.first_frame, i.last_frame, i.seen_frames });
+      return out;
+   }
+
+   void TlasBuilder::AddInstance(uint64_t instance_key, uint64_t blas_key, const float object_to_world[3][4], uint8_t mask, uint32_t cutout_record, uint8_t source, uint8_t shadow_slice)
    {
       const std::lock_guard lock(mutex);
       auto [it, inserted] = instances.try_emplace(instance_key);
@@ -509,11 +597,24 @@ namespace RTAO
          instance.seen_frames = 1;
          instance.sources = 0;
          instance.missing_frames = 0;
+         instance.first_frame = frame;
+         instance.shadow_first_frame = UINT32_MAX;
+         instance.min_slice = 0xFF;
+         instance.moved = false;
+         instance.batch = false;
          added_new++;
+      }
+      if ((source & kInstanceSourceShadow) && !(instance.sources & kInstanceSourceShadow))
+      {
+         instance.shadow_first_frame = frame;
+         added_new_shadow++;
+         batch_candidates.push_back(instance_key);
       }
       else if (instance.last_frame != frame)
          instance.seen_frames++;
       instance.sources |= source;
+      if (shadow_slice < instance.min_slice)
+         instance.min_slice = shadow_slice;
       std::memcpy(instance.transform, object_to_world, sizeof(instance.transform));
       instance.blas_key = blas_key;
       instance.mask = mask;
@@ -687,6 +788,8 @@ namespace RTAO
          const std::lock_guard lock(mutex);
          instances.clear();
          frame_instances.clear();
+         batch_candidates.clear();
+         added_new_shadow = 0;
       }
       for (uint32_t i = 0; i < kSlots; i++)
       {

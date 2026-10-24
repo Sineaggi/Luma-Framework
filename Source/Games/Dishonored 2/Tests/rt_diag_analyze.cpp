@@ -31,7 +31,7 @@ struct Capture
    double vp[16] = {}, inv_vp[16] = {};
    double cam[3] = {}, fwd[3] = {};
    int phase = 0;
-   int combo = 0; // Test matrix combo (bit 0: openables from the shadow map off, bit 1: shadow map objects kept longer)
+   int combo = 0; // Test matrix combo (bit 0: openables from the shadow map off, bit 1: the old shadow map retention rule)
    bool settle = false; // Right after a combo switch: not compared
    uint32_t w = 0, h = 0;
    std::vector<float> depth;
@@ -349,9 +349,95 @@ int main(int argc, char** argv)
          printf("  mesh %08X: in %d captures, largest gap between the shadow map copy and the camera copy %.3f m%s\n", key, p.captures, p.max_gap, p.max_gap > 0.05 ? "  <-- MISPLACED" : "");
    }
    const char* names[5] = { "game_shadow", "rt_raw", "rt_denoised", "scene", "final" };
-   const char* combo_names[4] = { "default (openables from shadow map, short shadow young)", "openables from shadow map OFF", "shadow map objects kept longer", "openables OFF + kept longer" };
+   // Against the game's own shadow, per capture (no pairs, so nothing is skipped): the lit fraction of the RT shadow vs
+   // the game's. A caster the game doesn't have (or the reverse) shows as a gap, however long it lasts.
+   auto lit = [](const std::vector<uint8_t>& v) { size_t n = 0; for (uint8_t x : v) n += x > 127; return v.empty() ? -1.0 : double(n) / v.size(); };
+   struct Gap { double sum = 0, max = 0; int n = 0, big = 0; };
+   std::map<int, Gap> gaps;
+   printf("\nlit fraction, RT vs the game's own shadow, per capture (|gap| > 0.05 marked):\n");
+   double prev_rt = -1;
+   for (const Capture& c : captures)
+   {
+      auto g = c.gray.find("game_shadow"), r = c.gray.find("rt_denoised");
+      if (g == c.gray.end() || r == c.gray.end())
+         continue;
+      const double gl = lit(g->second), rl = lit(r->second), gap = rl - gl;
+      Gap& acc = gaps[(c.phase & 1) * 10 + c.combo];
+      acc.sum += std::fabs(gap);
+      acc.max = std::max(acc.max, std::fabs(gap));
+      acc.n++;
+      acc.big += std::fabs(gap) > 0.05;
+      if (std::fabs(gap) > 0.05 || (prev_rt >= 0 && std::fabs(rl - prev_rt) > 0.05))
+         printf("  c%04d t=%5.1fs phase %d combo %d%s: game %.3f, rt %.3f, gap %+.3f%s\n", c.index, std::stod(c.meta.count("t_ms") ? c.meta.at("t_ms") : std::string("0")) / 1000.0, c.phase, c.combo, c.settle ? " (settle)" : "", gl, rl, gap,
+            prev_rt >= 0 && std::fabs(rl - prev_rt) > 0.05 ? "  <-- RT jump" : "");
+      prev_rt = rl;
+   }
+   // Pass/fail metric (absolute, per capture, switch captures included): where the game's own shadow is lit (the
+   // window light), the share the RT shadow also lights ("recall"), and where the game is shadowed, the share RT
+   // lights anyway ("false light"). Plus the view depth of the game's lit pixels against cascade 0's far depth.
+   struct Agree { double recall_sum = 0, recall_min = 2, false_sum = 0; int n = 0, low = 0; };
+   std::map<int, Agree> agree;
+   printf("\nagreement with the game's own shadow, per capture (recall < 0.8 or false light > 0.05 marked):\n");
+   for (const Capture& c : captures)
+   {
+      auto g = c.gray.find("game_shadow"), r = c.gray.find("rt_denoised");
+      if (g == c.gray.end() || r == c.gray.end())
+         continue;
+      size_t game_lit = 0, both_lit = 0, game_dark = 0, false_lit = 0;
+      std::vector<double> lit_z;
+      for (size_t i = 0; i < g->second.size(); i++)
+      {
+         const bool gl = g->second[i] > 127, rl = r->second[i] > 127;
+         if (gl)
+         {
+            game_lit++;
+            both_lit += rl;
+            double w[3];
+            if (lit_z.size() < 20000 && World(c, uint32_t(i % c.w), uint32_t(i / c.w), w))
+               lit_z.push_back((w[0] - c.cam[0]) * c.fwd[0] + (w[1] - c.cam[1]) * c.fwd[1] + (w[2] - c.cam[2]) * c.fwd[2]);
+         }
+         else
+         {
+            game_dark++;
+            false_lit += rl;
+         }
+      }
+      if (game_lit < 200)
+         continue; // No window light in view
+      const double recall = double(both_lit) / game_lit, false_light = game_dark ? double(false_lit) / game_dark : 0.0;
+      Agree& a = agree[(c.phase & 1) * 10 + c.combo];
+      a.recall_sum += recall;
+      a.recall_min = std::min(a.recall_min, recall);
+      a.false_sum += false_light;
+      a.n++;
+      a.low += recall < 0.8;
+      std::nth_element(lit_z.begin(), lit_z.begin() + lit_z.size() / 2, lit_z.end());
+      const double median_z = lit_z.empty() ? -1 : lit_z[lit_z.size() / 2];
+      double fars[4] = { -1, -1, -1, -1 };
+      if (c.meta.count("slice_fars"))
+         ParseList(c.meta.at("slice_fars"), fars, 4);
+      if (recall < 0.8 || false_light > 0.05)
+         printf("  c%04d t=%5.1fs phase %d combo %d%s: recall %.3f, false light %.3f | lit pixels' median view depth %.2f m, cascade 0 ends at %.2f m\n", c.index,
+            std::stod(c.meta.count("t_ms") ? c.meta.at("t_ms") : std::string("0")) / 1000.0, c.phase, c.combo, c.settle ? " (settle)" : "", recall, false_light, median_z, fars[0]);
+   }
+   const char* combo_names[4] = { "default (near slices only, static shadow world kept)", "near slices only, OLD retention", "ALL slices, static shadow world kept", "ALL slices, OLD retention" };
    printf("\nper combo (pairs within a block, settling captures skipped): mean %% of compared pixels flipping\n");
    printf("  %-58s %5s | %8s %7s %7s %7s %7s | %6s %6s\n", "combo", "pairs", "game_sh", "rt_raw", "rt_den", "scene", "final", "max rt", "spikes");
+   printf("\nper combo, agreement with the game's own shadow (captures with window light in view):\n");
+   for (const auto& [id, a] : agree)
+   {
+      const int phase = id / 10, combo = id % 10;
+      std::string name = phase ? std::string("FROZEN scene, ") + combo_names[combo & 3] : combo_names[combo & 3];
+      printf("  %-58s %3d captures | recall mean %.3f, min %.3f, captures below 0.8: %d | false light mean %.3f\n", name.c_str(), a.n, a.recall_sum / a.n, a.recall_min, a.low, a.false_sum / a.n);
+   }
+   printf("\nper combo, RT lit fraction vs the game's own shadow (all captures):\n");
+   for (const auto& [id, gap] : gaps)
+   {
+      const int phase = id / 10, combo = id % 10;
+      std::string name = phase ? std::string("FROZEN scene, ") + combo_names[combo & 3] : combo_names[combo & 3];
+      printf("  %-58s %3d captures | mean |gap| %.3f, max %.3f, captures with |gap| > 0.05: %d\n", name.c_str(), gap.n, gap.sum / gap.n, gap.max, gap.big);
+   }
+   printf("\n");
    for (const auto& [id, s] : sums)
    {
       if (!s.pairs)

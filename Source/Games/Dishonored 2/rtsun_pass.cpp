@@ -864,6 +864,7 @@ namespace RTSun
          {
             std::memcpy(direction, dir, sizeof(direction));
             std::memcpy(atmosphere_sun, sun, sizeof(atmosphere_sun));
+            std::memcpy(slice_fars, data, sizeof(slice_fars)); // cb_parallellightslicefars @0
             direction_frame = slot.frame;
             valid = true;
          }

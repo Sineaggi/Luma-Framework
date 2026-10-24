@@ -199,7 +199,10 @@ namespace RTAO
       uint32_t main_only = 0, shadow_only = 0, both = 0; // By where they were seen
       uint32_t evicted_young = 0, evicted_promoted = 0; // Pruned by that BeginFrame
       uint32_t added_new = 0; // AddInstance calls since the previous BeginFrame that created an instance
-      uint32_t shadow_young = 0; // Retained shadow map instances not confirmed static yet (moving objects stay here)
+      uint32_t shadow_young = 0; // Retained shadow map instances not confirmed static yet (old rule)
+      uint32_t shadow_static = 0; // Shadow map instances kept as static world
+      uint32_t moved = 0; // Shadow map copies dropped as the previous position of a moving object (this BeginFrame)
+      uint32_t capped = 0; // Static shadow map instances dropped by the cap (this BeginFrame)
    };
 
    class TlasBuilder
@@ -221,6 +224,13 @@ namespace RTAO
       static constexpr uint32_t kShadowYoungRetainFrames = 4;
       // A retained instance whose BLAS has been missing this many builds (mesh freed, e.g. a level change) is dropped
       static constexpr uint32_t kMissingBlasFrames = 120;
+      // Shadow map retention (BeginFrame, shadow_mode 0): a redraw batch is this many new shadow map instances in one
+      // readback; a moved copy is within kMovingDistance of the previous one, which stopped being drawn within
+      // kMovingWindowFrames; at most kMaxShadowStatic static shadow map instances (the least recently drawn go first)
+      static constexpr uint32_t kShadowBatch = 30;
+      static constexpr uint32_t kMovingWindowFrames = 4;
+      static constexpr float kMovingDistance = 2.f;
+      static constexpr size_t kMaxShadowStatic = 60000;
 
       ~TlasBuilder() { Clear(nullptr, 0); }
 
@@ -229,7 +239,16 @@ namespace RTAO
       // Thread safe. "object_to_world" is a row major 3x4 (the D3D12 instance transform layout).
       // "mask": kInstanceMaskOpaque, or kInstanceMaskCutout for alpha tested geometry (non opaque in the TLAS).
       // "cutout_record": cutouts only, see kNoCutoutRecord.
-      void AddInstance(uint64_t instance_key, uint64_t blas_key, const float object_to_world[3][4], uint8_t mask = kInstanceMaskOpaque, uint32_t cutout_record = kNoCutoutRecord, uint8_t source = kInstanceSourceMain);
+      void AddInstance(uint64_t instance_key, uint64_t blas_key, const float object_to_world[3][4], uint8_t mask = kInstanceMaskOpaque, uint32_t cutout_record = kNoCutoutRecord, uint8_t source = kInstanceSourceMain, uint8_t shadow_slice = 0xFF);
+      // Diagnostic capture: every retained instance (BLAS key, sources, lowest shadow map slice, position, frames)
+      struct InstanceInfo
+      {
+         uint64_t blas_key;
+         uint8_t sources, min_slice;
+         float pos[3];
+         uint32_t first_frame, last_frame, seen_frames;
+      };
+      std::vector<InstanceInfo> Snapshot();
       RetentionStats GetRetentionStats();
       void RemoveInstance(uint64_t instance_key);
       size_t RetainedCount();
@@ -248,7 +267,9 @@ namespace RTAO
       uint32_t retain_frames = kRetainFrames;
       uint32_t promote_frames = kPromoteFrames;
       uint32_t young_retain_frames = kYoungRetainFrames;
-      uint32_t shadow_young_retain_frames = kShadowYoungRetainFrames; // Test toggle "keep shadow map objects longer"
+      uint32_t shadow_young_retain_frames = kShadowYoungRetainFrames; // Old rule only
+      uint32_t shadow_mode = 0; // 0: static world until unloaded, moving copies dropped; 1: the old rule (test toggle)
+      std::atomic<bool> drop_shadow_request = false; // Next BeginFrame drops every instance seen only in shadow maps
 
    private:
       struct Instance
@@ -261,7 +282,14 @@ namespace RTAO
          uint8_t mask;
          uint8_t sources;
          uint32_t missing_frames; // Consecutive builds its BLAS was missing
+         uint32_t first_frame;
+         uint32_t shadow_first_frame; // The frame its first shadow map sighting was added
+         uint8_t min_slice; // Lowest shadow map array slice it was drawn in (0xFF: none)
+         bool moved; // A shadow map copy left behind by a moving object
+         bool batch; // Arrived in a shadow map redraw batch (never taken for a move)
       };
+      uint32_t added_new_shadow = 0;
+      std::vector<uint64_t> batch_candidates; // Shadow map instances created since the last BeginFrame
       RetentionStats retention_stats;
       uint32_t added_new = 0;
       std::mutex mutex;

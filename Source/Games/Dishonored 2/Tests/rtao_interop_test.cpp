@@ -250,11 +250,57 @@ static void TestTlasRetention()
    tlas.AddInstance(2, 1, identity);
    CHECK(tlas.RetainedCount() == 1, "a promoted instance must be pruned after kRetainFrames (got %zu)", tlas.RetainedCount());
 
-   // Shadow map instances: static casters (drawn every frame, as the game does) are kept far beyond kRetainFrames once
-   // out of all views; a moving object (a new key every frame, seen by the main view then the shadow map a frame later)
-   // leaves no trail
+   // Shadow map instances, current rule: static world drawn once (a shadow map region the game keeps) stays until its
+   // mesh goes; a moving object (shadow only, or main view then shadow map a frame later) leaves no trail; two redraw
+   // batches of the same mesh side by side in consecutive frames are not taken for moves
    {
       RTAO::TlasBuilder shadow;
+      shadow.BeginFrame();
+      for (uint64_t k = 0; k < 6; k++)
+      {
+         float xform[3][4] = { { 1, 0, 0, 10.f + 0.3f * k }, { 0, 1, 0, 0 }, { 0, 0, 1, 0 } };
+         shadow.AddInstance(500 + k, 3, xform, RTAO::kInstanceMaskOpaque, RTAO::kNoCutoutRecord, RTAO::kInstanceSourceShadow);
+      }
+      // Moving, seen by the main view then the shadow map a frame later
+      for (uint64_t f = 0; f < 40; f++)
+      {
+         shadow.BeginFrame();
+         float now[3][4] = { { 1, 0, 0, 0.1f * f }, { 0, 1, 0, 5 }, { 0, 0, 1, 0 } };
+         float before[3][4] = { { 1, 0, 0, 0.1f * (f - 1) }, { 0, 1, 0, 5 }, { 0, 0, 1, 0 } };
+         shadow.AddInstance(1000 + f, 2, now, RTAO::kInstanceMaskOpaque, RTAO::kNoCutoutRecord, RTAO::kInstanceSourceMain);
+         if (f > 0)
+            shadow.AddInstance(1000 + f - 1, 2, before, RTAO::kInstanceMaskOpaque, RTAO::kNoCutoutRecord, RTAO::kInstanceSourceShadow);
+      }
+      // Moving, shadow map only
+      for (uint64_t f = 0; f < 40; f++)
+      {
+         shadow.BeginFrame();
+         float now[3][4] = { { 1, 0, 0, 0.1f * f }, { 0, 1, 0, 9 }, { 0, 0, 1, 0 } };
+         shadow.AddInstance(2000 + f, 4, now, RTAO::kInstanceMaskOpaque, RTAO::kNoCutoutRecord, RTAO::kInstanceSourceShadow);
+      }
+      // Two redraw batches (40 each, the same mesh 0.3 apart), one frame apart
+      for (int b = 0; b < 2; b++)
+      {
+         shadow.BeginFrame();
+         for (uint64_t k = 0; k < 40; k++)
+         {
+            float xform[3][4] = { { 1, 0, 0, 100.f + 0.3f * k + 0.15f * b }, { 0, 1, 0, 0 }, { 0, 0, 1, 0 } };
+            shadow.AddInstance(3000 + b * 100 + k, 5, xform, RTAO::kInstanceMaskOpaque, RTAO::kNoCutoutRecord, RTAO::kInstanceSourceShadow);
+         }
+      }
+      for (uint32_t i = 0; i < 10; i++)
+         shadow.BeginFrame();
+      // 6 static + the two movers' last positions (+ the main view mover's last main-only copy, young) + 80 batch copies
+      CHECK(shadow.RetainedCount() >= 6 + 2 + 80 && shadow.RetainedCount() <= 6 + 3 + 80, "moving objects must leave no trail, batches must stay (retained %zu)", shadow.RetainedCount());
+      for (uint32_t i = 0; i < 20000; i++)
+         shadow.BeginFrame();
+      CHECK(shadow.RetainedCount() >= 6 + 2 + 80, "static shadow map world must stay without sightings (retained %zu)", shadow.RetainedCount());
+   }
+
+   // The old rule (test toggle): static casters need kShadowPromoteFrames sightings
+   {
+      RTAO::TlasBuilder shadow;
+      shadow.shadow_mode = 1;
       for (uint32_t f = 0; f < RTAO::TlasBuilder::kShadowPromoteFrames; f++)
       {
          shadow.BeginFrame();

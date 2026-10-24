@@ -237,6 +237,7 @@ namespace RTAO
       // transform check at readback: world = MVP x inverse(the bound PerViewCB view projection) is only right if the
       // game bound the light's view in PerViewCB.
       bool shadow_view = false;
+      uint8_t shadow_slice = 0xFF; // shadow_view: the shadow map array slice the draw renders into
    };
 
    struct CaptureStats
@@ -337,6 +338,14 @@ namespace RTAO
          float pos[3];
       };
       std::vector<FrameMeshProbe> GetProbes() { const std::lock_guard lock(mutex); return probes; }
+      // Diagnostic capture: index and vertex count of a captured mesh (0 if unknown)
+      void GetMeshSize(uint64_t key, uint32_t& index_count, uint32_t& vertex_count)
+      {
+         const std::lock_guard lock(mutex);
+         auto it = meshes.find(key);
+         index_count = it != meshes.end() ? it->second.index_count : 0;
+         vertex_count = it != meshes.end() ? it->second.vertex_count : 0;
+      }
       // Test toggle: per frame meshes (openables) from shadow map draws are skipped while this is off
       std::atomic<bool> shadow_frame_meshes_enabled = true;
       // Set to drop the held movables at the next Record (diagnostic test matrix: a switch must not inherit them)
@@ -411,6 +420,7 @@ namespace RTAO
          bool shadow_view = false; // Instances, FrameMesh: from a shadow map draw (kept after the AO pass)
          bool check_rigid = false; // Instances: MVP derived in a shadow map draw (see DrawInfo::shadow_view)
          uint32_t tag = 0; // Instances: the draw's record tag (CaptureParams::record_tag)
+         uint8_t shadow_slice = 0xFF;
          bool skinned = false; // FrameMesh: skinned (else a dynamic vertex buffer), debug scene view
          bool mvp = false; // Instances: MVP derived matrix (identity matched with a tolerance, see FuzzyKey)
       };
@@ -483,6 +493,7 @@ namespace RTAO
          bool check_rigid;
          bool mvp;
          uint32_t tag;
+         uint8_t shadow_slice;
       };
       uint32_t next_record_tag = 1;
       // MVP derived matrices (world = MVP x inverse(VP)) carry float noise that changes with the camera, so their exact

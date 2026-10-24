@@ -214,6 +214,9 @@ namespace RTSun
 
       // The latest light direction (toward the light) and the frame its copy was made on. False if none yet.
       bool GetDirection(float out_dir[3], uint32_t* out_frame = nullptr, float* out_atmosphere_sun = nullptr);
+      // cb_parallellightslicefars of the same copy: the view depth where each cascade ends (the game's screen shadows
+      // pick cascade = how many of these the pixel's view depth reaches, and sample that slice of its shadow map array)
+      void GetSliceFars(float out[4]) { const std::lock_guard lock(mutex); std::memcpy(out, slice_fars, sizeof(slice_fars)); }
       int up_axis = 2;
 
       static constexpr uint32_t kSlots = 4;
@@ -234,6 +237,7 @@ namespace RTSun
       bool valid = false;
       float direction[3] = {};
       float atmosphere_sun[3] = {};
+      float slice_fars[4] = {};
       uint32_t direction_frame = 0;
    };
 }

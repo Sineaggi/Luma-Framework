@@ -2301,6 +2301,45 @@ static void TestCutoutTextures(ID3D11Device* device, ID3D11DeviceContext* contex
    CHECK(std::fabs(sun_stochastic_left - sun_stochastic_right) < 0.1f && sun_stochastic_left > 0.3f && sun_stochastic_left < 0.7f, "RT sun, stochastic: both sides half lit");
    CHECK(sun_counters.exact_tests > 0 && sun_counters.exact_hits > 0 && sun_counters.fallback_tests == 0, "RT sun: masked candidates counted");
 
+   // Textured windows (RTSunTexturedWindows, pattern 4): the same wall as a window whose BC5-like SNORM normal map is
+   // raised (lead) in the checker's solid quadrants and flat (glass) elsewhere. The strip shader turns the normal's xy
+   // length into the opacity mask; the sun must be blocked by the lead and pass the glass, like the alpha checker.
+   {
+      std::vector<int8_t> normal(64 * 64 * 2, 0);
+      for (int y = 0; y < 64; y++)
+         for (int x = 0; x < 64; x++)
+         {
+            const bool solid = (x < 32) == (y >= 32);
+            normal[(y * 64 + x) * 2 + 0] = solid ? 110 : 0;
+            normal[(y * 64 + x) * 2 + 1] = solid ? 40 : 0;
+         }
+      D3D11_TEXTURE2D_DESC normal_desc = { 64, 64, 1, 1, DXGI_FORMAT_R8G8_SNORM, { 1, 0 }, D3D11_USAGE_DEFAULT, D3D11_BIND_SHADER_RESOURCE, 0, 0 };
+      D3D11_SUBRESOURCE_DATA normal_data = { normal.data(), 64 * 2, 0 };
+      ID3D11Texture2D* normal_texture = nullptr;
+      device->CreateTexture2D(&normal_desc, &normal_data, &normal_texture);
+      ID3D11ShaderResourceView* normal_srv = nullptr;
+      device->CreateShaderResourceView(normal_texture, nullptr, &normal_srv);
+      RTAO::PixelShaderInfo window_ps;
+      window_ps.discard = window_ps.alpha_tested = window_ps.texture_exact = true;
+      window_ps.alpha_channel = 4;
+      window_ps.alpha_ref = 0.5f;
+      const RTAO::DrawInfo saved = draw;
+      draw.ps = &window_ps;
+      draw.alpha_srv = normal_srv;
+      draw.material_cb = nullptr;
+      draw.window = true;
+      float window_left = 0.f, window_right = 0.f;
+      sun_on = true;
+      sun_settings.cutout_exact = true;
+      measure_sun(window_left, window_right);
+      sun_on = false;
+      draw = saved;
+      printf("RT sun through a textured window (normal map lead), left (lead below) / right (glass below): %.3f / %.3f\n", window_left, window_right);
+      CHECK(window_left < 0.1f && window_right > 0.9f, "RT sun, textured window: shadow of the lead, light through the glass (%.3f / %.3f)", window_left, window_right);
+      normal_srv->Release();
+      normal_texture->Release();
+   }
+
    CHECK(interop.WaitForIdle(5000), "WaitForIdle");
    retirer.ReleaseAll();
    sun.Shutdown(nullptr, 0);

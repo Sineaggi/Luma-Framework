@@ -455,7 +455,8 @@ void skin_vertices_cs(uint3 id : SV_DispatchThreadID)
 
 cbuffer AlphaStripParams : register(b0)
 {
-    uint AlphaChannel; // 0..3
+    uint AlphaChannel; // 0..3: that channel. Textured windows (main.cpp RTSunWindowPattern), the opacity: 4 the lead of a
+                       // BC5 SNORM normal map (raised = lead), 5 one minus channel x, 6 channel x, 7 one minus the luminance
     uint AlphaSourceMips; // Mips in the view
     float2 AlphaSourceSize; // Size of the view's most detailed mip
 };
@@ -479,7 +480,18 @@ void alpha_strip_cs(uint3 id : SV_DispatchThreadID)
         {
             float2 uv = (float2(id.xy) + (float2(x, y) + 0.5) / float(taps)) / tile;
             float4 texel = AlphaSource.SampleLevel(AlphaSampler, uv, sample_lod);
-            value += AlphaChannel == 0 ? texel.x : (AlphaChannel == 1 ? texel.y : (AlphaChannel == 2 ? texel.z : texel.w));
+            float v;
+            if (AlphaChannel == 4)
+                v = saturate(length(texel.xy) * 2.0);
+            else if (AlphaChannel == 5)
+                v = 1.0 - texel.x;
+            else if (AlphaChannel == 6)
+                v = texel.x;
+            else if (AlphaChannel == 7)
+                v = 1.0 - dot(saturate(texel.rgb), float3(0.299, 0.587, 0.114));
+            else
+                v = AlphaChannel == 0 ? texel.x : (AlphaChannel == 1 ? texel.y : (AlphaChannel == 2 ? texel.z : texel.w));
+            value += v;
         }
     }
     AlphaTile[id.xy] = value / float(taps * taps);

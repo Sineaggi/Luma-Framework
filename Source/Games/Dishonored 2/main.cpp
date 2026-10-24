@@ -396,6 +396,25 @@ namespace
    // Window material textures (diagnostic capture): the textures bound to the colour pass of the window panes' shaders,
    // listed in textures.csv and each saved once as tex_<slot>_<srv>.png (512x512, the game's sampling of it)
    constexpr uint32_t kWindowPixelShaders[] = { 0x09D8B56Eu, 0xC2A93A3Du, 0x905A32E4u, 0xFC0455E5u };
+   // Textured windows (opt in, config "RTSunTexturedWindows"): the game keeps window panes out of its sun shadow; with
+   // this on, a pane's own texture decides where the sun passes. "RTSunWindowPattern" (the strip shader's mode): 4 lead
+   // from the normal map (default), 5 one minus the one channel map, 6 the one channel map, 7 one minus the diffuse
+   // luminance. The colour pass of the window shaders registers, per mesh, the pattern's texture and the UVs; the
+   // mesh's motion vector pass draw (its geometry capture) then becomes a cutout with that mask.
+   bool g_rtsun_textured_windows = false;
+   int g_rtsun_window_pattern = 4;
+   struct WindowMaterial
+   {
+      com_ptr<ID3D11ShaderResourceView> srv;
+      com_ptr<ID3D11Buffer> uv_buffer;
+      UINT uv_stride = 0, uv_offset = 0, uv_element_offset = 0;
+      DXGI_FORMAT uv_format = DXGI_FORMAT_UNKNOWN;
+      uint32_t pattern = 0;
+   };
+   std::mutex g_window_mutex;
+   std::unordered_map<uint64_t, WindowMaterial> g_windows;
+   std::atomic<uint64_t> g_window_registered = 0, g_window_captured = 0;
+   RTAO::PixelShaderInfo g_window_ps[8]; // Per pattern mode: texture exact, reference 0.5, TEXCOORD0 as is
    std::mutex g_tex_probe_mutex;
    std::map<std::string, uint64_t> g_tex_probe;
    std::vector<std::pair<std::string, com_ptr<ID3D11ShaderResourceView>>> g_tex_dump_queue;
@@ -1393,6 +1412,8 @@ public:
                const std::string path = (std::filesystem::path(g_rtdiag.dir) / name).string();
                std::thread([csv = std::move(csv), path]() { std::ofstream(path) << csv; }).detach();
             }
+            add("textured_windows=%d\nwindow_pattern=%d\nwindows_registered=%llu\nwindow_draws_captured=%llu\n", int(g_rtsun_textured_windows), g_rtsun_window_pattern,
+               (unsigned long long)g_window_registered.load(), (unsigned long long)g_window_captured.load());
             add("casters_only=%d\nskinned_hold=%d\nafter_ao_records=%llu\nafter_ao_redraw_kept=%llu\n", int(g_rtsun_casters_only), g_rtao_skinned_hold,
                (unsigned long long)stats.after_ao_records, (unsigned long long)stats.after_ao_redraw_kept);
             add("shadow_bias=%d\nshadow_slope_bias=%.3f\nshadow_depth_format=%u\nshadow_records_held=%llu\nshadow_records_lost=%llu\nrecords_deferred=%llu\n", g_shadow_depth_bias.load(), g_shadow_slope_bias.load(), g_shadow_depth_format.load(),
@@ -3152,6 +3173,82 @@ public:
          g_shadow_audit.emplace(std::move(key), 1);
    }
 
+   // The mesh key GeometryCapture gives the draw's geometry (0 if unknown)
+   static uint64_t DrawMeshKey(ID3D11DeviceContext* context, const RTAO::InputLayoutInfo& layout_info, uint32_t index_count, uint32_t first_index, int32_t vertex_offset)
+   {
+      if (!layout_info.has_position)
+         return 0;
+      com_ptr<ID3D11Buffer> vb, ib;
+      UINT stride = 0, offset = 0, index_offset = 0;
+      DXGI_FORMAT index_format = DXGI_FORMAT_UNKNOWN;
+      context->IAGetVertexBuffers(layout_info.position_slot, 1, &vb, &stride, &offset);
+      context->IAGetIndexBuffer(&ib, &index_format, &index_offset);
+      const uint32_t index_size = index_format == DXGI_FORMAT_R16_UINT ? 2 : (index_format == DXGI_FORMAT_R32_UINT ? 4 : 0);
+      if (!vb || !ib || !index_size)
+         return 0;
+      D3D11_BUFFER_DESC vb_desc = {};
+      vb->GetDesc(&vb_desc);
+      const bool dynamic = vb_desc.Usage == D3D11_USAGE_DYNAMIC;
+      const int64_t vertex_zero = int64_t(offset) + int64_t(vertex_offset) * int64_t(stride);
+      if (vertex_zero < 0)
+         return 0;
+      return RTAO::ComputeMeshKey(vb.get(), ib.get(), uint64_t(vertex_zero) + layout_info.position_offset, stride,
+         dynamic ? layout_info.position_format : RTAO::DxrVertexFormat(layout_info.position_format), uint64_t(index_offset) + uint64_t(first_index) * index_size, index_count, index_format);
+   }
+
+   // Textured windows: a colour pass draw of a window shader registers its mesh's pattern texture and UVs
+   static void RegisterWindowDraw(ID3D11DeviceContext* context, uint32_t index_count, uint32_t first_index, int32_t vertex_offset)
+   {
+      com_ptr<ID3D11PixelShader> ps;
+      context->PSGetShader(&ps, nullptr, nullptr);
+      if (!ps)
+         return;
+      com_ptr<ID3D11InputLayout> layout;
+      context->IAGetInputLayout(&layout);
+      uint32_t ps_hash = 0;
+      RTAO::InputLayoutInfo layout_info;
+      {
+         const std::shared_lock lock(g_rtao_shader_mutex);
+         auto ph = g_rtao_pixel_shader_hashes.find(uint64_t(uintptr_t(ps.get())));
+         ps_hash = ph != g_rtao_pixel_shader_hashes.end() ? ph->second : 0;
+         if (std::find(std::begin(kWindowPixelShaders), std::end(kWindowPixelShaders), ps_hash) == std::end(kWindowPixelShaders))
+            return;
+         auto layout_it = g_rtao_input_layouts.find(uint64_t(uintptr_t(layout.get())));
+         if (layout_it == g_rtao_input_layouts.end())
+            return;
+         layout_info = layout_it->second;
+      }
+      if (!layout_info.texcoord0.present || layout_info.texcoord0.per_instance)
+         return;
+      const uint32_t pattern = uint32_t(std::clamp(g_rtsun_window_pattern, 4, 7));
+      // Texture slots of the window shaders (their reflection): normal t3, one channel map t4, diffuse t6 (FC0455E5: t5)
+      const uint32_t diffuse_slot = ps_hash == 0xFC0455E5u ? 5 : 6;
+      const uint32_t slot = pattern == 4 ? 3 : (pattern == 7 ? diffuse_slot : 4);
+      const uint64_t key = DrawMeshKey(context, layout_info, index_count, first_index, vertex_offset);
+      if (!key)
+         return;
+      {
+         const std::lock_guard lock(g_window_mutex);
+         auto it = g_windows.find(key);
+         if (it != g_windows.end() && it->second.pattern == pattern)
+            return;
+      }
+      WindowMaterial material;
+      context->PSGetShaderResources(slot, 1, &material.srv);
+      context->IAGetVertexBuffers(layout_info.texcoord0.slot, 1, &material.uv_buffer, &material.uv_stride, &material.uv_offset);
+      material.uv_element_offset = layout_info.texcoord0.offset;
+      material.uv_format = layout_info.texcoord0.format;
+      material.pattern = pattern;
+      if (!material.srv || !material.uv_buffer)
+         return;
+      const std::lock_guard lock(g_window_mutex);
+      if (g_windows.size() < 1024)
+      {
+         g_windows[key] = std::move(material);
+         g_window_registered++;
+      }
+   }
+
    static void DrawProbe(ID3D11DeviceContext* context, uint32_t index_count, uint32_t first_index, int32_t vertex_offset)
    {
       com_ptr<ID3D11InputLayout> layout;
@@ -3306,6 +3403,8 @@ public:
       if (device->get_api() != reshade::api::device_api::d3d11)
          return false;
       auto* context = reinterpret_cast<ID3D11DeviceContext*>(cmd_list->get_native());
+      if (g_rtsun_textured_windows)
+         RegisterWindowDraw(context, index_count, first_index, vertex_offset);
       // Main view draws, or shadow map draws (sun casters out of view). Shadow map draws feed no main view diagnostics.
       bool shadow_view = false;
       uint32_t shadow_slice = 0xFF;
@@ -3580,6 +3679,31 @@ public:
             draw.uv.offset = uv_offset;
             draw.uv.element_offset = layout_info.texcoord0.offset;
             draw.uv.format = layout_info.texcoord0.format;
+         }
+      }
+      WindowMaterial window_material;
+      if (g_rtsun_textured_windows && !shadow_view && !draw.cutout && g_rtao_cutouts_exact)
+      {
+         const uint64_t key = DrawMeshKey(context, layout_info, index_count, first_index, vertex_offset);
+         {
+            const std::lock_guard lock(g_window_mutex);
+            auto it = g_windows.find(key);
+            if (key && it != g_windows.end())
+               window_material = it->second;
+         }
+         if (window_material.srv && window_material.uv_buffer && window_material.pattern >= 4 && window_material.pattern <= 7)
+         {
+            draw.cutout = true;
+            draw.window = true;
+            draw.ps = &g_window_ps[window_material.pattern];
+            draw.alpha_srv = window_material.srv.get();
+            draw.material_cb = nullptr;
+            draw.uv.buffer = window_material.uv_buffer.get();
+            draw.uv.stride = window_material.uv_stride;
+            draw.uv.offset = window_material.uv_offset;
+            draw.uv.element_offset = window_material.uv_element_offset;
+            draw.uv.format = window_material.uv_format;
+            g_window_captured++;
          }
       }
       if (g_rtao_dedup)
@@ -4018,6 +4142,18 @@ public:
       reshade::get_config_value(runtime, NAME, "RTAOShadowFlatTargets", g_rtao_shadow_flat);
       reshade::get_config_value(runtime, NAME, "RTAOShadowSkinned", g_rtao_shadow_skinned);
       reshade::get_config_value(runtime, NAME, "RTAOShadowAtlasCasters", g_rtao_shadow_atlas_casters);
+      reshade::get_config_value(runtime, NAME, "RTSunTexturedWindows", g_rtsun_textured_windows);
+      reshade::get_config_value(runtime, NAME, "RTSunWindowPattern", g_rtsun_window_pattern);
+      for (uint32_t mode = 0; mode < 8; mode++)
+      {
+         RTAO::PixelShaderInfo& info = g_window_ps[mode];
+         info.discard = true;
+         info.alpha_tested = true;
+         info.texture_exact = true;
+         info.alpha_channel = mode;
+         info.alpha_ref = 0.5f;
+         info.alpha_ref_exact = true;
+      }
       reshade::get_config_value(runtime, NAME, "RTSunShadowMapTolerance", g_rtsun_shadow_tolerance);
       reshade::get_config_value(runtime, NAME, "RTAOShadowNearSlices", g_rtao_shadow_near_slices);
       reshade::get_config_value(runtime, NAME, "RTAOShadowNearOnly", g_rtao_shadow_near_only);
@@ -4329,6 +4465,14 @@ public:
       ImGui::Checkbox("RT test: openables from the shadow map", &g_rtdbg_shadow_openables);
       if (ImGui::IsItemHovered())
          ImGui::SetTooltip("Off: openable windows/doors only enter the ray tracing scene from the camera's draws (not saved).");
+      if (ImGui::Checkbox("RT sun: textured windows", &g_rtsun_textured_windows))
+         reshade::set_config_value(runtime, NAME, "RTSunTexturedWindows", g_rtsun_textured_windows);
+      if (ImGui::IsItemHovered())
+         ImGui::SetTooltip("The game leaves window panes out of its sun shadows. On: a pane's own texture decides where sunlight passes\n(the lead of a leaded window blocks, the glass lets it through). Not the game's look: an addition.");
+      if (ImGui::SliderInt("RT sun: window pattern source", &g_rtsun_window_pattern, 4, 7))
+         reshade::set_config_value(runtime, NAME, "RTSunWindowPattern", g_rtsun_window_pattern);
+      if (ImGui::IsItemHovered())
+         ImGui::SetTooltip("4: lead from the normal map, 5: one minus the one channel map, 6: the one channel map, 7: one minus the diffuse brightness.\nTakes effect for windows seen after the change.");
       if (ImGui::Checkbox("RT sun: shadow map check", &g_rtsun_shadow_consult))
          reshade::set_config_value(runtime, NAME, "RTSunShadowMapCheck", g_rtsun_shadow_consult);
       if (ImGui::IsItemHovered())

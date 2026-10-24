@@ -1572,6 +1572,7 @@ namespace RTAO
          record.tag = record_tag;
          record.shadow_slice = draw.shadow_slice;
          record.redraw_pass = draw.redraw_pass;
+         record.window = draw.window;
          local.push_back(record);
          if (identity)
             frame_identities.emplace(identity, context);
@@ -2281,7 +2282,7 @@ namespace RTAO
                   }
                   float transform[3][4];
                   std::memcpy(transform, rows, sizeof(transform));
-                  tlas.AddInstance(key, r.mesh_key, transform, r.mask, cutout_record, uint8_t((r.shadow_view ? kInstanceSourceShadow : kInstanceSourceMain) | (r.mvp ? kInstanceFlagMvp : 0)), r.shadow_view ? r.shadow_slice : uint8_t(0xFF));
+                  tlas.AddInstance(key, r.mesh_key, transform, r.mask, cutout_record, uint8_t((r.shadow_view ? kInstanceSourceShadow : kInstanceSourceMain) | (r.mvp ? kInstanceFlagMvp : 0) | (r.window ? kInstanceFlagWindow : 0)), r.shadow_view ? r.shadow_slice : uint8_t(0xFF));
                   frame_instances++;
                   frame_cutouts += (r.mask & kInstanceMaskCutout) != 0;
                }
@@ -2333,7 +2334,7 @@ namespace RTAO
                remaining -= len;
                src = (src + len) % kRingSlots;
             }
-            readback_records[slot].push_back({ record.mesh_key, record.count, record.mask, record.material, record.geometry, record.shadow_view, record.check_rigid, record.mvp, record.tag, record.shadow_slice });
+            readback_records[slot].push_back({ record.mesh_key, record.count, record.mask, record.material, record.geometry, record.shadow_view, record.check_rigid, record.mvp, record.tag, record.shadow_slice, record.window });
          }
          flush();
          Transition(list, ring12, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_COMMON);

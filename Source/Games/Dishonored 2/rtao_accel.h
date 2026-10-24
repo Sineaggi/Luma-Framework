@@ -218,6 +218,7 @@ namespace RTAO
    constexpr uint8_t kInstanceFlagFrameMesh = 0x04; // Per frame mesh (AddFrameInstance)
    constexpr uint8_t kInstanceFlagMvp = 0x08; // Matrix recovered from the MVP
    constexpr uint8_t kInstanceFlagSkinned = 0x10; // Skinned (per frame mesh)
+   constexpr uint8_t kInstanceFlagWindow = 0x40; // Textured window (RTSunTexturedWindows): a sun caster through its glass/lead mask
    constexpr uint8_t kInstanceFlagCameraOnly = 0x20; // Camera only (kInstanceMaskCameraOnly*): the RT sun's shadow map check applies
 
    // TLAS retention diagnostics, from the last BeginFrame (and the AddInstance calls before it)

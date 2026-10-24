@@ -778,7 +778,7 @@ namespace RTAO
             // Camera only: this instance was never drawn into a shadow map. The game draws its sun shadows with its own
             // shadow meshes (often other geometry than the camera's: merged sector meshes) and leaves objects out of
             // them by its own choice (window panes), so only what it drew into a shadow map blocks the sun
-            const bool camera_only = !(pair.second.sources & kInstanceSourceShadow);
+            const bool camera_only = !(pair.second.sources & (kInstanceSourceShadow | kInstanceFlagWindow));
             if (camera_only)
                desc.InstanceMask = (pair.second.mask & kInstanceMaskCutout) ? kInstanceMaskCameraOnlyCutout : kInstanceMaskCameraOnly;
             desc.Flags = D3D12_RAYTRACING_INSTANCE_FLAG_TRIANGLE_CULL_DISABLE |

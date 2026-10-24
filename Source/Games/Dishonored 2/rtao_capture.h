@@ -213,6 +213,7 @@ namespace RTAO
       ID3D11Buffer* per_view_cb = nullptr; // The bound PerViewCB (MvpConstantBuffer only)
       uint32_t per_view_cb_first_constant = 0, per_view_cb_num_constants = 0;
       bool cutout = false; // Alpha tested (the bound pixel shader): its instances go into the TLAS as cutouts (kInstanceMaskCutout)
+      bool window = false; // A textured window (RTSunTexturedWindows): a cutout of its glass/lead pattern that the sun sees
       // Skinned shaders only (vs->skinned)
       struct Stream
       {
@@ -466,6 +467,7 @@ namespace RTAO
          bool mvp = false; // Instances: MVP derived matrix (identity matched with a tolerance, see FuzzyKey)
          uint64_t identity = 0; // FrameMesh: the draw's per frame identity (the pass keeps one record per identity)
          uint8_t context_id = 0; // FrameMesh: diagnostics (FrameMeshEvent)
+         bool window = false; // Instances: DrawInfo::window
          uint64_t ring_pos = 0; // Instances: absolute ring position of first_slot (valid while ring_head - ring_pos <= kRingSlots)
          bool redraw_pass = false; // Instances: from DrawInfo::redraw_pass
       };
@@ -556,6 +558,7 @@ namespace RTAO
          bool mvp;
          uint32_t tag;
          uint8_t shadow_slice;
+         bool window;
       };
       uint32_t next_record_tag = 1;
       // MVP derived matrices (world = MVP x inverse(VP)) carry float noise that changes with the camera, so their exact

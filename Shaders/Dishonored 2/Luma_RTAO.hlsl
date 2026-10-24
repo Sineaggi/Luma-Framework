@@ -94,7 +94,7 @@ cbuffer CaptureParams : register(b0)
     uint MtxOffsetCB; // byte offset of cb_mtxoffset in the game's PerInstanceCB
     uint SkinIndexStart; // Arena byte address of the draw's first index
     uint SkinIndex32;
-    uint SkinPad;
+    uint SkinShadow; // 1: a shadow map draw (FrameCounters)
     // Streams 0 position, 1 indices0, 2 weights0, 3 indices1, 4 weights1 (components of the two uint4)
     uint4 StreamBase[2]; // Arena byte address of vertex 0's element
     uint4 StreamStride[2];
@@ -281,6 +281,9 @@ Buffer<float4> Bones : register(t3); // The draw's ro_matrices
 ByteAddressBuffer Arena : register(t4); // The geometry arena (the game's vertex/index buffers copied whole), one view of it
 ByteAddressBuffer DynamicVertices : register(t5); // DYNAMIC vertex buffers, copied at the draw (stream format flag RTAO_FORMAT_DYNAMIC)
 RWByteAddressBuffer SkinOut : register(u1); // float3 per vertex
+// Diagnostics (uint counters): [0] shadow map per frame meshes whose matrix was rejected, [1] shadow map per frame meshes,
+// [2] main view per frame meshes rejected (not view models), [3] main view per frame meshes. See GeometryCapture::PollCounters.
+RWByteAddressBuffer FrameCounters : register(u2);
 
 // Vertex element formats (must match RTAO::VertexFormatCode): kind | components << 4 | bits per component << 8
 #define RTAO_KIND_FLOAT 1
@@ -403,6 +406,13 @@ void skin_vertices_cs(uint3 id : SV_DispatchThreadID)
     float4 rows[3];
     uint flags = ResolveInstance(0, rows);
 
+    if (i == 0)
+    {
+        uint base = SkinShadow != 0 ? 0 : 8;
+        FrameCounters.InterlockedAdd(base + 4, 1);
+        if ((flags & RTAO_FLAG_VALID) == 0)
+            FrameCounters.InterlockedAdd(base, 1);
+    }
     float3 world = asfloat(0x7FC00000u).xxx; // NaN: DXR treats the triangle as inactive (view model, unresolved matrix)
     if (flags == RTAO_FLAG_VALID)
     {

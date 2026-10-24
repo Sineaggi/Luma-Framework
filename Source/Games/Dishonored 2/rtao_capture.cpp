@@ -136,7 +136,7 @@ namespace RTAO
       // Records one capture dispatch with the draw's own bindings (b1 PerInstanceCB, b2 PerViewCB, t0..t2 instance data)
       // plus ours. Only the compute state it touches is saved and restored. Fills the matrix source part of "params".
       bool DispatchCapture(ID3D11DeviceContext* context, ID3D11Buffer* params_cb, const DrawInfo& draw, CaptureParams& params, ID3D11ComputeShader* shader, ID3D11ShaderResourceView* bones, ID3D11ShaderResourceView* arena,
-         ID3D11ShaderResourceView* dynamic_vertices, ID3D11UnorderedAccessView* uav, UINT uav_slot, UINT groups)
+         ID3D11ShaderResourceView* dynamic_vertices, ID3D11UnorderedAccessView* uav, UINT uav_slot, UINT groups, ID3D11UnorderedAccessView* counters = nullptr)
       {
          const MatrixSource source = draw.vs->source;
          params.source = uint32_t(source);
@@ -152,7 +152,7 @@ namespace RTAO
          params.uv_scalebias_cb = material ? draw.ps->uv_scalebias_cb : kNoOffset;
          params.alpha_ref_const = draw.ps ? draw.ps->alpha_ref : 0.5f;
 
-         constexpr UINT kCbs = 4, kSrvs = 6, kUavs = 2;
+         constexpr UINT kCbs = 4, kSrvs = 6, kUavs = 3;
          ID3D11DeviceContext1* context1 = nullptr;
          context->QueryInterface(IID_PPV_ARGS(&context1));
          ID3D11ComputeShader* old_cs = nullptr;
@@ -207,7 +207,8 @@ namespace RTAO
             context->CSSetShaderResources(0, kSrvs, srvs);
             ID3D11UnorderedAccessView* uavs[kUavs] = {};
             uavs[uav_slot] = uav;
-            UINT initial_counts[kUavs] = { UINT(-1), UINT(-1) };
+            uavs[2] = counters;
+            UINT initial_counts[kUavs] = { UINT(-1), UINT(-1), UINT(-1) };
             context->CSSetUnorderedAccessViews(0, kUavs, uavs, initial_counts);
             context->Dispatch(groups, 1, 1);
             dispatched = true;
@@ -219,7 +220,7 @@ namespace RTAO
          else
             context->CSSetConstantBuffers(0, kCbs, old_cbs);
          context->CSSetShaderResources(0, kSrvs, old_srvs);
-         UINT keep_counts[kUavs] = { UINT(-1), UINT(-1) };
+         UINT keep_counts[kUavs] = { UINT(-1), UINT(-1), UINT(-1) };
          context->CSSetUnorderedAccessViews(0, kUavs, old_uavs, keep_counts);
          SafeRelease(old_cs);
          for (auto*& p : old_cbs)
@@ -1258,6 +1259,11 @@ namespace RTAO
       SafeRelease(skin_ring12);
       SafeRelease(skin_ring11);
       SafeRelease(skin_cs);
+      SafeRelease(counters_uav);
+      SafeRelease(counters11);
+      for (auto& s : counters_staging)
+         SafeRelease(s);
+      counters_frame = 0;
       SafeRelease(dynamic_ring_srv);
       SafeRelease(dynamic_ring);
       skin_head = skin_window = 0;
@@ -1802,7 +1808,8 @@ namespace RTAO
          context->CopySubresourceRegion(dynamic_ring, 0, UINT(dynamic_offset), 0, 0, streams[0].buffer, 0, &box);
       }
       params.instance_count = 1;
-      const bool dispatched = DispatchCapture(context, params_cb, draw, params, skin_cs, skinned ? draw.bones : nullptr, arena_view, dynamic_ring_srv, skin_ring_uav, 1, (vertex_count + 63) / 64);
+      params.skin_shadow = draw.shadow_view ? 1 : 0;
+      const bool dispatched = DispatchCapture(context, params_cb, draw, params, skin_cs, skinned ? draw.bones : nullptr, arena_view, dynamic_ring_srv, skin_ring_uav, 1, (vertex_count + 63) / 64, counters_uav);
 
       const std::lock_guard lock(mutex);
       if (dispatched)
@@ -1903,6 +1910,55 @@ namespace RTAO
    {
       const std::lock_guard lock(mutex);
       after_ao_pass = true;
+   }
+
+   void GeometryCapture::PollCounters(ID3D11DeviceContext* immediate)
+   {
+      if (!counters11 && device11 && skin_cs)
+      {
+         D3D11_BUFFER_DESC desc = { 16, D3D11_USAGE_DEFAULT, D3D11_BIND_UNORDERED_ACCESS, 0, D3D11_RESOURCE_MISC_BUFFER_ALLOW_RAW_VIEWS, 0 };
+         const uint32_t zero[4] = {};
+         D3D11_SUBRESOURCE_DATA data = { zero, 0, 0 };
+         if (SUCCEEDED(device11->CreateBuffer(&desc, &data, &counters11)))
+         {
+            D3D11_UNORDERED_ACCESS_VIEW_DESC uav = {};
+            uav.Format = DXGI_FORMAT_R32_TYPELESS;
+            uav.ViewDimension = D3D11_UAV_DIMENSION_BUFFER;
+            uav.Buffer.NumElements = 4;
+            uav.Buffer.Flags = D3D11_BUFFER_UAV_FLAG_RAW;
+            ID3D11UnorderedAccessView* view = nullptr;
+            if (SUCCEEDED(device11->CreateUnorderedAccessView(counters11, &uav, &view)))
+            {
+               const std::lock_guard lock(mutex);
+               counters_uav = view;
+            }
+            D3D11_BUFFER_DESC staging = { 16, D3D11_USAGE_STAGING, 0, D3D11_CPU_ACCESS_READ, 0, 0 };
+            for (auto& s : counters_staging)
+               device11->CreateBuffer(&staging, nullptr, &s);
+         }
+         return;
+      }
+      if (!counters11 || !counters_staging[0])
+         return;
+      const uint32_t slot = counters_frame % 3;
+      // The copy made 3 frames ago (never waits: skipped if the GPU isn't there yet)
+      if (counters_frame >= 3)
+      {
+         D3D11_MAPPED_SUBRESOURCE mapped = {};
+         if (SUCCEEDED(immediate->Map(counters_staging[slot], 0, D3D11_MAP_READ, D3D11_MAP_FLAG_DO_NOT_WAIT, &mapped)))
+         {
+            uint32_t c[4];
+            std::memcpy(c, mapped.pData, sizeof(c));
+            immediate->Unmap(counters_staging[slot], 0);
+            const std::lock_guard lock(mutex);
+            stats.gpu_shadow_frame_rejected = c[0];
+            stats.gpu_shadow_frame = c[1];
+            stats.gpu_main_frame_rejected = c[2];
+            stats.gpu_main_frame = c[3];
+         }
+      }
+      immediate->CopyResource(counters_staging[slot], counters11);
+      counters_frame++;
    }
 
    void GeometryCapture::OnPresent()

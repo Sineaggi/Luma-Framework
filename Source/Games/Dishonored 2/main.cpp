@@ -1395,6 +1395,12 @@ public:
          game_device_data.rtao_capture.OnPresent();
       if (g_rtsun_mode != RTSUN_MODE_OFF)
          PollRTSunLight(native_device, game_device_data);
+      if (game_device_data.rtao_capture.IsInitialized() && g_rtao_capture_active.load(std::memory_order_relaxed))
+      {
+         com_ptr<ID3D11DeviceContext> immediate;
+         native_device->GetImmediateContext(&immediate);
+         game_device_data.rtao_capture.PollCounters(immediate.get());
+      }
       if (g_ao_view_mode != 0 || RTSunSceneView())
          DrawAOView(native_device, device_data, game_device_data);
 
@@ -1462,11 +1468,11 @@ public:
          {
             const RTAO::CaptureStats stats = game_device_data.rtao_capture.GetStats();
             const RTAO::RetentionStats& r = stats.retention;
-            char line[1400];
+            char line[1800];
             snprintf(line, sizeof(line),
                "RTAO diag: shadow map draws in %u frames: %u frames with none, max %llu in a frame | TLAS retained %u (promoted %u, young %u; main view only %u, shadow maps only %u, both %u), "
                "last readback: new %u, evicted %u promoted + %u young, shadow young %u | BLAS: meshes %llu, built %llu, failed %llu, TLAS instances %u, left out (BLAS not built yet) %u, budget %d/frame, arena %llu MB, draws refused: arena full %llu, buffer %llu, ring %llu | MVP instances %llu, rekeyed %llu (fuzzy entries %llu) | "
-               "camera: SSAO draws %llu, shared copy from another frame %llu, view projection differed %llu (max element diff %.6f), no thread copy %llu, thread copy another camera %llu | game writes into captured buffers %llu (%llu buffers, %llu re-copied) | indirect draws (not captured): main view %llu, shadow maps %llu | matrix tag mismatches %llu of %llu | movable objects kept while not drawn %llu",
+               "camera: SSAO draws %llu, shared copy from another frame %llu, view projection differed %llu (max element diff %.6f), no thread copy %llu, thread copy another camera %llu | game writes into captured buffers %llu (%llu buffers, %llu re-copied) | indirect draws (not captured): main view %llu, shadow maps %llu | matrix tag mismatches %llu of %llu | movable objects kept while not drawn %llu | per frame meshes (GPU, total): shadow maps %llu (matrix rejected %llu), main view %llu (rejected %llu)",
                g_rtao_shadow_frames, g_rtao_shadow_zero_frames, (unsigned long long)g_rtao_shadow_max_per_frame, r.promoted + r.young, r.promoted, r.young, r.main_only, r.shadow_only, r.both,
                r.added_new, r.evicted_promoted, r.evicted_young, r.shadow_young, (unsigned long long)stats.meshes, (unsigned long long)stats.meshes_ready, (unsigned long long)stats.blas_failed,
                game_device_data.rtao_tlas_instances.load(), game_device_data.rtao_tlas_missing_blas.load(), g_rtao_blas_budget, (unsigned long long)(stats.arena_vertex_bytes >> 20),
@@ -1474,7 +1480,8 @@ public:
                (unsigned long long)g_rtao_view_checks.load(), (unsigned long long)g_rtao_view_other_frame.load(), (unsigned long long)g_rtao_view_mismatch.load(), g_rtao_view_mismatch_max.load() / 1e6,
                (unsigned long long)g_rtao_view_no_thread_copy.load(), (unsigned long long)g_rtao_view_other_camera.load(),
                (unsigned long long)stats.written_after_copy, (unsigned long long)stats.written_buffers, (unsigned long long)stats.written_forgotten,
-               (unsigned long long)g_rtao_indirect_draws.load(), (unsigned long long)g_rtao_shadow_indirect_draws.load(), (unsigned long long)stats.tag_mismatch, (unsigned long long)stats.tag_checked, (unsigned long long)stats.frame_retained);
+               (unsigned long long)g_rtao_indirect_draws.load(), (unsigned long long)g_rtao_shadow_indirect_draws.load(), (unsigned long long)stats.tag_mismatch, (unsigned long long)stats.tag_checked, (unsigned long long)stats.frame_retained,
+               (unsigned long long)stats.gpu_shadow_frame, (unsigned long long)stats.gpu_shadow_frame_rejected, (unsigned long long)stats.gpu_main_frame, (unsigned long long)stats.gpu_main_frame_rejected);
             reshade::log::message(reshade::log::level::info, line);
             g_rtao_shadow_frames = g_rtao_shadow_zero_frames = 0;
             g_rtao_shadow_max_per_frame = 0;

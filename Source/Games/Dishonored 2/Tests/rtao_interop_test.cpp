@@ -1660,6 +1660,7 @@ static void TestFrameMeshes(ID3D11Device* device, ID3D11DeviceContext* context, 
          return pass.Record(list, info, top, settings, retirer, err);
       }, error), "Run (frame meshes): %s", error.c_str());
       capture.OnPresent();
+      capture.PollCounters(context);
       ID3D11ShaderResourceView* ao_srv = interop.GetAOSRV();
       UINT w = 0, h = 0;
       std::vector<float> ao = ReadAO(device, context, ao_srv, w, h);
@@ -1761,6 +1762,10 @@ static void TestFrameMeshes(ID3D11Device* device, ID3D11DeviceContext* context, 
       printf("frame meshes not drawn for 3 frames: dynamic E kept (AO next to it %.3f), retained %llu, TLAS %u\n", near_e_kept, (unsigned long long)kept.frame_retained, tlas_count);
       CHECK(count > 5 && near_e_kept < 0.8f, "a movable object not drawn must keep occluding in its last pose (%.3f)", near_e_kept);
       CHECK(kept.frame_retained == 1 && tlas_count == 4, "TLAS: ground + view model + C + retained E, skinned A gone (retained %llu, TLAS %u)", (unsigned long long)kept.frame_retained, tlas_count);
+      // GPU counters (read back a few frames late): per frame meshes dispatched, none with a rejected matrix
+      printf("frame mesh GPU counters: main view %llu (rejected %llu), shadow maps %llu (rejected %llu)\n", (unsigned long long)kept.gpu_main_frame, (unsigned long long)kept.gpu_main_frame_rejected,
+         (unsigned long long)kept.gpu_shadow_frame, (unsigned long long)kept.gpu_shadow_frame_rejected);
+      CHECK(kept.gpu_main_frame > 0 && kept.gpu_main_frame_rejected == 0 && kept.gpu_shadow_frame == 0, "frame mesh GPU counters");
    }
 
    CHECK(interop.WaitForIdle(5000), "WaitForIdle");

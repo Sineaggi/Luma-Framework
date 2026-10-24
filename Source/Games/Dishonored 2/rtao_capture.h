@@ -169,7 +169,7 @@ namespace RTAO
       uint32_t mtx_offset_cb; // cb_mtxoffset in the game's PerInstanceCB, bytes
       uint32_t skin_index_start; // Arena SRV byte address of the draw's first index (soup)
       uint32_t skin_index32; // 1: 32 bit indices
-      uint32_t pad3;
+      uint32_t skin_shadow; // 1: a shadow map draw (diagnostic counters)
       // Streams: 0 position, 1 indices0, 2 weights0, 3 indices1, 4 weights1. Vertex v of stream s is at arena SRV byte
       // address stream_base[s] + v * stream_stride[s] (base: buffer copy + IA offset + base vertex + element offset).
       uint32_t stream_base[8];
@@ -255,6 +255,8 @@ namespace RTAO
       uint64_t frame_draws = 0, frame_vertices = 0; // Built into the last frame's TLAS
       uint64_t frame_blas_builds = 0, frame_blas_refits = 0, frame_blas_failed = 0;
       uint64_t frame_blas_count = 0, frame_blas_bytes = 0;
+      // Per frame meshes dispatched / with a rejected matrix (NaN vertices), shadow maps and main view (GPU counters, cumulative)
+      uint64_t gpu_shadow_frame = 0, gpu_shadow_frame_rejected = 0, gpu_main_frame = 0, gpu_main_frame_rejected = 0;
       uint64_t frame_retained = 0; // Movable objects kept in their last pose (not drawn in the last frame)
       uint64_t draws_seen = 0, draws_captured = 0, instances_captured = 0;
       uint64_t skipped[8] = {}; // By CaptureSkip
@@ -325,6 +327,8 @@ namespace RTAO
       // that write depth after the AO's depth was taken) is left out, until OnPresent.
       void MarkAOPassDone();
       void OnPresent();
+      // Reads back the skinning shader's counters (a few frames late, never waits). Immediate context, once per frame.
+      void PollCounters(ID3D11DeviceContext* immediate);
       void OnDestroyBuffer(ID3D11Buffer* buffer);
       // The game wrote into a buffer (UpdateSubresource, a copy into it). If the capture copied it already, it is counted
       // and, with "forget", dropped like a destroyed buffer (its meshes' BLASes evicted, copied again at the next draw).
@@ -420,6 +424,10 @@ namespace RTAO
       ID3D12Resource* readback[kFrameSlots] = {};
       // Skinning
       ID3D11ComputeShader* skin_cs = nullptr;
+      ID3D11Buffer* counters11 = nullptr; // FrameCounters (u2)
+      ID3D11UnorderedAccessView* counters_uav = nullptr;
+      ID3D11Buffer* counters_staging[3] = {};
+      uint32_t counters_frame = 0;
       ID3D11Buffer* skin_ring11 = nullptr;
       ID3D11UnorderedAccessView* skin_ring_uav = nullptr;
       ID3D12Resource* skin_ring12 = nullptr;

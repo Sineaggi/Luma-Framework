@@ -3,6 +3,8 @@
 #endif
 #include "rtao_accel.h"
 
+#include <unordered_set>
+
 #include <algorithm>
 #include <cstdio>
 #include <cstring>
@@ -285,7 +287,7 @@ namespace RTAO
       return true;
    }
 
-   D3D12_GPU_VIRTUAL_ADDRESS DynamicBlasSet::Update(const BuildContext& ctx, uint64_t key, const GpuMesh& mesh, bool& refit, std::string& error, bool retain, uint8_t source)
+   D3D12_GPU_VIRTUAL_ADDRESS DynamicBlasSet::Update(const BuildContext& ctx, uint64_t key, const GpuMesh& mesh, bool& refit, std::string& error, bool retain, uint8_t source, uint64_t group, uintptr_t owner)
    {
       refit = false;
       if (!mesh.vertices || mesh.vertex_count < 3 || (mesh.indices && mesh.index_count < 3))
@@ -386,6 +388,8 @@ namespace RTAO
       it->second.last_frame = frame;
       it->second.retain = retain;
       it->second.source = source;
+      it->second.group = group;
+      it->second.owner = owner;
       build.Inputs = inputs;
       build.DestAccelerationStructureData = it->second.result->GetGPUVirtualAddress();
       build.ScratchAccelerationStructureData = scratch_address;
@@ -412,11 +416,23 @@ namespace RTAO
          std::nth_element(retained.begin(), retained.begin() + (retained.size() - kMaxRetained), retained.end());
          retain_cutoff = retained[retained.size() - kMaxRetained].first;
       }
+      // Objects drawn this frame: their held (older) poses are replaced
+      std::unordered_set<uint64_t> drawn_groups;
+      for (const auto& pair : entries)
+         if (pair.second.last_frame == frame && pair.second.group)
+            drawn_groups.insert(pair.second.group);
       retained_count = 0;
       for (auto it = entries.begin(); it != entries.end();)
       {
          const Entry& e = it->second;
-         const bool expired = e.retain ? (frame - e.last_frame > kRetainFrames || (e.last_frame != frame && e.last_frame < retain_cutoff)) : frame - e.last_frame > kEvictFrames;
+         const bool held = e.retain && e.last_frame != frame;
+         const bool superseded = held && e.group && drawn_groups.count(e.group);
+         const bool capped = held && e.last_frame < retain_cutoff;
+         const bool owner_freed = !e.retain && e.last_frame == 0 && e.owner;
+         const bool expired = e.retain ? (superseded || capped) : frame - e.last_frame > kEvictFrames;
+         hold_stats.superseded += superseded;
+         hold_stats.capped += capped && !superseded;
+         hold_stats.owner_freed += owner_freed;
          retained_count += (!expired && e.retain && e.last_frame != frame) ? 1 : 0;
          if (expired)
          {

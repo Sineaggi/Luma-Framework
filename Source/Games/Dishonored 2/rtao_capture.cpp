@@ -1834,6 +1834,7 @@ namespace RTAO
          record.index_format = soup ? DXGI_FORMAT_UNKNOWN : draw.index_format;
          record.shadow_view = draw.shadow_view;
          record.skinned = skinned;
+         record.owner = uintptr_t(draw.vertex_buffer);
          local.push_back(record);
          if (identity)
             frame_identities.insert(identity);
@@ -2044,6 +2045,8 @@ namespace RTAO
    void GeometryCapture::OnDestroyBuffer(ID3D11Buffer* buffer)
    {
       const std::lock_guard lock(mutex);
+      if (freed_owners.size() < 4096)
+         freed_owners.push_back(uintptr_t(buffer));
       written_seen.erase(buffer);
       if (buffers.erase(buffer) == 0)
          return;
@@ -2289,6 +2292,15 @@ namespace RTAO
          frame_blases.BeginFrame();
          if (drop_retained_request.exchange(false))
             frame_blases.DropRetained();
+         {
+            std::vector<uintptr_t> freed;
+            {
+               const std::lock_guard lock(mutex);
+               freed.swap(freed_owners);
+            }
+            if (!freed.empty())
+               frame_blases.DropOwners(std::unordered_set<uintptr_t>(freed.begin(), freed.end()));
+         }
          bool any = false, any_indexed = false;
          for (const auto& record : work)
          {
@@ -2327,7 +2339,7 @@ namespace RTAO
                // Movable objects (dynamic vertex buffers: openable windows, doors) keep their last pose while the game skips
                // drawing them (DynamicBlasSet::kRetainFrames); characters (skinned) are current-frame only
                const uint8_t source = uint8_t((record.shadow_view ? kInstanceSourceShadow : kInstanceSourceMain) | (record.skinned ? kInstanceFlagSkinned : 0));
-               const D3D12_GPU_VIRTUAL_ADDRESS blas = frame_blases.Update(ctx, key, mesh, refit, build_error, !record.skinned, source);
+               const D3D12_GPU_VIRTUAL_ADDRESS blas = frame_blases.Update(ctx, key, mesh, refit, build_error, !record.skinned, source, record.mesh_key, record.owner);
                if (!blas)
                {
                   frame_failed++;
@@ -2366,6 +2378,10 @@ namespace RTAO
       stats.frame_blas_failed += frame_failed;
       stats.frame_blas_count = frame_blases.Count();
       stats.frame_retained = frame_blases.RetainedCount();
+      const DynamicBlasSet::HoldStats hold = frame_blases.GetHoldStats();
+      stats.hold_superseded = hold.superseded;
+      stats.hold_owner_freed = hold.owner_freed;
+      stats.hold_capped = hold.capped;
       stats.frame_blas_bytes = frame_blases.ResultBytes();
       for (uint64_t key : failed_keys)
       {

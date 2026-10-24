@@ -66,6 +66,7 @@ namespace RTSun
       SceneView = 5, // The ray tracing scene seen from the camera, colored by capture source (RGB565, debug)
       SceneSun = 6, // The same, seen from the sun (orthographic, 60 m around the camera): what the shadow rays can hit (debug)
       Blocker = 7, // One hard shadow ray per pixel: the TLAS index + 1 of what it hits first, 0 if lit (16 bit id, debug)
+      BlockerAll = 8, // The same ray with every instance (the "casters only" mask off): what a missing caster would be (debug)
       Count
    };
 
@@ -111,7 +112,8 @@ namespace RTSun
       // The shared visibility texture (R16_UNORM, or R8_UNORM), AddRef'd. Null until EnsureTargets succeeded.
       ID3D11ShaderResourceView* GetSRV();
       // Diagnostic capture: EnsureTargets also creates the debug targets while this is set. GetDebugSRV(0): raw visibility,
-      // (1): scene view from the camera, (2): scene view from the sun (RGB565), (3): blocker ids, AddRef'd, null if not created.
+      // (1): scene view from the camera, (2): scene view from the sun (RGB565), (3): blocker ids, (4): blocker ids with every
+      // instance, AddRef'd, null if not created.
       void SetDebugOutputs(bool enabled) { debug_requested = enabled; }
       ID3D11ShaderResourceView* GetDebugSRV(uint32_t index);
       DXGI_FORMAT GetVisFormat() const { return vis_format; }
@@ -167,11 +169,11 @@ namespace RTSun
       ID3D11ShaderResourceView* srv11 = nullptr;
       // Diagnostic capture targets (created by EnsureTargets while debug_requested)
       std::atomic<bool> debug_requested = true; // Created with the targets, so starting a capture never re-creates targets mid run
-      ID3D12Resource* dbg_vis[4] = {}; // vis_format UAVs: raw, scene view from the camera, from the sun, blocker ids
+      ID3D12Resource* dbg_vis[5] = {}; // vis_format UAVs: raw, scene view from the camera, from the sun, blocker ids (masked, all)
       ID3D12Resource* dbg_hist = nullptr; // R32G32_UINT scratch the filter writes in its "off" mode (keeps the real history)
-      ID3D12Resource* dbg_shared12[4] = {};
-      ID3D11Texture2D* dbg_shared11[4] = {};
-      ID3D11ShaderResourceView* dbg_srv11[4] = {};
+      ID3D12Resource* dbg_shared12[5] = {};
+      ID3D11Texture2D* dbg_shared11[5] = {};
+      ID3D11ShaderResourceView* dbg_srv11[5] = {};
       std::vector<IUnknown*> graveyard; // D3D12 objects to retire at the next Record
 
       // Descriptors (recorder thread). Per history parity p, 5 from p * 5: [depth SRV, raw UAV, vis UAV, hist prev, hist cur],

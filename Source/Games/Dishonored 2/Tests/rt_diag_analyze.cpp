@@ -38,6 +38,7 @@ struct Capture
    std::map<std::string, std::vector<uint8_t>> gray; // game_shadow, rt_raw, rt_denoised
    std::vector<uint8_t> scene, final_image, scene_sun; // RGB
    std::vector<uint16_t> blocker; // TLAS index + 1 of the first hit of a hard sun ray, 0 lit
+   std::vector<uint16_t> blocker_all; // The same with every instance (casters only mask off)
    struct TlasRow { std::string key; int sources = 0, min_slice = 255; double pos[3] = {}; int indices = 0, vertices = 0; unsigned vs = 0, ps = 0; };
    std::vector<TlasRow> tlas; // cNNNN_tlas.csv, row r = blocker id r + 1
    struct Probe { uint32_t key, flags; double pos[3]; };
@@ -151,6 +152,12 @@ static bool Load(const fs::path& dir, int index, Capture& c)
    std::vector<uint8_t> s = ReadBytes(dir / (std::string(name) + "_scene.bin"));
    if (s.size() == n * 3)
       c.scene = std::move(s);
+   std::vector<uint8_t> bla = ReadBytes(dir / (std::string(name) + "_blocker_all.bin"));
+   if (bla.size() == n * 2)
+   {
+      c.blocker_all.resize(n);
+      std::memcpy(c.blocker_all.data(), bla.data(), bla.size());
+   }
    std::vector<uint8_t> bl = ReadBytes(dir / (std::string(name) + "_blocker.bin"));
    if (bl.size() == n * 2)
    {
@@ -494,6 +501,58 @@ int main(int argc, char** argv)
          std::string src = std::string((s & 4) ? "per-frame mesh" : "") + ((s & 1) ? " camera" : "") + ((s & 2) ? " shadow-map" : "") + ((s & 8) ? " (MVP)" : "") + ((s & 16) ? " skinned" : "");
          printf("  %6d px in %3d captures: mesh %s, %s, lowest slice %s, %d indices / %d vertices, at %.2f %.2f %.2f, VS %08X PS %08X\n", b.pixels, b.captures, b.row.key.c_str(), src.c_str(),
             b.row.min_slice == 255 ? "-" : std::to_string(b.row.min_slice).c_str(), b.row.indices, b.row.vertices, b.row.pos[0], b.row.pos[1], b.row.pos[2], b.row.vs, b.row.ps);
+      }
+   }
+   // Missing casters: where the game's shadow is dark but RT lights, what the same ray hits with every instance. A hit is
+   // an object the "casters only" mask leaves out; no hit means the caster is not in the ray tracing scene at all.
+   {
+      struct Miss { int pixels = 0, captures = 0, last = -1; Capture::TlasRow row; };
+      std::map<std::string, Miss> masked;
+      int false_pixels = 0, absent = 0, facing = 0;
+      for (const Capture& c : captures)
+      {
+         auto g = c.gray.find("game_shadow"), r = c.gray.find("rt_denoised");
+         if (g == c.gray.end() || r == c.gray.end() || c.blocker_all.empty() || c.tlas.empty())
+            continue;
+         for (size_t i = 0; i < c.blocker_all.size(); i++)
+         {
+            if (!(g->second[i] <= 127 && r->second[i] > 127))
+               continue;
+            false_pixels++;
+            const uint16_t id = c.blocker_all[i];
+            if (id == 65534)
+            {
+               facing++;
+               continue;
+            }
+            if (id == 0 || id > c.tlas.size())
+            {
+               absent++;
+               continue;
+            }
+            const Capture::TlasRow& t = c.tlas[id - 1];
+            char k[96];
+            snprintf(k, sizeof(k), "%s@%.1f,%.1f,%.1f", t.key.c_str(), t.pos[0], t.pos[1], t.pos[2]);
+            Miss& m = masked[k];
+            m.pixels++;
+            m.row = t;
+            if (m.last != c.index)
+            {
+               m.captures++;
+               m.last = c.index;
+            }
+         }
+      }
+      std::vector<std::pair<std::string, Miss>> sorted(masked.begin(), masked.end());
+      std::sort(sorted.begin(), sorted.end(), [](const auto& a, const auto& b) { return a.second.pixels > b.second.pixels; });
+      printf("\nfalse light (the game's shadow dark, RT lit): %d pixels; caster absent from the ray tracing scene %d, facing away %d, left out by the casters only mask:\n", false_pixels, absent, facing);
+      for (size_t k = 0; k < sorted.size() && k < 12; k++)
+      {
+         const auto& m = sorted[k].second;
+         const int s = m.row.sources;
+         std::string src = std::string((s & 4) ? "per-frame mesh" : "") + ((s & 1) ? " camera" : "") + ((s & 2) ? " shadow-map" : "") + ((s & 8) ? " (MVP)" : "");
+         printf("  %6d px in %3d captures: mesh %s, %s, %d indices, at %.2f %.2f %.2f, VS %08X PS %08X\n", m.pixels, m.captures, m.row.key.c_str(), src.c_str(), m.row.indices,
+            m.row.pos[0], m.row.pos[1], m.row.pos[2], m.row.vs, m.row.ps);
       }
    }
    const char* combo_names[4] = { "current settings", "(combo 1)", "(combo 2)", "(combo 3)" };

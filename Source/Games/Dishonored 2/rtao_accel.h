@@ -128,10 +128,12 @@ namespace RTAO
    public:
       static constexpr uint32_t kMaxRefits = 30;
       static constexpr uint32_t kEvictFrames = 2;
-      // Entries updated with "retain" (movable objects with a DYNAMIC vertex buffer: openable windows, doors) are kept
-      // this long after their last draw, with their last pose (ForEachRetained), instead of vanishing on the frames the
-      // game doesn't draw them (out of the view and of the shadow cascades). At most kMaxRetained, oldest evicted first.
-      static constexpr uint32_t kRetainFrames = 600;
+      // Entries updated with "retain" (movable objects with a DYNAMIC vertex buffer: openable windows, doors) keep their
+      // last pose (ForEachRetained) while the game doesn't draw them: the game draws a still object into its shadow map
+      // once and reuses that, so there is no time limit. A held pose goes when the same object ("group") is drawn again
+      // in another entry (it moved: the new pose replaces it), when its vertex buffer ("owner") is freed (DropOwner:
+      // level change), or past kMaxRetained (the oldest first).
+      static constexpr uint32_t kRetainFrames = UINT32_MAX;
       static constexpr size_t kMaxRetained = 512;
 
       ~DynamicBlasSet() { Clear(nullptr, 0); }
@@ -139,7 +141,22 @@ namespace RTAO
       void BeginFrame();
       // Records a build or refit into ctx.list (the vertices/indices must be readable by the build). Returns the BLAS
       // address, 0 on failure. Call EndFrame() after the frame's updates, before the TLAS build.
-      D3D12_GPU_VIRTUAL_ADDRESS Update(const BuildContext& ctx, uint64_t key, const GpuMesh& mesh, bool& refit, std::string& error, bool retain = false, uint8_t source = 0);
+      D3D12_GPU_VIRTUAL_ADDRESS Update(const BuildContext& ctx, uint64_t key, const GpuMesh& mesh, bool& refit, std::string& error, bool retain = false, uint8_t source = 0, uint64_t group = 0, uintptr_t owner = 0);
+      // The held entries of a freed vertex buffer go at the next EndFrame
+      void DropOwners(const std::unordered_set<uintptr_t>& owners)
+      {
+         for (auto& pair : entries)
+            if (pair.second.owner && owners.count(pair.second.owner))
+            {
+               pair.second.retain = false;
+               pair.second.last_frame = 0;
+            }
+      }
+      struct HoldStats
+      {
+         uint64_t superseded = 0, owner_freed = 0, capped = 0;
+      };
+      HoldStats GetHoldStats() const { return hold_stats; }
       // Retained entries not updated this frame (call after EndFrame): fn(blas address, source)
       template <class F>
       void ForEachRetained(F&& fn) const
@@ -178,7 +195,10 @@ namespace RTAO
          uint32_t refits = 0;
          bool retain = false;
          uint8_t source = 0;
+         uint64_t group = 0; // The object (its mesh key): a newer pose of it replaces a held one
+         uintptr_t owner = 0; // Its vertex buffer
       };
+      HoldStats hold_stats;
       size_t retained_count = 0; // Retained entries not drawn in the last frame
       std::unordered_map<uint64_t, Entry> entries;
       uint64_t result_bytes = 0;

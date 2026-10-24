@@ -58,6 +58,7 @@ float3 DepthNormal(uint2 px, float3 p0)
 // The color goes out packed as RGB565 in the 16 bit visibility (Luma_RTAO.hlsl ao_view_ps unpacks it).
 static const uint kDebugSceneView = 5; // From the camera, through each pixel
 static const float kSkinSelfDistance = 0.08; // A shadow ray ignores a character hit closer than this to its origin (self shadow)
+static const uint kDebugBlockerAll = 8; // The same with every instance (the casters only mask off)
 static const uint kDebugBlocker = 7;    // One hard shadow ray: TLAS index + 1 of the closest blocker, 0 if lit (16 bit id)
 static const uint kDebugSceneSun = 6;  // From the sun, orthographic, a 60 m tall area around the camera, 40 m up the light to 40 m past it
 // Must match rtao_accel.h
@@ -142,7 +143,7 @@ void main(uint3 id : SV_DispatchThreadID)
     float d = LoadDepth(px);
     if (IsSky(d))
     {
-        VisRaw[px] = DebugMode == kDebugBlocker ? 0.0 : 1.0; // Sky: lit (blocker id 0)
+        VisRaw[px] = (DebugMode == kDebugBlocker || DebugMode == kDebugBlockerAll) ? 0.0 : 1.0; // Sky: lit (blocker id 0)
         return;
     }
     float3 p0 = WorldPosAt(px, d);
@@ -158,11 +159,11 @@ void main(uint3 id : SV_DispatchThreadID)
     // keeps grazing surfaces, whose reconstructed normal is noisy, on the traced path.
     if (n_dot_l < -0.05)
     {
-        VisRaw[px] = DebugMode == kDebugBlocker ? 65534.0 / 65535.0 : 0.0; // Facing away (blocker id 65534)
+        VisRaw[px] = (DebugMode == kDebugBlocker || DebugMode == kDebugBlockerAll) ? 65534.0 / 65535.0 : 0.0; // Facing away (blocker id 65534)
         return;
     }
 
-    if (DebugMode == kDebugBlocker)
+    if (DebugMode == kDebugBlocker || DebugMode == kDebugBlockerAll)
     {
         // The visibility's ray (same origin and bias), toward the light's center, closest hit with the cutout test
         float3 o = p0 + n * (Bias + max(ViewZ(p0), 0.0) * 0.002);
@@ -172,7 +173,7 @@ void main(uint3 id : SV_DispatchThreadID)
         ray.TMin = 0.0;
         ray.TMax = TMax;
         RayQuery<RAY_FLAG_SKIP_PROCEDURAL_PRIMITIVES> q;
-        q.TraceRayInline(Scene, RAY_FLAG_NONE, CastersOnly != 0 ? (0xFF & ~(kInstanceMaskCameraOnly | kInstanceMaskCameraOnlyCutout)) : 0xFF, ray);
+        q.TraceRayInline(Scene, RAY_FLAG_NONE, (CastersOnly != 0 && DebugMode == kDebugBlocker) ? (0xFF & ~(kInstanceMaskCameraOnly | kInstanceMaskCameraOnlyCutout)) : 0xFF, ray);
         uint guard = 0;
         while (q.Proceed() && guard++ < 256)
         {

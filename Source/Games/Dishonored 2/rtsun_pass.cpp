@@ -270,7 +270,7 @@ namespace RTSun
 
       D3D12_RESOURCE_DESC desc = {};
       desc.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
-      desc.Width = 5 * kSlots * kConstantsStride; // Sets: the pass, the 4 debug outputs
+      desc.Width = 6 * kSlots * kConstantsStride; // Sets: the pass, the 5 debug outputs
       desc.Height = 1;
       desc.DepthOrArraySize = 1;
       desc.MipLevels = 1;
@@ -312,7 +312,7 @@ namespace RTSun
 
    void SunPass::ReleaseTargetsLocked()
    {
-      ID3D12Resource** resources[] = { &raw, &vis, &history[0], &history[1], &shared12, &dbg_vis[0], &dbg_vis[1], &dbg_vis[2], &dbg_vis[3], &dbg_hist, &dbg_shared12[0], &dbg_shared12[1], &dbg_shared12[2], &dbg_shared12[3] };
+      ID3D12Resource** resources[] = { &raw, &vis, &history[0], &history[1], &shared12, &dbg_vis[0], &dbg_vis[1], &dbg_vis[2], &dbg_vis[3], &dbg_vis[4], &dbg_hist, &dbg_shared12[0], &dbg_shared12[1], &dbg_shared12[2], &dbg_shared12[3], &dbg_shared12[4] };
       for (ID3D12Resource** resource : resources)
       {
          if (*resource)
@@ -325,7 +325,7 @@ namespace RTSun
       if (shared11)
          shared11->Release();
       shared11 = nullptr;
-      for (uint32_t i = 0; i < 4; i++)
+      for (uint32_t i = 0; i < 5; i++)
       {
          if (dbg_srv11[i])
             dbg_srv11[i]->Release();
@@ -346,7 +346,7 @@ namespace RTSun
          return false;
       }
       const bool want_debug = debug_requested.load();
-      if (srv11 && new_width == width && new_height == height && (!want_debug || dbg_srv11[3]))
+      if (srv11 && new_width == width && new_height == height && (!want_debug || dbg_srv11[4]))
          return true;
       if (new_width == 0 || new_height == 0)
       {
@@ -387,7 +387,7 @@ namespace RTSun
       {
          std::string debug_error;
          bool ok = true;
-         for (uint32_t i = 0; i < 4 && ok; i++)
+         for (uint32_t i = 0; i < 5 && ok; i++)
          {
             dbg_vis[i] = CreateTexture(device, vis_format, new_width, new_height, hr);
             ok = dbg_vis[i] && CreateSharedTexture(device, device11, vis_format, new_width, new_height, dbg_shared12[i], dbg_shared11[i], debug_error) &&
@@ -398,7 +398,7 @@ namespace RTSun
          if (!ok || !dbg_hist)
          {
             // The pass works without them: the capture just has no raw / scene stages
-            for (uint32_t i = 0; i < 4; i++)
+            for (uint32_t i = 0; i < 5; i++)
             {
                if (dbg_vis[i])
                   graveyard.push_back(dbg_vis[i]);
@@ -422,7 +422,7 @@ namespace RTSun
       if (history[0]) history[0]->SetName(L"RT sun history 0");
       if (history[1]) history[1]->SetName(L"RT sun history 1");
       if (shared12) shared12->SetName(L"RT sun shared");
-      for (uint32_t i = 0; i < 4; i++)
+      for (uint32_t i = 0; i < 5; i++)
       {
          if (dbg_vis[i]) dbg_vis[i]->SetName(L"RT sun debug vis");
          if (dbg_shared12[i]) dbg_shared12[i]->SetName(L"RT sun debug shared");
@@ -436,7 +436,7 @@ namespace RTSun
    ID3D11ShaderResourceView* SunPass::GetDebugSRV(uint32_t index)
    {
       const std::lock_guard lock(mutex);
-      ID3D11ShaderResourceView* srv = index < 4 ? dbg_srv11[index] : nullptr;
+      ID3D11ShaderResourceView* srv = index < 5 ? dbg_srv11[index] : nullptr;
       if (srv)
          srv->AddRef();
       return srv;
@@ -459,7 +459,7 @@ namespace RTSun
          has_history = false;
       D3D12_DESCRIPTOR_HEAP_DESC heap_desc = {};
       heap_desc.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
-      heap_desc.NumDescriptors = 31;
+      heap_desc.NumDescriptors = 36;
       heap_desc.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
       HRESULT hr = device->CreateDescriptorHeap(&heap_desc, IID_PPV_ARGS(&heap));
       if (FAILED(hr))
@@ -490,7 +490,7 @@ namespace RTSun
          }
       }
       // Debug tables (diagnostic capture): the filter in its "off" mode copies raw into dbg_vis[i]; HistCur goes to a scratch
-      for (uint32_t i = 0; i < 4 && dbg_hist; i++)
+      for (uint32_t i = 0; i < 5 && dbg_hist; i++)
       {
          D3D12_CPU_DESCRIPTOR_HANDLE handle = heap->GetCPUDescriptorHandleForHeapStart();
          handle.ptr += SIZE_T(11 + i * 5) * descriptor_size;
@@ -656,13 +656,13 @@ namespace RTSun
       // Diagnostic capture: the same frame's raw visibility (what "raw" holds now), then a camera scene view trace
       if (settings.debug_outputs && heap_debug && dbg_hist)
       {
-         for (uint32_t i = 0; i < 4; i++)
+         for (uint32_t i = 0; i < 5; i++)
          {
             SunConstants debug_constants = constants;
             debug_constants.filter_mode = uint32_t(RTAO::FilterMode::Off);
-            const Output debug_outputs[4] = { Output::Raw, Output::SceneView, Output::SceneSun, Output::Blocker };
+            const Output debug_outputs[5] = { Output::Raw, Output::SceneView, Output::SceneSun, Output::Blocker, Output::BlockerAll };
             debug_constants.debug_mode = uint32_t(debug_outputs[i]);
-            if (i == 3)
+            if (i >= 3)
                debug_constants.cone_tan = 0.f; // One hard ray
             const uint64_t offset = (uint64_t(1 + i) * kSlots + slot) * kConstantsStride;
             std::memcpy(constants_mapped + offset, &debug_constants, sizeof(debug_constants));

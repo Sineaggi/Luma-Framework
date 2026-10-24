@@ -260,6 +260,7 @@ namespace RTAO
       // Per frame meshes dispatched / with a rejected matrix (NaN vertices), shadow maps and main view (GPU counters, cumulative)
       uint64_t gpu_shadow_frame = 0, gpu_shadow_frame_rejected = 0, gpu_main_frame = 0, gpu_main_frame_rejected = 0;
       uint64_t frame_retained = 0; // Movable objects kept in their last pose (not drawn in the last frame)
+      uint64_t hold_superseded = 0, hold_owner_freed = 0, hold_capped = 0; // Held poses dropped: moved (newer pose), buffer freed, cap
       uint64_t draws_seen = 0, draws_captured = 0, instances_captured = 0;
       uint64_t skipped[8] = {}; // By CaptureSkip
       uint64_t meshes = 0, meshes_ready = 0, buffers_copied = 0, arena_vertex_bytes = 0, arena_index_bytes = 0;
@@ -427,6 +428,7 @@ namespace RTAO
          bool check_rigid = false; // Instances: MVP derived in a shadow map draw (see DrawInfo::shadow_view)
          uint32_t tag = 0; // Instances: the draw's record tag (CaptureParams::record_tag)
          uint8_t shadow_slice = 0xFF;
+         uintptr_t owner = 0; // FrameMesh: the draw's vertex buffer (held poses go when it is freed)
          bool skinned = false; // FrameMesh: skinned (else a dynamic vertex buffer), debug scene view
          bool mvp = false; // Instances: MVP derived matrix (identity matched with a tolerance, see FuzzyKey)
       };
@@ -474,6 +476,7 @@ namespace RTAO
       std::unordered_map<ID3D11Buffer*, BufferEntry> buffers;
       std::unordered_map<uint64_t, MeshEntry> meshes;
       std::vector<uint64_t> evictions;
+      std::vector<uintptr_t> freed_owners; // Freed buffers: their held per frame poses go (DynamicBlasSet::DropOwner)
       std::unordered_map<ID3D11DeviceContext*, std::vector<Rec>> context_records;
       std::unordered_set<ID3D11Buffer*> written_seen; // Distinct buffers counted in written_buffers
       std::unordered_set<uint64_t> frame_identities; // Draws captured this frame (dedup), cleared at OnPresent

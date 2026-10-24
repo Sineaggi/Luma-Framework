@@ -340,7 +340,7 @@ namespace
       std::vector<std::string> timeline;
       uint32_t last_bound = 0, last_stale = 0;
       uint64_t last_slices[8] = {};
-      RTDiagStage stages[8] = {
+      RTDiagStage stages[9] = {
          { "game_shadow", RTDiag::Kind::Gray, 1 }, // The game's own screen shadow (y of its target)
          { "rt_raw", RTDiag::Kind::Gray, 0 },
          { "rt_denoised", RTDiag::Kind::Gray, 0 }, // What the lighting reads
@@ -349,6 +349,7 @@ namespace
          { "final", RTDiag::Kind::Color, 0 },
          { "scene_sun", RTDiag::Kind::Rgb565, 0 }, // The ray tracing scene seen from the sun (60 m around the camera)
          { "blocker", RTDiag::Kind::Id16, 0 }, // TLAS index + 1 of the first thing a hard sun ray hits (cNNNN_tlas.csv)
+         { "blocker_all", RTDiag::Kind::Id16, 0 }, // The same ray with every instance (casters only mask off)
       };
       std::string status = "idle";
    };
@@ -1045,7 +1046,7 @@ public:
       {
          g_rtdiag.next = now + std::chrono::milliseconds(int(kRTDiagInterval * 1000.0));
          const int set = int(g_rtdiag.index & 1);
-         com_ptr<ID3D11Resource> sources[8];
+         com_ptr<ID3D11Resource> sources[9];
          {
             const std::lock_guard lock(g_rtdiag.mutex);
             // Drawn this frame (rtao_frame has already advanced at present)
@@ -1057,6 +1058,7 @@ public:
          sources[3] = com_ptr<ID3D11Resource>(RTDiagResource(g.rtsun_pass.GetDebugSRV(1)), true);
          sources[6] = com_ptr<ID3D11Resource>(RTDiagResource(g.rtsun_pass.GetDebugSRV(2)), true);
          sources[7] = com_ptr<ID3D11Resource>(RTDiagResource(g.rtsun_pass.GetDebugSRV(3)), true);
+         sources[8] = com_ptr<ID3D11Resource>(RTDiagResource(g.rtsun_pass.GetDebugSRV(4)), true);
          if (g.rtao.IsInitialized())
             sources[4] = com_ptr<ID3D11Resource>(RTDiagResource(g.rtao.GetDepthRTV()), true);
          {
@@ -1070,7 +1072,7 @@ public:
             }
          }
          int copied = 0;
-         for (int s = 0; s < 8; s++)
+         for (int s = 0; s < 9; s++)
          {
             RTDiagStage& stage = g_rtdiag.stages[s];
             if (!sources[s])
@@ -1957,7 +1959,7 @@ public:
             snprintf(line, sizeof(line),
                "RTAO diag: shadow map draws in %u frames: %u frames with none, max %llu in a frame | TLAS retained %u (promoted %u, young %u; main view only %u, shadow maps only %u, both %u), "
                "last readback: new %u, evicted %u promoted + %u young, shadow young %u | BLAS: meshes %llu, built %llu, failed %llu, TLAS instances %u, left out (BLAS not built yet) %u, budget %d/frame, arena %llu MB, draws refused: arena full %llu, buffer %llu, ring %llu | MVP instances %llu, rekeyed %llu (fuzzy entries %llu) | "
-               "camera: SSAO draws %llu, shared copy from another frame %llu, view projection differed %llu (max element diff %.6f), no thread copy %llu, thread copy another camera %llu | game writes into captured buffers %llu (%llu buffers, %llu re-copied) | indirect draws (not captured): main view %llu, shadow maps %llu | matrix tag mismatches %llu of %llu | movable objects kept while not drawn %llu | per frame meshes (GPU, total): shadow maps %llu (matrix rejected %llu), main view %llu (rejected %llu)",
+               "camera: SSAO draws %llu, shared copy from another frame %llu, view projection differed %llu (max element diff %.6f), no thread copy %llu, thread copy another camera %llu | game writes into captured buffers %llu (%llu buffers, %llu re-copied) | indirect draws (not captured): main view %llu, shadow maps %llu | matrix tag mismatches %llu of %llu | movable objects kept while not drawn %llu (dropped: moved %llu, freed %llu, cap %llu) | per frame meshes (GPU, total): shadow maps %llu (matrix rejected %llu), main view %llu (rejected %llu)",
                g_rtao_shadow_frames, g_rtao_shadow_zero_frames, (unsigned long long)g_rtao_shadow_max_per_frame, r.promoted + r.young, r.promoted, r.young, r.main_only, r.shadow_only, r.both,
                r.added_new, r.evicted_promoted, r.evicted_young, r.shadow_young, (unsigned long long)stats.meshes, (unsigned long long)stats.meshes_ready, (unsigned long long)stats.blas_failed,
                game_device_data.rtao_tlas_instances.load(), game_device_data.rtao_tlas_missing_blas.load(), g_rtao_blas_budget, (unsigned long long)(stats.arena_vertex_bytes >> 20),
@@ -1965,7 +1967,7 @@ public:
                (unsigned long long)g_rtao_view_checks.load(), (unsigned long long)g_rtao_view_other_frame.load(), (unsigned long long)g_rtao_view_mismatch.load(), g_rtao_view_mismatch_max.load() / 1e6,
                (unsigned long long)g_rtao_view_no_thread_copy.load(), (unsigned long long)g_rtao_view_other_camera.load(),
                (unsigned long long)stats.written_after_copy, (unsigned long long)stats.written_buffers, (unsigned long long)stats.written_forgotten,
-               (unsigned long long)g_rtao_indirect_draws.load(), (unsigned long long)g_rtao_shadow_indirect_draws.load(), (unsigned long long)stats.tag_mismatch, (unsigned long long)stats.tag_checked, (unsigned long long)stats.frame_retained,
+               (unsigned long long)g_rtao_indirect_draws.load(), (unsigned long long)g_rtao_shadow_indirect_draws.load(), (unsigned long long)stats.tag_mismatch, (unsigned long long)stats.tag_checked, (unsigned long long)stats.frame_retained, (unsigned long long)stats.hold_superseded, (unsigned long long)stats.hold_owner_freed, (unsigned long long)stats.hold_capped,
                (unsigned long long)stats.gpu_shadow_frame, (unsigned long long)stats.gpu_shadow_frame_rejected, (unsigned long long)stats.gpu_main_frame, (unsigned long long)stats.gpu_main_frame_rejected);
             reshade::log::message(reshade::log::level::info, line);
             {
@@ -3636,7 +3638,7 @@ public:
       if (ImGui::IsItemHovered())
          ImGui::SetTooltip("Rays per pixel per frame (in the penumbra the denoiser averages them over frames).");
       static const char* rtsun_output_names[int(RTSun::Output::Count)] = { "Denoised", "Raw (no denoiser)", "Geometric N.L (no rays, debug)", "Denoiser history (debug)", "Raw hard (no denoiser, no penumbra)",
-         "Scene view: from the camera (debug)", "Scene view: from the sun (debug)", "Blocker ids (debug)" };
+         "Scene view: from the camera (debug)", "Scene view: from the sun (debug)", "Blocker ids (debug)", "Blocker ids, all objects (debug)" };
       if (ImGui::Combo("RT Sun Output", &g_rtsun_output, rtsun_output_names, int(RTSun::Output::Count)))
       {
          g_rtsun_output = std::clamp(g_rtsun_output, 0, int(RTSun::Output::Count) - 1);

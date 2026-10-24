@@ -223,7 +223,31 @@ static void TestSunShadows(ID3D11Device* device, ID3D11DeviceContext* context, R
       settings.ray_count = 1;
       settings.output = RTSun::Output::Raw;
       settings.casters_only = true;
+      settings.debug_outputs = true;
       const std::vector<float> camera_only = run_frame();
+      settings.debug_outputs = false;
+      {
+         // The masked blocker ids see no caster, the unmasked ones (missing caster diagnostic) see the boxes
+         ID3D11ShaderResourceView* masked_srv = sun.GetDebugSRV(3);
+         ID3D11ShaderResourceView* all_srv = sun.GetDebugSRV(4);
+         CHECK(masked_srv && all_srv, "blocker outputs created");
+         UINT bw = 0, bh = 0;
+         const std::vector<float> masked = ReadAO(device, context, masked_srv, bw, bh);
+         const std::vector<float> all = ReadAO(device, context, all_srv, bw, bh);
+         masked_srv->Release();
+         all_srv->Release();
+         int masked_hits = 0, all_hits = 0;
+         for (UINT i = 0; i < W * H; i++)
+         {
+            if (!is_receiver(i))
+               continue;
+            const uint32_t m = uint32_t(std::lround(masked[i] * 65535.f)), a = uint32_t(std::lround(all[i] * 65535.f));
+            masked_hits += (m != 0 && m != 65534) ? 1 : 0;
+            all_hits += (a != 0 && a != 65534) ? 1 : 0;
+         }
+         printf("RT sun casters only, blocker ids on receivers: masked %d, all objects %d\n", masked_hits, all_hits);
+         CHECK(masked_hits == 0 && all_hits > 1000, "the unmasked blocker must name the camera only casters (%d masked, %d all)", masked_hits, all_hits);
+      }
       int dark = 0;
       for (UINT i = 0; i < W * H; i++)
          dark += (is_receiver(i) && camera_only[i] < 0.5f) ? 1 : 0; // Receivers face the light: only a caster can darken them

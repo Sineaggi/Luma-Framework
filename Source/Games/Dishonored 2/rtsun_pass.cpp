@@ -417,6 +417,17 @@ namespace RTSun
             dbg_hist = nullptr;
          }
       }
+      if (raw) raw->SetName(L"RT sun raw");
+      if (vis) vis->SetName(L"RT sun vis");
+      if (history[0]) history[0]->SetName(L"RT sun history 0");
+      if (history[1]) history[1]->SetName(L"RT sun history 1");
+      if (shared12) shared12->SetName(L"RT sun shared");
+      for (uint32_t i = 0; i < 3; i++)
+      {
+         if (dbg_vis[i]) dbg_vis[i]->SetName(L"RT sun debug vis");
+         if (dbg_shared12[i]) dbg_shared12[i]->SetName(L"RT sun debug shared");
+      }
+      if (dbg_hist) dbg_hist->SetName(L"RT sun debug hist");
       width = new_width;
       height = new_height;
       return true;

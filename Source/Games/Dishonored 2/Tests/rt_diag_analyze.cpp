@@ -420,7 +420,7 @@ int main(int argc, char** argv)
          printf("  c%04d t=%5.1fs phase %d combo %d%s: recall %.3f, false light %.3f | lit pixels' median view depth %.2f m, cascade 0 ends at %.2f m\n", c.index,
             std::stod(c.meta.count("t_ms") ? c.meta.at("t_ms") : std::string("0")) / 1000.0, c.phase, c.combo, c.settle ? " (settle)" : "", recall, false_light, median_z, fars[0]);
    }
-   const char* combo_names[4] = { "default (near slices only, static shadow world kept)", "near slices only, OLD retention", "ALL slices, static shadow world kept", "ALL slices, OLD retention" };
+   const char* combo_names[4] = { "default (near slices only, static shadow world kept)", "near slices only, OLD retention", "ALL slices, OLD retention", "(unused)" };
    printf("\nper combo (pairs within a block, settling captures skipped): mean %% of compared pixels flipping\n");
    printf("  %-58s %5s | %8s %7s %7s %7s %7s | %6s %6s\n", "combo", "pairs", "game_sh", "rt_raw", "rt_den", "scene", "final", "max rt", "spikes");
    printf("\nper combo, agreement with the game's own shadow (captures with window light in view):\n");

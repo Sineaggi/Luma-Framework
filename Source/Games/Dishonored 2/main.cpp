@@ -27,6 +27,8 @@
 #include "rt_debug_capture.h"
 
 #include <chrono>
+#include <map>
+#include <tuple>
 #include <ctime>
 #include <filesystem>
 #include <fstream>
@@ -186,6 +188,10 @@ namespace
    // the world (other LODs, no window openings) into its far cascades, which must not enter the ray tracing scene (the
    // near cascade, used for the view, has the detailed geometry). "RTAOShadowNearOnly" off takes every slice (test).
    int g_rtao_shadow_near_slices = 2;
+   // Shadow map layout diagnostics: draws per (slice, viewport rectangle), so the periodic diag line shows how the game
+   // lays out its cascades (one per array slice, or several viewports in one slice)
+   std::mutex g_rtao_shadow_layout_mutex;
+   std::map<std::tuple<uint32_t, int, int, int, int>, uint64_t> g_rtao_shadow_layout;
    bool g_rtao_shadow_near_only = true;
    // Shadow map draws per frame (at present): frames with none, the most in one frame, over the current log window
    uint64_t g_rtao_shadow_draws_at_present = 0;
@@ -319,7 +325,7 @@ namespace
       uint32_t frame = 0;
       int phase = 0; // 0 as is, 1 scene frozen
       bool saved_freeze = false, saved_openables = true, saved_young_long = false, saved_near_only = true;
-      // Test matrix: combo bit 0 = the old shadow map retention, bit 1 = shadow map casters from every slice (not near only)
+      // Test matrix: 0 near slices + static retention, 1 near slices + old retention, 2 every slice + old retention
       int combo = 0;
       std::chrono::steady_clock::time_point switch_time;
       std::atomic<bool> reset_history = false; // The sun denoiser's history, at a switch (consumed by PrepareRTSun)
@@ -1019,7 +1025,7 @@ public:
       if (!frozen)
       {
          const int block = int(t / kRTDiagBlock);
-         combo = (block + block / 4) % 4;
+         combo = (block + block / 3) % 3; // 0 near + static retention, 1 near + old retention, 2 all slices + old retention
       }
       if (combo != g_rtdiag.combo || int(frozen) != g_rtdiag.phase)
       {
@@ -1032,8 +1038,9 @@ public:
       g_rtdiag.combo = combo;
       g_rtdiag.phase = frozen ? 1 : 0;
       g_rtdbg_shadow_openables = g_rtdiag.saved_openables;
-      g_rtdbg_shadow_young_long = frozen ? g_rtdiag.saved_young_long : (combo & 1) != 0;
-      g_rtao_shadow_near_only = frozen ? g_rtdiag.saved_near_only : (combo & 2) == 0;
+      // Every slice is only ever tested with the old (bounded) retention: far slice copies kept until unloaded would pile up
+      g_rtdbg_shadow_young_long = frozen ? g_rtdiag.saved_young_long : combo != 0;
+      g_rtao_shadow_near_only = frozen ? g_rtdiag.saved_near_only : combo != 2;
       g_rtao_freeze_scene = frozen ? true : g_rtdiag.saved_freeze;
 
       // A capture: copy every stage of this frame into the free staging set
@@ -1436,7 +1443,6 @@ public:
          }
          SetRTSunStatus("ready, waiting for the light direction (screen shadows pass)", false);
       }
-      game_device_data.rtsun_pass.SetDebugOutputs(g_rtdiag.active);
       out.debug_outputs = g_rtdiag.active;
       if (!game_device_data.rtsun_pass.EnsureTargets(native_device, width, height, error))
       {
@@ -1867,7 +1873,19 @@ public:
          game_device_data.rtao_capture.PollCounters(immediate.get());
       }
       if (game_device_data.rtao.IsInitialized())
+      {
+         static bool removal_logged = false;
+         if (!removal_logged)
+         {
+            const std::string report = game_device_data.rtao.DeviceRemovedReport();
+            if (!report.empty())
+            {
+               removal_logged = true;
+               reshade::log::message(reshade::log::level::error, ("RTAO: " + report).c_str());
+            }
+         }
          RTDiagOnPresent(native_device, device_data, game_device_data);
+      }
       if (g_ao_view_mode != 0 || RTSunSceneView())
          DrawAOView(native_device, device_data, game_device_data);
 
@@ -1950,6 +1968,16 @@ public:
                (unsigned long long)g_rtao_indirect_draws.load(), (unsigned long long)g_rtao_shadow_indirect_draws.load(), (unsigned long long)stats.tag_mismatch, (unsigned long long)stats.tag_checked, (unsigned long long)stats.frame_retained,
                (unsigned long long)stats.gpu_shadow_frame, (unsigned long long)stats.gpu_shadow_frame_rejected, (unsigned long long)stats.gpu_main_frame, (unsigned long long)stats.gpu_main_frame_rejected);
             reshade::log::message(reshade::log::level::info, line);
+            {
+               // Shadow map layout over this window: draws per slice and viewport (x,y wxh), then reset
+               std::string layout = "RTAO diag: shadow map layout (slice: viewport x,y wxh = draws):";
+               const std::lock_guard lock(g_rtao_shadow_layout_mutex);
+               for (const auto& [k, n] : g_rtao_shadow_layout)
+                  layout += " s" + std::to_string(std::get<0>(k)) + ": " + std::to_string(std::get<1>(k)) + "," + std::to_string(std::get<2>(k)) + " " + std::to_string(std::get<3>(k)) + "x" + std::to_string(std::get<4>(k)) + " = " + std::to_string(n) + ";";
+               layout += " near only " + std::to_string(int(g_rtao_shadow_near_only)) + " (" + std::to_string(g_rtao_shadow_near_slices) + " slices), far skipped total " + std::to_string(g_rtao_shadow_far_skipped.load());
+               g_rtao_shadow_layout.clear();
+               reshade::log::message(reshade::log::level::info, layout.c_str());
+            }
             g_rtao_shadow_frames = g_rtao_shadow_zero_frames = 0;
             g_rtao_shadow_max_per_frame = 0;
             g_rtao_view_checks = g_rtao_view_no_thread_copy = g_rtao_view_mismatch = g_rtao_view_other_frame = g_rtao_view_other_camera = 0;
@@ -2639,6 +2667,20 @@ public:
       D3D11_DEPTH_STENCIL_VIEW_DESC dsv_desc;
       dsv->GetDesc(&dsv_desc);
       const uint32_t slice = dsv_desc.ViewDimension == D3D11_DSV_DIMENSION_TEXTURE2DARRAY ? dsv_desc.Texture2DArray.FirstArraySlice : 0;
+      {
+         D3D11_VIEWPORT viewport = {};
+         UINT viewports = 1;
+         context->RSGetViewports(&viewports, &viewport);
+         const std::lock_guard lock(g_rtao_shadow_layout_mutex);
+         if (g_rtao_shadow_layout.size() < 64)
+            g_rtao_shadow_layout[{ slice, int(viewport.TopLeftX), int(viewport.TopLeftY), int(viewport.Width), int(viewport.Height) }]++;
+         else
+         {
+            auto it = g_rtao_shadow_layout.find({ slice, int(viewport.TopLeftX), int(viewport.TopLeftY), int(viewport.Width), int(viewport.Height) });
+            if (it != g_rtao_shadow_layout.end())
+               it->second++;
+         }
+      }
       if (out_slice)
          *out_slice = slice;
       g_rtao_shadow_view_width.store(desc.Width, std::memory_order_relaxed);

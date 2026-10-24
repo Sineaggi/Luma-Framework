@@ -170,6 +170,57 @@ void main(uint3 id : SV_DispatchThreadID)
       }
    }
 
+   std::string Interop::DeviceRemovedReport()
+   {
+      if (!device12)
+         return std::string();
+      const HRESULT reason = device12->GetDeviceRemovedReason();
+      if (reason == S_OK)
+         return std::string();
+      std::string out = "D3D12 device removed: " + HResultString("reason", reason);
+      ID3D12DeviceRemovedExtendedData* dred = nullptr;
+      if (FAILED(device12->QueryInterface(IID_PPV_ARGS(&dred))) || !dred)
+         return out + " (no DRED)";
+      D3D12_DRED_AUTO_BREADCRUMBS_OUTPUT breadcrumbs = {};
+      if (SUCCEEDED(dred->GetAutoBreadcrumbsOutput(&breadcrumbs)))
+      {
+         for (const D3D12_AUTO_BREADCRUMB_NODE* node = breadcrumbs.pHeadAutoBreadcrumbNode; node; node = node->pNext)
+         {
+            const uint32_t count = node->BreadcrumbCount, done = node->pLastBreadcrumbValue ? *node->pLastBreadcrumbValue : 0;
+            if (done >= count)
+               continue; // Completed list
+            char line[256];
+            snprintf(line, sizeof(line), " | list '%ls' on queue '%ls': %u of %u ops done;", node->pCommandListDebugNameW ? node->pCommandListDebugNameW : L"?",
+               node->pCommandQueueDebugNameW ? node->pCommandQueueDebugNameW : L"?", done, count);
+            out += line;
+            for (uint32_t i = (done > 3 ? done - 3 : 0); i < count && i < done + 4; i++)
+            {
+               snprintf(line, sizeof(line), " %s%d", i == done ? "[next>]" : "", int(node->pCommandHistory[i]));
+               out += line;
+            }
+         }
+      }
+      D3D12_DRED_PAGE_FAULT_OUTPUT fault = {};
+      if (SUCCEEDED(dred->GetPageFaultAllocationOutput(&fault)) && fault.PageFaultVA)
+      {
+         char line[128];
+         snprintf(line, sizeof(line), " | page fault at 0x%llX, allocations there:", (unsigned long long)fault.PageFaultVA);
+         out += line;
+         for (const D3D12_DRED_ALLOCATION_NODE* n = fault.pHeadExistingAllocationNode; n; n = n->pNext)
+         {
+            snprintf(line, sizeof(line), " live '%ls'", n->ObjectNameW ? n->ObjectNameW : L"?");
+            out += line;
+         }
+         for (const D3D12_DRED_ALLOCATION_NODE* n = fault.pHeadRecentFreedAllocationNode; n; n = n->pNext)
+         {
+            snprintf(line, sizeof(line), " FREED '%ls'", n->ObjectNameW ? n->ObjectNameW : L"?");
+            out += line;
+         }
+      }
+      dred->Release();
+      return out;
+   }
+
    bool Interop::Init(ID3D11Device* device11, std::string& error)
    {
       const std::lock_guard lock(mutex);
@@ -230,6 +281,18 @@ void main(uint3 id : SV_DispatchThreadID)
          error = HResultString("EnumAdapterByLuid", hr);
          return false;
       }
+      // Device Removed Extended Data: if the GPU faults, which of our operations was running and which allocation the
+      // faulting address was in (DeviceRemovedReport). Must be set before the device is created; cheap.
+      if (auto get_debug = reinterpret_cast<PFN_D3D12_GET_DEBUG_INTERFACE>(GetProcAddress(d3d12_module, "D3D12GetDebugInterface")))
+      {
+         ID3D12DeviceRemovedExtendedDataSettings* dred = nullptr;
+         if (SUCCEEDED(get_debug(IID_PPV_ARGS(&dred))) && dred)
+         {
+            dred->SetAutoBreadcrumbsEnablement(D3D12_DRED_ENABLEMENT_FORCED_ON);
+            dred->SetPageFaultEnablement(D3D12_DRED_ENABLEMENT_FORCED_ON);
+            dred->Release();
+         }
+      }
       hr = create_device(adapter, D3D_FEATURE_LEVEL_12_0, IID_PPV_ARGS(&device12));
       adapter->Release();
       if (FAILED(hr) || !device12)
@@ -258,6 +321,7 @@ void main(uint3 id : SV_DispatchThreadID)
       hr = device12->CreateCommandQueue(&queue_desc, IID_PPV_ARGS(&queue));
       if (FAILED(hr))
          return fail(HResultString("CreateCommandQueue", hr));
+      queue->SetName(L"RTAO queue");
       for (auto& allocator : allocators)
       {
          hr = device12->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&allocator));
@@ -267,6 +331,7 @@ void main(uint3 id : SV_DispatchThreadID)
       hr = device12->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, allocators[0], nullptr, IID_PPV_ARGS(&command_list)); // ID3D12GraphicsCommandList4: DXR builds
       if (FAILED(hr))
          return fail(HResultString("CreateCommandList", hr));
+      command_list->SetName(L"RTAO list");
       command_list->Close();
 
       hr = device12->CreateFence(0, D3D12_FENCE_FLAG_SHARED, IID_PPV_ARGS(&shared_fence12));

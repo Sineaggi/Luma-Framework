@@ -162,7 +162,7 @@ namespace RTSun
       ID3D11Texture2D* shared11 = nullptr;
       ID3D11ShaderResourceView* srv11 = nullptr;
       // Diagnostic capture targets (created by EnsureTargets while debug_requested)
-      std::atomic<bool> debug_requested = false;
+      std::atomic<bool> debug_requested = true; // Created with the targets, so starting a capture never re-creates targets mid run
       ID3D12Resource* dbg_vis[3] = {}; // vis_format UAVs: raw, scene view from the camera, from the sun
       ID3D12Resource* dbg_hist = nullptr; // R32G32_UINT scratch the filter writes in its "off" mode (keeps the real history)
       ID3D12Resource* dbg_shared12[3] = {};

@@ -102,6 +102,8 @@ namespace RTAO
 
       // Valid after Init. Not reference counted: don't keep past Shutdown.
       ID3D12Device5* GetDevice() const { return device12; }
+      // Empty while the D3D12 device is fine; else the removal reason and the DRED breadcrumbs / page fault allocations
+      std::string DeviceRemovedReport();
       static constexpr uint32_t GetFramesInFlight() { return frames_in_flight; }
 
       // Ticks per second of the direct queue's timestamps (0 if unavailable)

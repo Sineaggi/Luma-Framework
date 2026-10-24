@@ -1181,6 +1181,8 @@ public:
             float fars[4] = {};
             g.rtsun_light.GetSliceFars(fars);
             add("slice_fars=%.4g,%.4g,%.4g,%.4g\n", fars[0], fars[1], fars[2], fars[3]);
+            add("shadow_bursts=%u\nlast_burst_frame=%u\nlast_burst_size=%u\ndynamic_meshes=%u\ndynamic_dropped=%u\nshadow_static=%u\n", r.bursts, r.last_burst_frame, r.last_burst_size,
+               r.dynamic_meshes, r.dynamic_dropped, r.shadow_static);
             // Shadow pass audit since the last capture
             {
                std::map<ShadowAuditKey, uint64_t> audit;
@@ -2133,6 +2135,20 @@ public:
          g_rtao_shadow_frames++;
          g_rtao_shadow_zero_frames += delta == 0;
          g_rtao_shadow_max_per_frame = (std::max)(g_rtao_shadow_max_per_frame, delta);
+         // Every shadow map redraw burst (first 200): when the game puts static content into its shadow maps
+         if (game_device_data.rtao_capture.IsInitialized())
+         {
+            static uint32_t logged_bursts = 0;
+            const RTAO::RetentionStats burst = game_device_data.rtao_tlas.GetRetentionStats();
+            if (burst.bursts != logged_bursts && logged_bursts < 200)
+            {
+               logged_bursts = burst.bursts;
+               char text[200];
+               snprintf(text, sizeof(text), "RTAO diag: shadow map redraw burst %u at TLAS frame %u (Luma frame %u): %u new shadow map instances, %u static kept, %u dynamic meshes",
+                  burst.bursts, burst.last_burst_frame, game_device_data.rtao_frame, burst.last_burst_size, burst.shadow_static, burst.dynamic_meshes);
+               reshade::log::message(reshade::log::level::info, text);
+            }
+         }
          if (g_rtao_shadow_frames >= 600 && game_device_data.rtao_capture.IsInitialized())
          {
             const RTAO::CaptureStats stats = game_device_data.rtao_capture.GetStats();

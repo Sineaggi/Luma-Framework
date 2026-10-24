@@ -231,6 +231,10 @@ namespace RTAO
       uint32_t shadow_static = 0; // Shadow map instances kept as static world
       uint32_t moved = 0; // Shadow map copies dropped as the previous position of a moving object (this BeginFrame)
       uint32_t capped = 0; // Static shadow map instances dropped by the cap (this BeginFrame)
+      uint32_t dynamic_meshes = 0; // Meshes taken as dynamic in the shadow maps (new copies frame after frame: particles)
+      uint32_t dynamic_dropped = 0; // Their copies dropped once the game stopped drawing them (this BeginFrame)
+      // Shadow map redraw bursts (a readback bringing >= kShadowBatch new shadow map instances): since start, the last one
+      uint32_t bursts = 0, last_burst_frame = 0, last_burst_size = 0;
    };
 
    class TlasBuilder
@@ -257,6 +261,13 @@ namespace RTAO
       // kMovingWindowFrames; at most kMaxShadowStatic static shadow map instances (the least recently drawn go first)
       static constexpr uint32_t kShadowBatch = 30;
       static constexpr uint32_t kMovingWindowFrames = 4;
+      // A mesh that brings new shadow map copies in kDynamicStreakFrames consecutive readbacks is dynamic in the shadow
+      // maps (falling particles, debris): only the copies of its latest draw are kept (within kDynamicRetainFrames of it: a
+      // mover's last pose, one frame of particles), older ones go.
+      // It stays dynamic until it brought no new copy for kDynamicCoolFrames.
+      static constexpr uint32_t kDynamicStreakFrames = 12;
+      static constexpr uint32_t kDynamicRetainFrames = 2;
+      static constexpr uint32_t kDynamicCoolFrames = 120;
       static constexpr float kMovingDistance = 2.f;
       static constexpr size_t kMaxShadowStatic = 60000;
 
@@ -326,6 +337,14 @@ namespace RTAO
       std::unordered_set<uint64_t> shadow_meshes; // BLAS keys ever drawn into a shadow map (sun casters, any instance)
       std::vector<InstanceInfo> last_build_order;
       std::vector<uint64_t> batch_candidates; // Shadow map instances created since the last BeginFrame
+      struct MeshChurn
+      {
+         uint32_t last_new_frame = 0;
+         uint32_t streak = 0;
+         bool dynamic = false;
+      };
+      std::unordered_map<uint64_t, MeshChurn> churn; // By BLAS key: new shadow map copies frame after frame
+      uint32_t bursts = 0, last_burst_frame = 0, last_burst_size = 0;
       RetentionStats retention_stats;
       uint32_t added_new = 0;
       std::mutex mutex;

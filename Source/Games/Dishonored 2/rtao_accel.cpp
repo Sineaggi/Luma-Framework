@@ -485,6 +485,37 @@ namespace RTAO
       if (drop_shadow_request.exchange(false))
          std::erase_if(instances, [](const auto& pair) { return (pair.second.sources & kInstanceSourceShadow) != 0; }); // Also those the main view saw: their slice history goes too
       const bool batch = added_new_shadow >= kShadowBatch; // The last readback brought a shadow map redraw of the world
+      if (batch)
+      {
+         bursts++;
+         last_burst_frame = frame;
+         last_burst_size = added_new_shadow;
+      }
+      // Meshes that brought new shadow map copies in this readback: their streak of consecutive readbacks
+      {
+         std::unordered_set<uint64_t> new_meshes;
+         for (uint64_t key : batch_candidates)
+         {
+            auto it = instances.find(key);
+            if (it != instances.end())
+               new_meshes.insert(it->second.blas_key);
+         }
+         for (uint64_t mesh : new_meshes)
+         {
+            MeshChurn& c = churn[mesh];
+            c.streak = c.last_new_frame + 1 == frame ? c.streak + 1 : 1;
+            c.last_new_frame = frame;
+            if (c.streak >= kDynamicStreakFrames)
+               c.dynamic = true;
+         }
+         for (auto it = churn.begin(); it != churn.end();)
+         {
+            if (frame - it->second.last_new_frame > kDynamicCoolFrames)
+               it = churn.erase(it);
+            else
+               ++it;
+         }
+      }
       added_new_shadow = 0;
       if (batch)
          for (uint64_t key : batch_candidates)
@@ -537,6 +568,21 @@ namespace RTAO
       }
 
       size_t shadow_static_count = 0;
+      // Dynamic meshes keep only the copies of their latest draw (a mover's last pose, the particles of one frame)
+      std::unordered_map<uint64_t, uint32_t> dynamic_latest;
+      for (const auto& pair : churn)
+         if (pair.second.dynamic)
+         {
+            s.dynamic_meshes++;
+            dynamic_latest[pair.first] = 0;
+         }
+      if (!dynamic_latest.empty())
+         for (const auto& [key, instance] : instances)
+         {
+            auto d = (instance.sources & kInstanceSourceShadow) ? dynamic_latest.find(instance.blas_key) : dynamic_latest.end();
+            if (d != dynamic_latest.end())
+               d->second = (std::max)(d->second, instance.last_frame);
+         }
       for (auto it = instances.begin(); it != instances.end();)
       {
          const Instance& instance = it->second;
@@ -545,9 +591,12 @@ namespace RTAO
          uint32_t max_age;
          if (shadow_mode == 0)
          {
-            shadow_static = shadow && !instance.moved;
+            auto d = shadow ? dynamic_latest.find(instance.blas_key) : dynamic_latest.end();
+            const bool dynamic = d != dynamic_latest.end() && instance.last_frame + kDynamicRetainFrames < d->second; // Older than its mesh's latest draw
+            shadow_static = shadow && !instance.moved && !dynamic;
             promoted = shadow_static || instance.seen_frames >= promote_frames;
-            max_age = shadow_static ? UINT32_MAX : (instance.moved ? 0 : (promoted ? retain_frames : young_retain_frames));
+            max_age = shadow_static ? UINT32_MAX : (instance.moved || dynamic ? 0 : (promoted ? retain_frames : young_retain_frames));
+            s.dynamic_dropped += dynamic;
          }
          else
          {
@@ -589,6 +638,9 @@ namespace RTAO
          shadow_static_count -= excess;
       }
       s.shadow_static = uint32_t(shadow_static_count);
+      s.bursts = bursts;
+      s.last_burst_frame = last_burst_frame;
+      s.last_burst_size = last_burst_size;
       retention_stats = s;
    }
 

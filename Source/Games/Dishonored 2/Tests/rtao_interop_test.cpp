@@ -327,6 +327,36 @@ static void TestTlasRetention()
          shadow.BeginFrame();
       CHECK(shadow.RetainedCount() == 0, "shadow map casters must go after kShadowRetainFrames (retained %zu)", shadow.RetainedCount());
    }
+   // Particles in the shadow maps: a mesh bringing 40 new copies in random places every frame (more than a redraw batch)
+   // keeps only its latest frame of copies; a one off static redraw burst of another mesh (the game filling its shadow
+   // map) stays
+   {
+      RTAO::TlasBuilder shadow;
+      shadow.BeginFrame();
+      for (uint64_t k = 0; k < 50; k++)
+      {
+         float xform[3][4] = { { 1, 0, 0, 3.f * k }, { 0, 1, 0, 100 }, { 0, 0, 1, 0 } };
+         shadow.AddInstance(90000 + k, 7, xform, RTAO::kInstanceMaskOpaque, RTAO::kNoCutoutRecord, RTAO::kInstanceSourceShadow);
+      }
+      uint64_t next = 100000;
+      for (uint32_t f = 0; f < 200; f++)
+      {
+         shadow.BeginFrame();
+         for (uint32_t k = 0; k < 40; k++)
+         {
+            float xform[3][4] = { { 1, 0, 0, float((next * 7919) % 1000) }, { 0, 1, 0, float((next * 104729) % 1000) }, { 0, 0, 1, 0 } };
+            shadow.AddInstance(next++, 8, xform, RTAO::kInstanceMaskOpaque, RTAO::kNoCutoutRecord, RTAO::kInstanceSourceShadow);
+         }
+      }
+      shadow.BeginFrame();
+      const RTAO::RetentionStats r = shadow.GetRetentionStats();
+      printf("TLAS retention, particles: retained %zu after 200 frames of 40 new copies (dynamic meshes %u, static %u, bursts %u)\n", shadow.RetainedCount(), r.dynamic_meshes, r.shadow_static, r.bursts);
+      CHECK(shadow.RetainedCount() <= 50 + 40 * (RTAO::TlasBuilder::kDynamicRetainFrames + 2), "particle copies must not pile up (retained %zu)", shadow.RetainedCount());
+      CHECK(r.dynamic_meshes == 1 && r.shadow_static >= 50, "only the particle mesh is dynamic, the static burst stays (dynamic %u, static %u)", r.dynamic_meshes, r.shadow_static);
+      for (uint32_t f = 0; f < 1000; f++)
+         shadow.BeginFrame();
+      CHECK(shadow.RetainedCount() >= 50 && shadow.RetainedCount() <= 50 + 40 * (RTAO::TlasBuilder::kDynamicRetainFrames + 2), "after the particles stop, the static burst stays (retained %zu)", shadow.RetainedCount());
+   }
    printf("TLAS retention: ok\n");
 }
 

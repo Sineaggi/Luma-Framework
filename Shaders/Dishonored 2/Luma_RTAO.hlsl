@@ -84,7 +84,8 @@ cbuffer CaptureParams : register(b0)
     uint4 MvpCB; // byte offsets of cb_mvpmatrixx/y/z/w (clip.c = dot(float4(pos, 1), cb_mvpmatrix[c]))
     uint ViewProjCB; // byte offset of cb_viewprojectionmatrix in the game's PerViewCB (4 rows: clip = world_h x VP)
     float AlphaRefConst; // Cutouts: the hardcoded reference when AlphaRefCB is RTAO_NO_OFFSET
-    uint2 CapturePad2;
+    uint RecordTag; // capture_instances_cs: written into bits 8..31 of each instance's flags (readback checks it)
+    uint CapturePad2;
     // skin_vertices_cs only
     uint SkinVertexCount;
     uint SkinDstVertex; // first vertex written in SkinOut
@@ -267,7 +268,7 @@ void capture_instances_cs(uint3 id : SV_DispatchThreadID)
     CaptureRing.Store4(address, asuint(rows[0]));
     CaptureRing.Store4(address + 16, asuint(rows[1]));
     CaptureRing.Store4(address + 32, asuint(rows[2]));
-    CaptureRing.Store4(address + 48, uint4(flags, f32tof16(scalebias.x) | (f32tof16(scalebias.y) << 16), f32tof16(scalebias.z) | (f32tof16(scalebias.w) << 16), asuint(alpha_ref)));
+    CaptureRing.Store4(address + 48, uint4(flags | ((RecordTag & 0xFFFFFFu) << 8), f32tof16(scalebias.x) | (f32tof16(scalebias.y) << 16), f32tof16(scalebias.z) | (f32tof16(scalebias.w) << 16), asuint(alpha_ref)));
 }
 
 // ---- Per frame vertex capture (skinned meshes, DYNAMIC vertex buffers). Must match RTAO::GeometryCapture::CaptureFrameDraw

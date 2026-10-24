@@ -1427,6 +1427,7 @@ namespace RTAO
 
       std::vector<Rec> local;
       uint32_t dst_slot;
+      uint32_t record_tag = 0;
       {
          const std::lock_guard lock(mutex);
          stats.draws_seen++;
@@ -1486,12 +1487,14 @@ namespace RTAO
          }
          dst_slot = uint32_t(ring_head % kRingSlots);
          ring_head += draw.instance_count;
+         record_tag = next_record_tag++ & 0xFFFFFF;
       }
 
       // The matrix dispatch, with the draw's own bindings
       CaptureParams params = {};
       params.instance_count = draw.instance_count;
       params.dst_slot = dst_slot;
+      params.record_tag = record_tag;
       params.slot_mask = kRingSlots - 1;
       RTAO::DrawInfo capture_draw = draw;
       if (!material)
@@ -1512,6 +1515,7 @@ namespace RTAO
          record.shadow_view = draw.shadow_view;
          record.check_rigid = draw.shadow_view && source == MatrixSource::MvpConstantBuffer;
          record.mvp = source == MatrixSource::MvpConstantBuffer;
+         record.tag = record_tag;
          local.push_back(record);
          if (identity)
             frame_identities.insert(identity);
@@ -2031,7 +2035,7 @@ namespace RTAO
       // 1) Matrices captured 3 frames ago (this slot's last use has completed: Interop waited for its allocator)
       tlas.BeginFrame();
       const RetentionStats retention = tlas.GetRetentionStats();
-      uint64_t frame_instances = 0, view_model = 0, frame_cutouts = 0, shadow_rejected = 0, mvp_instances = 0;
+      uint64_t frame_instances = 0, view_model = 0, frame_cutouts = 0, shadow_rejected = 0, mvp_instances = 0, tag_mismatch = 0, tag_checked = 0;
       fuzzy_frame++;
       fuzzy_matched_other_key = 0;
       if ((fuzzy_frame & 255) == 0) // Forget entries the TLAS has dropped too
@@ -2075,6 +2079,12 @@ namespace RTAO
                {
                   const float* rows = reinterpret_cast<const float*>(data + index * 64);
                   const uint32_t flags = *reinterpret_cast<const uint32_t*>(data + index * 64 + 48);
+                  tag_checked++;
+                  if ((flags >> 8) != r.tag)
+                  {
+                     tag_mismatch++; // This entry was written by another draw: never use it
+                     continue;
+                  }
                   if (!(flags & 1u))
                      continue;
                   if (flags & 2u)
@@ -2156,7 +2166,7 @@ namespace RTAO
                remaining -= len;
                src = (src + len) % kRingSlots;
             }
-            readback_records[slot].push_back({ record.mesh_key, record.count, record.mask, record.material, record.geometry, record.shadow_view, record.check_rigid, record.mvp });
+            readback_records[slot].push_back({ record.mesh_key, record.count, record.mask, record.material, record.geometry, record.shadow_view, record.check_rigid, record.mvp, record.tag });
          }
          flush();
          Transition(list, ring12, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_COMMON);
@@ -2284,6 +2294,8 @@ namespace RTAO
       stats.view_model_instances = view_model;
       stats.shadow_rejected += shadow_rejected;
       stats.mvp_instances = mvp_instances;
+      stats.tag_mismatch += tag_mismatch;
+      stats.tag_checked += tag_checked;
       stats.mvp_rekeyed = fuzzy_matched_other_key;
       stats.retention = retention;
       size_t fuzzy_entries = 0;

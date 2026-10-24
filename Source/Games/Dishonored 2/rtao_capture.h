@@ -159,7 +159,8 @@ namespace RTAO
       uint32_t mvp_cb[4];
       uint32_t view_proj_cb;
       float alpha_ref_const;
-      uint32_t pad2[2];
+      uint32_t record_tag; // capture_instances_cs writes it into each instance's flags bits 8..31 (readback check)
+      uint32_t pad2;
       // skin_vertices_cs only
       uint32_t skin_vertex_count; // Threads: vertices written
       uint32_t skin_dst_vertex; // First vertex in the skinned ring
@@ -272,6 +273,8 @@ namespace RTAO
       uint64_t shadow_skipped_skinned = 0, shadow_skipped_mvp_frame = 0; // shadow_skipped split
       // Writes by the game into buffers already copied into the arena (stale geometry), total and distinct buffers
       uint64_t written_after_copy = 0, written_buffers = 0, written_forgotten = 0;
+      // H1: instances whose ring entry carried another draw's tag at readback (matrix from the wrong draw), checked
+      uint64_t tag_mismatch = 0, tag_checked = 0;
       // MVP derived instances, last readback: read back, matched to a known instance although their exact key differed
       uint64_t mvp_instances = 0, mvp_rekeyed = 0, fuzzy_entries = 0;
       RetentionStats retention; // The TLAS's retained instances, last readback
@@ -389,6 +392,7 @@ namespace RTAO
          CutoutGeometry geometry;
          bool shadow_view = false; // Instances, FrameMesh: from a shadow map draw (kept after the AO pass)
          bool check_rigid = false; // Instances: MVP derived in a shadow map draw (see DrawInfo::shadow_view)
+         uint32_t tag = 0; // Instances: the draw's record tag (CaptureParams::record_tag)
          bool skinned = false; // FrameMesh: skinned (else a dynamic vertex buffer), debug scene view
          bool mvp = false; // Instances: MVP derived matrix (identity matched with a tolerance, see FuzzyKey)
       };
@@ -455,7 +459,9 @@ namespace RTAO
          bool shadow_view;
          bool check_rigid;
          bool mvp;
+         uint32_t tag;
       };
+      uint32_t next_record_tag = 1;
       // MVP derived matrices (world = MVP x inverse(VP)) carry float noise that changes with the camera, so their exact
       // quantized key changes from frame to frame: the same static prop would look like a new object every frame, never
       // be promoted (TlasBuilder::kPromoteFrames) and drop out 2 frames after leaving the view. FuzzyKey gives them the

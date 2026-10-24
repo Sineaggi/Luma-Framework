@@ -169,6 +169,7 @@ namespace
    // which the main view never draws but the sun needs (RTAO::DrawInfo::shadow_view)
    bool g_rtao_shadow_casters = true;
    std::atomic<uint64_t> g_rtao_shadow_view_draws = 0; // Indexed draws into shadow maps seen (captured or not)
+   std::atomic<uint64_t> g_rtao_shadow_indirect_draws = 0; // Indirect (GPU culled) draws into shadow maps: not captured
    // Shadow map draws per frame (at present): frames with none, the most in one frame, over the current log window
    uint64_t g_rtao_shadow_draws_at_present = 0;
    uint32_t g_rtao_shadow_zero_frames = 0, g_rtao_shadow_frames = 0;
@@ -1465,14 +1466,15 @@ public:
             snprintf(line, sizeof(line),
                "RTAO diag: shadow map draws in %u frames: %u frames with none, max %llu in a frame | TLAS retained %u (promoted %u, young %u; main view only %u, shadow maps only %u, both %u), "
                "last readback: new %u, evicted %u promoted + %u young, shadow young %u | BLAS: meshes %llu, built %llu, failed %llu, TLAS instances %u, left out (BLAS not built yet) %u, budget %d/frame, arena %llu MB, draws refused: arena full %llu, buffer %llu, ring %llu | MVP instances %llu, rekeyed %llu (fuzzy entries %llu) | "
-               "camera: SSAO draws %llu, shared copy from another frame %llu, view projection differed %llu (max element diff %.6f), no thread copy %llu, thread copy another camera %llu | game writes into captured buffers %llu (%llu buffers, %llu re-copied)",
+               "camera: SSAO draws %llu, shared copy from another frame %llu, view projection differed %llu (max element diff %.6f), no thread copy %llu, thread copy another camera %llu | game writes into captured buffers %llu (%llu buffers, %llu re-copied) | indirect draws (not captured): main view %llu, shadow maps %llu | matrix tag mismatches %llu of %llu",
                g_rtao_shadow_frames, g_rtao_shadow_zero_frames, (unsigned long long)g_rtao_shadow_max_per_frame, r.promoted + r.young, r.promoted, r.young, r.main_only, r.shadow_only, r.both,
                r.added_new, r.evicted_promoted, r.evicted_young, r.shadow_young, (unsigned long long)stats.meshes, (unsigned long long)stats.meshes_ready, (unsigned long long)stats.blas_failed,
                game_device_data.rtao_tlas_instances.load(), game_device_data.rtao_tlas_missing_blas.load(), g_rtao_blas_budget, (unsigned long long)(stats.arena_vertex_bytes >> 20),
                (unsigned long long)stats.skipped[RTAO::kSkipArenaFull], (unsigned long long)stats.skipped[RTAO::kSkipBuffer], (unsigned long long)stats.skipped[RTAO::kSkipRingFull], (unsigned long long)stats.mvp_instances, (unsigned long long)stats.mvp_rekeyed, (unsigned long long)stats.fuzzy_entries,
                (unsigned long long)g_rtao_view_checks.load(), (unsigned long long)g_rtao_view_other_frame.load(), (unsigned long long)g_rtao_view_mismatch.load(), g_rtao_view_mismatch_max.load() / 1e6,
                (unsigned long long)g_rtao_view_no_thread_copy.load(), (unsigned long long)g_rtao_view_other_camera.load(),
-               (unsigned long long)stats.written_after_copy, (unsigned long long)stats.written_buffers, (unsigned long long)stats.written_forgotten);
+               (unsigned long long)stats.written_after_copy, (unsigned long long)stats.written_buffers, (unsigned long long)stats.written_forgotten,
+               (unsigned long long)g_rtao_indirect_draws.load(), (unsigned long long)g_rtao_shadow_indirect_draws.load(), (unsigned long long)stats.tag_mismatch, (unsigned long long)stats.tag_checked);
             reshade::log::message(reshade::log::level::info, line);
             g_rtao_shadow_frames = g_rtao_shadow_zero_frames = 0;
             g_rtao_shadow_max_per_frame = 0;
@@ -2448,8 +2450,11 @@ public:
          return false;
       if (cmd_list->get_device()->get_api() != reshade::api::device_api::d3d11)
          return false;
-      if (IsMainViewDepthWrite(reinterpret_cast<ID3D11DeviceContext*>(cmd_list->get_native()), false))
+      auto* context = reinterpret_cast<ID3D11DeviceContext*>(cmd_list->get_native());
+      if (IsMainViewDepthWrite(context, false))
          g_rtao_indirect_draws += draw_count;
+      else if (IsShadowViewDepthWrite(context))
+         g_rtao_shadow_indirect_draws += draw_count; // GPU culled shadow casters: not captured
       return false;
    }
 

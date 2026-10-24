@@ -3369,7 +3369,10 @@ public:
       D3D11_VIEWPORT viewport = {};
       UINT viewports = 1;
       context->RSGetViewports(&viewports, &viewport);
-      if (!depth_desc.DepthWriteMask && rtv_count > 0 && std::find(std::begin(kWindowPixelShaders), std::end(kWindowPixelShaders), ps_hash) != std::end(kWindowPixelShaders))
+      // Window materials, and transparent pass draws (blended, screen sized, not quads): glass drawn there never writes depth
+      const bool window_shader = std::find(std::begin(kWindowPixelShaders), std::end(kWindowPixelShaders), ps_hash) != std::end(kWindowPixelShaders);
+      const bool transparent = blend_desc.RenderTarget[0].BlendEnable && index_count >= 12 && viewport.Width >= 1000.f;
+      if (!depth_desc.DepthWriteMask && rtv_count > 0 && (window_shader || transparent))
       {
          ID3D11ShaderResourceView* srvs[12] = {};
          context->PSGetShaderResources(0, 12, srvs);
@@ -3390,7 +3393,7 @@ public:
             {
                const std::lock_guard lock(g_tex_probe_mutex);
                g_tex_probe[row]++;
-               if (sd.ViewDimension == D3D11_SRV_DIMENSION_TEXTURE2D && td.Width >= 16 && g_tex_dumped.size() < 48 && g_tex_dumped.insert(uintptr_t(res.get())).second)
+               if (sd.ViewDimension == D3D11_SRV_DIMENSION_TEXTURE2D && td.Width >= 16 && g_tex_dumped.size() < 160 && slot < 9 && g_tex_dumped.insert(uintptr_t(res.get())).second)
                {
                   char name[96];
                   snprintf(name, sizeof(name), "tex_%08X_t%u_%llX", ps_hash, slot, (unsigned long long)uintptr_t(res.get()));

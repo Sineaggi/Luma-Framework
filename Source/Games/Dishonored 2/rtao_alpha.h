@@ -137,6 +137,7 @@ namespace RTAO
       struct Material
       {
          ID3D11Resource* texture = nullptr; // Identity only
+         ID3D11Resource* texture2 = nullptr; // Identity only: the second texture (textured windows), if any
          State state = State::Pending;
          uint32_t tile = kNoTile; // Pending: the strip tile holding its mask
          uint32_t slice = 0xFFFF;

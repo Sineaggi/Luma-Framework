@@ -2346,6 +2346,7 @@ static void TestCutoutTextures(ID3D11Device* device, ID3D11DeviceContext* contex
       draw = saved;
       printf("RT sun through a textured window (normal map lead), left (lead below) / right (glass below): %.3f / %.3f\n", window_left, window_right);
       CHECK(window_left < 0.1f && window_right > 0.9f, "RT sun, textured window: shadow of the lead, light through the glass (%.3f / %.3f)", window_left, window_right);
+      capture.OnDestroyTexture(normal_texture); // Like the game's texture destruction hook
       normal_srv->Release();
       normal_texture->Release();
    }
@@ -2421,6 +2422,8 @@ static void TestCutoutTextures(ID3D11Device* device, ID3D11DeviceContext* contex
          results[0][0], results[0][1], results[1][0], results[1][1]);
       CHECK(results[0][0] > 0.9f && results[0][1] < 0.1f, "stained glass, density 1: light through the white glass, none through the black (%.3f / %.3f)", results[0][0], results[0][1]);
       CHECK(results[1][0] > 0.9f && results[1][1] > 0.35f && results[1][1] < 0.65f, "stained glass, density 0.5: the black glass lets half through (%.3f / %.3f)", results[1][0], results[1][1]);
+      capture.OnDestroyTexture(glass_texture);
+      capture.OnDestroyTexture(normal_texture);
       glass_srv->Release();
       glass_texture->Release();
       normal_srv->Release();
@@ -2460,6 +2463,7 @@ static void TestCutoutTextures(ID3D11Device* device, ID3D11DeviceContext* contex
       draw = saved;
       printf("RT sun through a window with thin lead lines (1 texel in 32 of 1024): left %.3f, right %.3f (1.000: the lines were lost)\n", left, right);
       CHECK(left < 0.98f && right < 0.98f, "thin lead lines must survive the mask reduction (%.3f / %.3f)", left, right);
+      capture.OnDestroyTexture(texture);
       srv->Release();
       texture->Release();
    }

@@ -172,9 +172,9 @@ namespace RTAO
          return 0;
       texture->Release(); // Identity only (the SRV keeps it alive for the draw)
       uint64_t key = MaterialKey(texture, channel);
+      ID3D11Resource* texture2 = nullptr;
       if (srv2)
       {
-         ID3D11Resource* texture2 = nullptr;
          srv2->GetResource(&texture2);
          if (texture2)
             texture2->Release();
@@ -195,6 +195,7 @@ namespace RTAO
             // alpha_strip_cs reads a Texture2D: never rendered, stays on the fallback (not retried at every draw)
             Material material;
             material.texture = texture;
+            material.texture2 = texture2;
             material.state = State::NoSlice;
             materials.emplace(key, material);
             stats.unsupported++;
@@ -218,6 +219,7 @@ namespace RTAO
       {
          Material material;
          material.texture = texture;
+         material.texture2 = texture2;
          material.tile = tile;
          material.frame = frame;
          materials.emplace(key, material);
@@ -339,14 +341,19 @@ namespace RTAO
       const std::lock_guard lock(mutex);
       if (materials.empty())
          return;
-      for (uint32_t channel = 0; channel < 4; channel++)
+      // Every material made from it: any channel or mode, as the first or the second texture (the keys of textured
+      // windows also hash the second texture and the density, so a key lookup would miss them and a new texture at the
+      // same address would inherit the old mask)
+      for (auto it = materials.begin(); it != materials.end();)
       {
-         auto it = materials.find(MaterialKey(texture, channel));
-         if (it == materials.end())
+         if (it->second.texture != texture && it->second.texture2 != texture)
+         {
+            ++it;
             continue;
+         }
          if (it->second.slice != 0xFFFF)
             free_slices.push_back(it->second.slice); // Its records resolve to "no mask" at the next upload
-         materials.erase(it);
+         it = materials.erase(it);
          version++;
       }
    }

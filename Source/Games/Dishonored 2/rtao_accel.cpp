@@ -472,7 +472,7 @@ namespace RTAO
          const bool shadow = (instance.sources & kInstanceSourceShadow) != 0;
          const bool shadow_static = shadow && instance.seen_frames >= kShadowPromoteFrames;
          const bool promoted = shadow_static || instance.seen_frames >= promote_frames;
-         const uint32_t max_age = shadow_static ? (std::max)(retain_frames, kShadowRetainFrames) : (promoted ? retain_frames : (shadow ? kShadowYoungRetainFrames : young_retain_frames));
+         const uint32_t max_age = shadow_static ? (std::max)(retain_frames, kShadowRetainFrames) : (promoted ? retain_frames : (shadow ? shadow_young_retain_frames : young_retain_frames));
          if (frame - instance.last_frame > max_age)
          {
             (promoted ? s.evicted_promoted : s.evicted_young)++;

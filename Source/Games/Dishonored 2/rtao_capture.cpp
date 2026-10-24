@@ -1342,6 +1342,12 @@ namespace RTAO
          dynamic_vertices = vb_desc.Usage == D3D11_USAGE_DYNAMIC;
       }
       const bool frame_mesh = draw.vs->skinned || dynamic_vertices;
+      if (draw.shadow_view && frame_mesh && !shadow_frame_meshes_enabled.load(std::memory_order_relaxed))
+      {
+         const std::lock_guard lock(mutex);
+         stats.shadow_skipped++;
+         return false;
+      }
       // Shadow map draws: no skinned meshes (once per cascade, the most expensive capture), see DrawInfo::shadow_view.
       // MVP per frame meshes (openable windows, doors) are taken: Luma_RTAO.hlsl ResolveInstance rejects a non rigid MVP
       // derived matrix on the GPU (NaN vertices, inactive in DXR).
@@ -1809,6 +1815,7 @@ namespace RTAO
       }
       params.instance_count = 1;
       params.skin_shadow = draw.shadow_view ? 1 : 0;
+      params.debug_key = uint32_t(key ^ (key >> 32));
       const bool dispatched = DispatchCapture(context, params_cb, draw, params, skin_cs, skinned ? draw.bones : nullptr, arena_view, dynamic_ring_srv, skin_ring_uav, 1, (vertex_count + 63) / 64, counters_uav);
 
       const std::lock_guard lock(mutex);
@@ -1916,15 +1923,15 @@ namespace RTAO
    {
       if (!counters11 && device11 && skin_cs)
       {
-         D3D11_BUFFER_DESC desc = { 16, D3D11_USAGE_DEFAULT, D3D11_BIND_UNORDERED_ACCESS, 0, D3D11_RESOURCE_MISC_BUFFER_ALLOW_RAW_VIEWS, 0 };
-         const uint32_t zero[4] = {};
-         D3D11_SUBRESOURCE_DATA data = { zero, 0, 0 };
+         D3D11_BUFFER_DESC desc = { kCounterBytes, D3D11_USAGE_DEFAULT, D3D11_BIND_UNORDERED_ACCESS, 0, D3D11_RESOURCE_MISC_BUFFER_ALLOW_RAW_VIEWS, 0 };
+         const std::vector<uint32_t> zero(kCounterBytes / 4, 0u);
+         D3D11_SUBRESOURCE_DATA data = { zero.data(), 0, 0 };
          if (SUCCEEDED(device11->CreateBuffer(&desc, &data, &counters11)))
          {
             D3D11_UNORDERED_ACCESS_VIEW_DESC uav = {};
             uav.Format = DXGI_FORMAT_R32_TYPELESS;
             uav.ViewDimension = D3D11_UAV_DIMENSION_BUFFER;
-            uav.Buffer.NumElements = 4;
+            uav.Buffer.NumElements = kCounterBytes / 4;
             uav.Buffer.Flags = D3D11_BUFFER_UAV_FLAG_RAW;
             ID3D11UnorderedAccessView* view = nullptr;
             if (SUCCEEDED(device11->CreateUnorderedAccessView(counters11, &uav, &view)))
@@ -1932,7 +1939,7 @@ namespace RTAO
                const std::lock_guard lock(mutex);
                counters_uav = view;
             }
-            D3D11_BUFFER_DESC staging = { 16, D3D11_USAGE_STAGING, 0, D3D11_CPU_ACCESS_READ, 0, 0 };
+            D3D11_BUFFER_DESC staging = { kCounterBytes, D3D11_USAGE_STAGING, 0, D3D11_CPU_ACCESS_READ, 0, 0 };
             for (auto& s : counters_staging)
                device11->CreateBuffer(&staging, nullptr, &s);
          }
@@ -1947,10 +1954,24 @@ namespace RTAO
          D3D11_MAPPED_SUBRESOURCE mapped = {};
          if (SUCCEEDED(immediate->Map(counters_staging[slot], 0, D3D11_MAP_READ, D3D11_MAP_FLAG_DO_NOT_WAIT, &mapped)))
          {
-            uint32_t c[4];
+            uint32_t c[8];
             std::memcpy(c, mapped.pData, sizeof(c));
+            // The probe ring, oldest first (c[4] probes written so far)
+            std::vector<FrameMeshProbe> ring;
+            const uint32_t written = c[4], count = written < 64 ? written : 64;
+            for (uint32_t k = 0; k < count; k++)
+            {
+               const uint32_t s = (written - count + k) % 64;
+               const uint8_t* p = static_cast<const uint8_t*>(mapped.pData) + 32 + s * 32;
+               FrameMeshProbe probe;
+               std::memcpy(&probe.key, p, 4);
+               std::memcpy(&probe.flags, p + 4, 4);
+               std::memcpy(probe.pos, p + 8, 12);
+               ring.push_back(probe);
+            }
             immediate->Unmap(counters_staging[slot], 0);
             const std::lock_guard lock(mutex);
+            probes = std::move(ring);
             stats.gpu_shadow_frame_rejected = c[0];
             stats.gpu_shadow_frame = c[1];
             stats.gpu_main_frame_rejected = c[2];

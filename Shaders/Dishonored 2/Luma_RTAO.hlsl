@@ -85,7 +85,7 @@ cbuffer CaptureParams : register(b0)
     uint ViewProjCB; // byte offset of cb_viewprojectionmatrix in the game's PerViewCB (4 rows: clip = world_h x VP)
     float AlphaRefConst; // Cutouts: the hardcoded reference when AlphaRefCB is RTAO_NO_OFFSET
     uint RecordTag; // capture_instances_cs: written into bits 8..31 of each instance's flags (readback checks it)
-    uint CapturePad2;
+    uint DebugKey; // skin_vertices_cs: the draw's mesh key (low bits), for the probe ring (FrameCounters)
     // skin_vertices_cs only
     uint SkinVertexCount;
     uint SkinDstVertex; // first vertex written in SkinOut
@@ -282,7 +282,9 @@ ByteAddressBuffer Arena : register(t4); // The geometry arena (the game's vertex
 ByteAddressBuffer DynamicVertices : register(t5); // DYNAMIC vertex buffers, copied at the draw (stream format flag RTAO_FORMAT_DYNAMIC)
 RWByteAddressBuffer SkinOut : register(u1); // float3 per vertex
 // Diagnostics (uint counters): [0] shadow map per frame meshes whose matrix was rejected, [1] shadow map per frame meshes,
-// [2] main view per frame meshes rejected (not view models), [3] main view per frame meshes. See GeometryCapture::PollCounters.
+// [2] main view per frame meshes rejected (not view models), [3] main view per frame meshes, [4] probes written; from byte 32,
+// a ring of 64 probes of 32 bytes: mesh key, flags (1 shadow map, 2 skinned), world position of the draw's vertex 0.
+// See GeometryCapture::PollCounters.
 RWByteAddressBuffer FrameCounters : register(u2);
 
 // Vertex element formats (must match RTAO::VertexFormatCode): kind | components << 4 | bits per component << 8
@@ -437,6 +439,14 @@ void skin_vertices_cs(uint3 id : SV_DispatchThreadID)
         world = float3(dot(model, rows[0]), dot(model, rows[1]), dot(model, rows[2]));
     }
     SkinOut.Store3((SkinDstVertex + i) * 12, asuint(world));
+    if (i == 0 && flags == RTAO_FLAG_VALID)
+    {
+        uint slot;
+        FrameCounters.InterlockedAdd(16, 1, slot);
+        const uint address = 32 + (slot % 64) * 32;
+        FrameCounters.Store4(address, uint4(DebugKey, (SkinShadow != 0 ? 1u : 0u) | (SkinSets != 0 ? 2u : 0u), asuint(world.x), asuint(world.y)));
+        FrameCounters.Store(address + 16, asuint(world.z));
+    }
 }
 
 // ---- Texture exact cutouts: one channel of a material's alpha texture into a 256x256 R8 tile. Must match

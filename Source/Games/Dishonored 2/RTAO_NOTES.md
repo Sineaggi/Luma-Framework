@@ -477,7 +477,7 @@ aged out by the retention meant for the main view (2 frames young, then 180). Ch
 ### Diagnostic capture
 
 To settle where a visible change starts (popping, wobble) without guessing: "RT diagnostic capture" in the Luma
-panel (or Ctrl+Shift+F9) records ~10 s into `RTDiag\<time>` next to the game exe. It runs 5 s as is, then 5 s with
+panel (or Ctrl+Shift+Pause; F9 is the game's quickload) records ~10 s into `RTDiag\<time>` next to the game exe. It runs 5 s as is, then 5 s with
 the ray tracing scene frozen, at ~5 captures per second. Each capture holds, from the same frame:
 - `game_shadow`: the game's own screen shadow (its draw run again into a side target, without the RT input);
 - `rt_raw`: the trace before the denoiser (the sun pass's debug output 0);

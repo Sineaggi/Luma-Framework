@@ -34,7 +34,9 @@ struct Capture
    uint32_t w = 0, h = 0;
    std::vector<float> depth;
    std::map<std::string, std::vector<uint8_t>> gray; // game_shadow, rt_raw, rt_denoised
-   std::vector<uint8_t> scene, final_image; // RGB
+   std::vector<uint8_t> scene, final_image, scene_sun; // RGB
+   struct Probe { uint32_t key, flags; double pos[3]; };
+   std::vector<Probe> probes;
 };
 
 static bool Invert(const double m[16], double out[16])
@@ -98,8 +100,21 @@ static bool Load(const fs::path& dir, int index, Capture& c)
    while (std::getline(meta, line))
    {
       const size_t eq = line.find('=');
-      if (eq != std::string::npos)
-         c.meta[line.substr(0, eq)] = line.substr(eq + 1);
+      if (eq == std::string::npos)
+         continue;
+      if (line.substr(0, eq) == "probe")
+      {
+         Capture::Probe probe = {};
+         unsigned key = 0, flags = 0;
+         if (sscanf(line.c_str() + eq + 1, "%X,%u,%lf,%lf,%lf", &key, &flags, &probe.pos[0], &probe.pos[1], &probe.pos[2]) == 5)
+         {
+            probe.key = key;
+            probe.flags = flags;
+            c.probes.push_back(probe);
+         }
+         continue;
+      }
+      c.meta[line.substr(0, eq)] = line.substr(eq + 1);
    }
    c.index = index;
    if (!ParseList(c.meta["view_proj"], c.vp, 16) || !Invert(c.vp, c.inv_vp))
@@ -127,6 +142,9 @@ static bool Load(const fs::path& dir, int index, Capture& c)
    std::vector<uint8_t> s = ReadBytes(dir / (std::string(name) + "_scene.bin"));
    if (s.size() == n * 3)
       c.scene = std::move(s);
+   std::vector<uint8_t> ss = ReadBytes(dir / (std::string(name) + "_scene_sun.bin"));
+   if (ss.size() == n * 3)
+      c.scene_sun = std::move(ss);
    std::vector<uint8_t> f = ReadBytes(dir / (std::string(name) + "_final.bin"));
    if (f.size() == n * 3)
       c.final_image = std::move(f);
@@ -267,6 +285,15 @@ int main(int argc, char** argv)
       for (int s = 0; s < 5; s++)
          pct[s] = 100.0 * flips[s] / compared;
       const double rt_same = scene_same ? 100.0 * rt_flip_scene_same / scene_same : 0.0;
+      // The sun view (orthographic around the camera, so only comparable as is while the camera barely moves)
+      char sun_text[16] = "-";
+      if (!a.scene_sun.empty() && !b.scene_sun.empty() && move < 0.05)
+      {
+         uint64_t changed = 0;
+         for (size_t i = 0; i < size_t(b.w) * b.h; i++)
+            changed += SceneClass(&a.scene_sun[i * 3]) != SceneClass(&b.scene_sun[i * 3]);
+         snprintf(sun_text, sizeof(sun_text), "%.2f%%", 100.0 * changed / (double(b.w) * b.h));
+      }
       Sum& sum = sums[b.phase & 1];
       for (int s = 0; s < 5; s++)
          sum.flips[s] += pct[s];
@@ -275,6 +302,41 @@ int main(int argc, char** argv)
       auto m = [&](const Capture& c, const char* key) { auto it = c.meta.find(key); return it != c.meta.end() ? it->second : std::string("?"); };
       printf("  c%04d-c%04d   %d    %6.2f   %6.1f  %7llu | %15.2f %7.2f %7.2f %7.2f %7.2f | %29.2f | %10s/%-4s | %5s %4s %5s\n", a.index, b.index, b.phase, move, turn, (unsigned long long)compared, pct[0], pct[1], pct[2], pct[3],
          pct[4], rt_same, m(b, "screen_shadows_rt").c_str(), m(b, "screen_shadows_game").c_str(), m(b, "tlas_instances").c_str(), m(b, "new").c_str(), m(b, "evicted").c_str());
+      printf("               sun view flipped %s\n", sun_text);
+   }
+   // Per frame mesh probes: the same mesh drawn by the camera and by a shadow map must land in the same place
+   {
+      struct Pair { double max_gap = 0; int captures = 0; };
+      std::map<uint32_t, Pair> pairs;
+      for (const Capture& c : captures)
+      {
+         std::map<uint32_t, std::vector<const Capture::Probe*>> by_key;
+         for (const auto& p : c.probes)
+            if (!(p.flags & 2)) // Not skinned
+               by_key[p.key].push_back(&p);
+         for (const auto& [key, list] : by_key)
+         {
+            double gap = -1;
+            for (const auto* x : list)
+               for (const auto* y : list)
+                  if ((x->flags & 1) && !(y->flags & 1))
+                  {
+                     const double d = std::sqrt((x->pos[0] - y->pos[0]) * (x->pos[0] - y->pos[0]) + (x->pos[1] - y->pos[1]) * (x->pos[1] - y->pos[1]) + (x->pos[2] - y->pos[2]) * (x->pos[2] - y->pos[2]));
+                     gap = std::max(gap, d);
+                  }
+            if (gap >= 0)
+            {
+               pairs[key].max_gap = std::max(pairs[key].max_gap, gap);
+               pairs[key].captures++;
+            }
+         }
+      }
+      size_t probes = 0;
+      for (const Capture& c : captures)
+         probes += c.probes.size();
+      printf("\nopenables (dynamic per frame meshes) seen from both the camera and a shadow map in the same capture: %zu meshes (%zu probes)\n", pairs.size(), probes);
+      for (const auto& [key, p] : pairs)
+         printf("  mesh %08X: in %d captures, largest gap between the shadow map copy and the camera copy %.3f m%s\n", key, p.captures, p.max_gap, p.max_gap > 0.05 ? "  <-- MISPLACED" : "");
    }
    const char* names[5] = { "game_shadow", "rt_raw", "rt_denoised", "scene", "final" };
    for (int phase = 0; phase < 2; phase++)

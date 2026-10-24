@@ -238,7 +238,10 @@ namespace
    // Skip draws that repeat one captured earlier in the frame (depth prepass + G-buffer pass) (config "RTAODedup")
    bool g_rtao_dedup = true;
    bool g_rtao_recopy_written = false; // Re-copy captured buffers the game rewrites (config "RTAORecopyWrittenBuffers", H3 test)
-   bool g_rtao_freeze_scene = false; // Debug, not saved: trace the last TLAS again every frame (no capture, no rebuild)
+   bool g_rtao_freeze_scene = false;
+   // Popping tests (not saved): openables taken from shadow map draws; shadow map objects not confirmed yet kept 64 frames, not 4
+   bool g_rtdbg_shadow_openables = true;
+   bool g_rtdbg_shadow_young_long = false; // Debug, not saved: trace the last TLAS again every frame (no capture, no rebuild)
    int g_rtao_blas_budget = 64; // New static BLASes built per frame (config "RTAOBlasBudget")
    // Map(WRITE_DISCARD) of game buffers, per recording thread: buffer -> unique id of its last discard. Part of a draw's
    // identity for the dedup, so a per instance buffer rewritten between two draws never makes them look the same.
@@ -282,7 +285,7 @@ namespace
    float g_rtsun_angle = 0.75f; // The light's angular diameter, degrees (config "RTSunAngle"); the real sun is 0.53
    int g_rtsun_rays = 1; // Per pixel per frame (config "RTSunRays")
    int g_rtsun_output = int(RTSun::Output::Denoised); // Config "RTSunOutput"
-   // ---- RT diagnostic capture (RTAO_NOTES.md "Diagnostic capture"): Luma panel button or Ctrl+Shift+F9. About 10 s:
+   // ---- RT diagnostic capture (RTAO_NOTES.md "Diagnostic capture"): Luma panel button or Ctrl+Shift+Pause (not F9: the game's quickload). About 10 s:
    // 5 s as is, then 5 s with the ray tracing scene frozen, ~5 captures per second. Each capture copies, from the SAME
    // frame, the game's own screen shadow (its draw run again into a side target, without the RT input), the RT raw and
    // denoised visibility, the camera scene view (traced into a side target), the depth and the back buffer, and writes
@@ -315,13 +318,14 @@ namespace
       std::string pending_meta;
       std::vector<std::string> timeline;
       uint32_t last_bound = 0, last_stale = 0;
-      RTDiagStage stages[6] = {
+      RTDiagStage stages[7] = {
          { "game_shadow", RTDiag::Kind::Gray, 1 }, // The game's own screen shadow (y of its target)
          { "rt_raw", RTDiag::Kind::Gray, 0 },
          { "rt_denoised", RTDiag::Kind::Gray, 0 }, // What the lighting reads
          { "scene", RTDiag::Kind::Rgb565, 0 },
          { "depth", RTDiag::Kind::DepthPacked, 0 },
          { "final", RTDiag::Kind::Color, 0 },
+         { "scene_sun", RTDiag::Kind::Rgb565, 0 }, // The ray tracing scene seen from the sun (60 m around the camera)
       };
       std::string status = "idle";
    };
@@ -636,6 +640,8 @@ public:
       game_device_data.rtao_capture.dynamic_enabled = g_rtao_dynamic;
       game_device_data.rtao_capture.cutouts_exact = g_rtao_cutouts_exact;
       game_device_data.rtao_capture.dedup_enabled = g_rtao_dedup;
+      game_device_data.rtao_capture.shadow_frame_meshes_enabled = g_rtdbg_shadow_openables;
+      game_device_data.rtao_tlas.shadow_young_retain_frames = g_rtdbg_shadow_young_long ? 64u : RTAO::TlasBuilder::kShadowYoungRetainFrames;
       game_device_data.rtao_last_draw_frame = game_device_data.rtao_frame;
       g_rtao_main_depth_width = depth_desc.Width;
       g_rtao_main_depth_height = depth_desc.Height;
@@ -844,7 +850,7 @@ public:
    static void RTDiagOnPresent(ID3D11Device* native_device, DeviceData& device_data, GameDeviceDataDishonored2& g)
    {
       static bool hotkey_down = false;
-      const bool down = (GetAsyncKeyState(VK_CONTROL) & 0x8000) && (GetAsyncKeyState(VK_SHIFT) & 0x8000) && (GetAsyncKeyState(VK_F9) & 0x8000);
+      const bool down = (GetAsyncKeyState(VK_CONTROL) & 0x8000) && (GetAsyncKeyState(VK_SHIFT) & 0x8000) && (GetAsyncKeyState(VK_PAUSE) & 0x8000);
       if (down && !hotkey_down && !g_rtdiag.active)
          g_rtdiag.start_requested = true;
       hotkey_down = down;
@@ -986,15 +992,17 @@ public:
       {
          g_rtdiag.next = now + std::chrono::milliseconds(int(kRTDiagInterval * 1000.0));
          const int set = int(g_rtdiag.index & 1);
-         com_ptr<ID3D11Resource> sources[6];
+         com_ptr<ID3D11Resource> sources[7];
          {
             const std::lock_guard lock(g_rtdiag.mutex);
-            if (g.rtdiag_game_shadow && g.rtdiag_game_shadow_frame == g.rtao_frame)
+            // Drawn this frame (rtao_frame has already advanced at present)
+            if (g.rtdiag_game_shadow && g.rtdiag_game_shadow_frame + 1 >= g.rtao_frame)
                sources[0] = g.rtdiag_game_shadow.get();
          }
          sources[1] = com_ptr<ID3D11Resource>(RTDiagResource(g.rtsun_pass.GetDebugSRV(0)), true);
          sources[2] = com_ptr<ID3D11Resource>(RTDiagResource(g.rtsun_pass.GetSRV()), true);
          sources[3] = com_ptr<ID3D11Resource>(RTDiagResource(g.rtsun_pass.GetDebugSRV(1)), true);
+         sources[6] = com_ptr<ID3D11Resource>(RTDiagResource(g.rtsun_pass.GetDebugSRV(2)), true);
          if (g.rtao.IsInitialized())
             sources[4] = com_ptr<ID3D11Resource>(RTDiagResource(g.rtao.GetDepthRTV()), true);
          {
@@ -1008,7 +1016,7 @@ public:
             }
          }
          int copied = 0;
-         for (int s = 0; s < 6; s++)
+         for (int s = 0; s < 7; s++)
          {
             RTDiagStage& stage = g_rtdiag.stages[s];
             if (!sources[s])
@@ -1066,6 +1074,10 @@ public:
             add("tlas_instances=%u\nretained=%u\npromoted=%u\nyoung=%u\nmain_only=%u\nshadow_only=%u\nboth=%u\nnew=%u\nevicted=%u\n", g.rtao_tlas_instances.load(), r.promoted + r.young, r.promoted, r.young,
                r.main_only, r.shadow_only, r.both, r.added_new, r.evicted_promoted + r.evicted_young);
             add("frame_meshes=%llu\nmovables_kept=%llu\n", (unsigned long long)stats.frame_draws, (unsigned long long)stats.frame_retained);
+            add("test_shadow_openables=%d\ntest_shadow_young_long=%d\n", int(g_rtdbg_shadow_openables), int(g_rtdbg_shadow_young_long));
+            // Per frame mesh probes: key, flags (1 from a shadow map, 2 skinned), vertex 0 world position
+            for (const auto& probe : g.rtao_capture.GetProbes())
+               add("probe=%08X,%u,%.4f,%.4f,%.4f\n", probe.key, probe.flags, probe.pos[0], probe.pos[1], probe.pos[2]);
             g_rtdiag.pending_meta = meta;
             g_rtdiag.pending_set = set;
             g_rtdiag.pending_index = g_rtdiag.index;
@@ -3488,7 +3500,7 @@ public:
       if (ImGui::IsItemHovered())
          ImGui::SetTooltip("What the trace writes. Check it with \"View AO only\" = RT sun visibility.");
       // Debug (shared with RTAO's scene), next to the sun output where they are used
-      if (ImGui::Button(g_rtdiag.active ? "RT diagnostic capture: running..." : "RT diagnostic capture (10 s, Ctrl+Shift+F9)") && !g_rtdiag.active)
+      if (ImGui::Button(g_rtdiag.active ? "RT diagnostic capture: running..." : "RT diagnostic capture (10 s, Ctrl+Shift+Pause)") && !g_rtdiag.active)
          g_rtdiag.start_requested = true;
       if (ImGui::IsItemHovered())
          ImGui::SetTooltip("Saves ~50 captures over 10 s into RTDiag\\<time> next to the game exe: 5 s as is, then 5 s with the ray tracing scene frozen.\n"
@@ -3500,6 +3512,12 @@ public:
          reshade::set_config_value(runtime, NAME, "RTAORecopyWrittenBuffers", g_rtao_recopy_written);
       if (ImGui::IsItemHovered())
          ImGui::SetTooltip("Test: when the game writes into a vertex/index buffer the ray tracing scene already copied (streamed or pooled\nmeshes), forget the copy so the next draw copies the new contents. Off: the count is still logged (\"RTAO diag\").");
+      ImGui::Checkbox("RT test: openables from the shadow map", &g_rtdbg_shadow_openables);
+      if (ImGui::IsItemHovered())
+         ImGui::SetTooltip("Off: openable windows/doors only enter the ray tracing scene from the camera's draws (not saved).");
+      ImGui::Checkbox("RT test: keep shadow map objects longer", &g_rtdbg_shadow_young_long);
+      if (ImGui::IsItemHovered())
+         ImGui::SetTooltip("On: objects seen in the shadow map but not confirmed yet are kept 64 frames instead of 4 (not saved).");
       ImGui::Checkbox("RT debug: freeze ray tracing scene", &g_rtao_freeze_scene);
       if (ImGui::IsItemHovered())
          ImGui::SetTooltip("Keeps tracing the current ray tracing scene (no new geometry, no removals) until unchecked. Not saved.\n"

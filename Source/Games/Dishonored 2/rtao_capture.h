@@ -160,7 +160,7 @@ namespace RTAO
       uint32_t view_proj_cb;
       float alpha_ref_const;
       uint32_t record_tag; // capture_instances_cs writes it into each instance's flags bits 8..31 (readback check)
-      uint32_t pad2;
+      uint32_t debug_key; // skin_vertices_cs: the mesh key's low bits, for the probe ring
       // skin_vertices_cs only
       uint32_t skin_vertex_count; // Threads: vertices written
       uint32_t skin_dst_vertex; // First vertex in the skinned ring
@@ -329,6 +329,16 @@ namespace RTAO
       void OnPresent();
       // Reads back the skinning shader's counters (a few frames late, never waits). Immediate context, once per frame.
       void PollCounters(ID3D11DeviceContext* immediate);
+      // The last 64 per frame mesh draws (probe ring, read back with the counters): mesh key, flags (1 shadow map, 2 skinned),
+      // world position of vertex 0. The same mesh from the camera and from a shadow map must land in the same place.
+      struct FrameMeshProbe
+      {
+         uint32_t key, flags;
+         float pos[3];
+      };
+      std::vector<FrameMeshProbe> GetProbes() { const std::lock_guard lock(mutex); return probes; }
+      // Test toggle: per frame meshes (openables) from shadow map draws are skipped while this is off
+      std::atomic<bool> shadow_frame_meshes_enabled = true;
       void OnDestroyBuffer(ID3D11Buffer* buffer);
       // The game wrote into a buffer (UpdateSubresource, a copy into it). If the capture copied it already, it is counted
       // and, with "forget", dropped like a destroyed buffer (its meshes' BLASes evicted, copied again at the next draw).
@@ -341,6 +351,7 @@ namespace RTAO
 
       CaptureStats GetStats();
 
+      static constexpr uint32_t kCounterBytes = 32 + 64 * 32; // FrameCounters: counters, then the probe ring
       static constexpr uint32_t kRingSlots = 1u << 18; // 64 bytes each: 16 MB
       static constexpr uint32_t kReadbackSlots = 1u << 17; // Instances per frame read back: 8 MB per frame slot (main view + shadow maps)
       static constexpr uint32_t kFrameSlots = 3;
@@ -428,6 +439,7 @@ namespace RTAO
       ID3D11UnorderedAccessView* counters_uav = nullptr;
       ID3D11Buffer* counters_staging[3] = {};
       uint32_t counters_frame = 0;
+      std::vector<FrameMeshProbe> probes;
       ID3D11Buffer* skin_ring11 = nullptr;
       ID3D11UnorderedAccessView* skin_ring_uav = nullptr;
       ID3D12Resource* skin_ring12 = nullptr;

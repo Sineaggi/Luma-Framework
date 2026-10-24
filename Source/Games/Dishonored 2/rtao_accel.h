@@ -241,6 +241,7 @@ namespace RTAO
       uint32_t retain_frames = kRetainFrames;
       uint32_t promote_frames = kPromoteFrames;
       uint32_t young_retain_frames = kYoungRetainFrames;
+      uint32_t shadow_young_retain_frames = kShadowYoungRetainFrames; // Test toggle "keep shadow map objects longer"
 
    private:
       struct Instance

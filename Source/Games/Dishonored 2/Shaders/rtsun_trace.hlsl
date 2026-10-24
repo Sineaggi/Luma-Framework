@@ -73,7 +73,7 @@ float3 SourceColor(uint flags, bool cutout)
     if (flags & kFlagSkinned)
         c = float3(1.0, 0.25, 0.25); // Skinned character (per frame): red
     else if (flags & kFlagFrameMesh)
-        c = float3(0.95, 0.3, 0.95); // Dynamic vertex buffer (doors, windows; per frame): magenta
+        c = (flags & 3u) == kSourceShadow ? float3(0.5, 0.25, 1.0) : float3(0.95, 0.3, 0.95); // Dynamic vertex buffer (doors, windows; per frame): magenta, from a shadow map purple
     else if ((flags & 3u) == kSourceShadow)
         c = (flags & kFlagMvp) ? float3(1.0, 1.0, 0.2) : float3(1.0, 0.6, 0.1); // Only seen in shadow maps: orange (MVP: yellow)
     else if ((flags & 3u) == (kSourceMain | kSourceShadow))

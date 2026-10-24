@@ -107,7 +107,7 @@ namespace RTSun
       // The shared visibility texture (R16_UNORM, or R8_UNORM), AddRef'd. Null until EnsureTargets succeeded.
       ID3D11ShaderResourceView* GetSRV();
       // Diagnostic capture: EnsureTargets also creates the debug targets while this is set. GetDebugSRV(0): raw visibility,
-      // (1): scene view from the camera (RGB565), AddRef'd, null if not created.
+      // (1): scene view from the camera, (2): scene view from the sun (RGB565), AddRef'd, null if not created.
       void SetDebugOutputs(bool enabled) { debug_requested = enabled; }
       ID3D11ShaderResourceView* GetDebugSRV(uint32_t index);
       DXGI_FORMAT GetVisFormat() const { return vis_format; }
@@ -163,11 +163,11 @@ namespace RTSun
       ID3D11ShaderResourceView* srv11 = nullptr;
       // Diagnostic capture targets (created by EnsureTargets while debug_requested)
       std::atomic<bool> debug_requested = false;
-      ID3D12Resource* dbg_vis[2] = {}; // vis_format UAVs: raw, scene view
+      ID3D12Resource* dbg_vis[3] = {}; // vis_format UAVs: raw, scene view from the camera, from the sun
       ID3D12Resource* dbg_hist = nullptr; // R32G32_UINT scratch the filter writes in its "off" mode (keeps the real history)
-      ID3D12Resource* dbg_shared12[2] = {};
-      ID3D11Texture2D* dbg_shared11[2] = {};
-      ID3D11ShaderResourceView* dbg_srv11[2] = {};
+      ID3D12Resource* dbg_shared12[3] = {};
+      ID3D11Texture2D* dbg_shared11[3] = {};
+      ID3D11ShaderResourceView* dbg_srv11[3] = {};
       std::vector<IUnknown*> graveyard; // D3D12 objects to retire at the next Record
 
       // Descriptors (recorder thread). Per history parity p, 5 from p * 5: [depth SRV, raw UAV, vis UAV, hist prev, hist cur],

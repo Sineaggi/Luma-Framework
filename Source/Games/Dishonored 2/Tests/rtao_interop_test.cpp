@@ -1766,6 +1766,17 @@ static void TestFrameMeshes(ID3D11Device* device, ID3D11DeviceContext* context, 
       printf("frame mesh GPU counters: main view %llu (rejected %llu), shadow maps %llu (rejected %llu)\n", (unsigned long long)kept.gpu_main_frame, (unsigned long long)kept.gpu_main_frame_rejected,
          (unsigned long long)kept.gpu_shadow_frame, (unsigned long long)kept.gpu_shadow_frame_rejected);
       CHECK(kept.gpu_main_frame > 0 && kept.gpu_main_frame_rejected == 0 && kept.gpu_shadow_frame == 0, "frame mesh GPU counters");
+      // Probe ring: vertex 0 of each per frame mesh draw, in world space (the dynamic box E's vertex 0 is its min corner)
+      const auto probes = capture.GetProbes();
+      int e_found = 0;
+      for (const auto& probe : probes)
+      {
+         const Box& e = scene[0][kE];
+         if (!(probe.flags & 2) && std::fabs(probe.pos[0] - e.min.x) < 1e-3f && std::fabs(probe.pos[1] - e.min.y) < 1e-3f && std::fabs(probe.pos[2] - e.min.z) < 1e-3f)
+            e_found++;
+      }
+      printf("frame mesh probes: %zu, dynamic box E's vertex 0 found in %d\n", probes.size(), e_found);
+      CHECK(!probes.empty() && e_found > 0, "probes must hold the dynamic mesh's world position");
    }
 
    CHECK(interop.WaitForIdle(5000), "WaitForIdle");

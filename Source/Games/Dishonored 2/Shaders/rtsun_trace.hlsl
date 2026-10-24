@@ -83,19 +83,27 @@ float4 ShadowMatrixRow(uint c, uint r)
     return float4(LoadShadowValue(p), LoadShadowValue(p + uint2(1, 0)), LoadShadowValue(p + uint2(2, 0)), LoadShadowValue(p + uint2(3, 0)));
 }
 
-// Does the game's own shadow map agree something blocks the sun at p (a hit on an object the game never drew into it)?
-// True if, in the finest cascade covering p, the map holds a surface at p's light depth or nearer the light (p is on a
-// caster, or in the shadow of one), within ShadowTolerance plus two texels' worth, over p's 3x3 texels. A sun ray keeps
-// its light space xy, so this is the texel of the receiver the ray left from. Outside the cascades: true (no say).
-bool GameShadowConfirms(float3 p)
+// Does the game's own shadow map agree something blocks the sun at p (a hit on an object the game never drew into it,
+// on a ray from "receiver")? The cascade is the one the game's screen shadows use for the receiver (how many of its
+// slice fars the receiver's view depth reaches): the cascades hold different geometry, so another one can disagree with
+// the game's own shadow. True if that cascade holds a surface at p's light depth or nearer the light (p is on a caster,
+// or in the shadow of one), within ShadowTolerance plus two texels' worth, over p's 3x3 texels. A sun ray keeps its
+// light space xy, so this is the receiver's texel. Beyond the copied cascades or outside it: true (no say).
+bool GameShadowConfirms(float3 receiver, float3 p)
 {
-    [loop]
-    for (uint c = 0; c < ShadowCascades; c++)
+    const uint2 extra = uint2(ShadowCascades * 16, ShadowSize.y * ShadowCascades);
+    float4 fars = float4(LoadShadowValue(extra), LoadShadowValue(extra + uint2(1, 0)), LoadShadowValue(extra + uint2(2, 0)), LoadShadowValue(extra + uint2(3, 0)));
+    float4 view_z_axis = float4(LoadShadowValue(extra + uint2(4, 0)), LoadShadowValue(extra + uint2(5, 0)), LoadShadowValue(extra + uint2(6, 0)), LoadShadowValue(extra + uint2(7, 0)));
+    float view_z = dot(float4(receiver, 1.0), view_z_axis);
+    uint4 beyond = select(-view_z >= fars, uint4(1, 1, 1, 1), uint4(0, 0, 0, 0));
+    uint c = beyond.x + beyond.y + beyond.z + beyond.w;
+    [branch]
+    if (c < ShadowCascades)
     {
         float4 r0 = ShadowMatrixRow(c, 0), r1 = ShadowMatrixRow(c, 1), r2 = ShadowMatrixRow(c, 2), r3 = ShadowMatrixRow(c, 3);
         float3 ls = p.x * r0.xyz + p.y * r1.xyz + p.z * r2.xyz + r3.xyz;
         if (any(ls.xy <= 0.0) || any(ls.xy >= 1.0) || ls.z <= 0.0 || ls.z >= 1.0)
-            continue;
+            return true;
         float depth_per_unit = length(float3(r0.z, r1.z, r2.z));
         float texel_units = 1.0 / (float(ShadowSize.x) * max(length(float3(r0.x, r1.x, r2.x)), 1e-9));
         float tolerance = (ShadowTolerance + 2.0 * texel_units) * depth_per_unit;
@@ -140,8 +148,105 @@ bool CandidateBlocks(uint instance_id, uint flags, uint instance_index, uint pri
         return t > kSkinSelfDistance; // A character, beyond its own surface
     }
     if (consult && (flags & kFlagCameraOnly) != 0)
-        return GameShadowConfirms(origin + dir * t);
+        return GameShadowConfirms(origin, origin + dir * t);
     return true;
+}
+
+// ---- Shadow map reproduction (diagnostics, RTSun::Output::ShadowRepro): for a grid of texels of the game's sun cascades
+// 0..kReproCascades-1, a ray from the light side through the texel, against our scene, compared with the game's own
+// shadow map depth there. Two variants: only instances drawn in a shadow map (variant 0), and everything (variant 1).
+// One uint per texel in Repro: bits 0-1 code of variant 0, 2-3 code of variant 1 (0 match, 1 missing: the game has a
+// surface nearer the light than ours, 2 extra: ours is nearer than the game's), 4-31 instance index + 1 of the variant 1
+// hit when variant 0 is "missing" (what we left out, 0: nothing in our scene), else of the variant 0 hit.
+static const uint kDebugShadowRepro = 9;
+static const uint kReproGrid = 512; // Per cascade side; must match RTSun::kReproGrid
+static const uint kReproCascades = 2;
+RWStructuredBuffer<uint> Repro : register(u5);
+
+// World position of light space ls in cascade rows r0..r3 (ls = x * r0 + y * r1 + z * r2 + r3)
+float3 ShadowToWorld(float3 r0, float3 r1, float3 r2, float3 r3, float3 ls)
+{
+    // Row vector: (ls - r3) = p * A, A's rows r0, r1, r2; p = (ls - r3) * inverse(A)
+    // inverse(A) has the columns c0 = r1 x r2, c1 = r2 x r0, c2 = r0 x r1 over det, so p.j = dot(ls - r3, cj) / det
+    float3 c0 = cross(r1, r2), c1 = cross(r2, r0), c2 = cross(r0, r1);
+    float det = dot(r0, c0);
+    float3 v = ls - r3;
+    return float3(dot(v, c0), dot(v, c1), dot(v, c2)) / det;
+}
+
+void ShadowRepro(uint2 id)
+{
+    uint c = id.x / kReproGrid;
+    uint2 g = uint2(id.x % kReproGrid, id.y);
+    if (c >= kReproCascades || c >= ShadowCascades || g.y >= kReproGrid || ShadowConsult == 0)
+        return;
+    uint step = max(ShadowSize.x / kReproGrid, 1u);
+    uint2 texel = min(g * step + step / 2, ShadowSize - 1);
+    float4 r0 = ShadowMatrixRow(c, 0), r1 = ShadowMatrixRow(c, 1), r2 = ShadowMatrixRow(c, 2), r3 = ShadowMatrixRow(c, 3);
+    float2 uv = (float2(texel) + 0.5) / float2(ShadowSize);
+    float z_start = ShadowReversed != 0 ? 1.0 : 0.0; // The light side
+    float3 a = ShadowToWorld(r0.xyz, r1.xyz, r2.xyz, r3.xyz, float3(uv, z_start));
+    float3 b = ShadowToWorld(r0.xyz, r1.xyz, r2.xyz, r3.xyz, float3(uv, 1.0 - z_start));
+    float3 d = b - a;
+    float len = max(length(d), 1e-6);
+    // Distances along the ray in units of the cascade's depth range (s = 0 at the light side plane, 1 at the far one).
+    // The ray starts 50 world units before the plane (the game clamps casters in front of it onto it).
+    float back = 50.0 / len;
+    // The game's depth over the texel's 3x3 neighbourhood, as s
+    float gmin = 1e30, gmax = -1e30;
+    [unroll]
+    for (int dy = -1; dy <= 1; dy++)
+    {
+        [unroll]
+        for (int dx = -1; dx <= 1; dx++)
+        {
+            int2 q = clamp(int2(texel) + int2(dx, dy), int2(0, 0), int2(ShadowSize) - 1);
+            float v = LoadShadowValue(uint2(q.x, uint(q.y) + c * ShadowSize.y));
+            float s = ShadowReversed != 0 ? 1.0 - v : v;
+            gmin = min(gmin, s);
+            gmax = max(gmax, s);
+        }
+    }
+    float tolerance = (ShadowTolerance + 0.05) / len;
+    uint packed = 0;
+    uint id0 = 0, id1 = 0;
+    uint codes[2];
+    [unroll]
+    for (uint v = 0; v < 2; v++)
+    {
+        RayDesc ray;
+        ray.Origin = a - d * back;
+        ray.Direction = d;
+        ray.TMin = 0.0;
+        ray.TMax = 1.0 + back;
+        RayQuery<RAY_FLAG_SKIP_PROCEDURAL_PRIMITIVES | RAY_FLAG_FORCE_NON_OPAQUE> q;
+        q.TraceRayInline(Scene, RAY_FLAG_FORCE_NON_OPAQUE, 0xFF, ray);
+        uint guard = 0;
+        while (q.Proceed() && guard++ < 1024)
+        {
+            uint flags = q.CandidateInstanceContributionToHitGroupIndex();
+            if (v == 0 && (flags & kSourceShadow) == 0)
+                continue;
+            if ((q.CandidateInstanceID() & kInstanceIdCutoutBit) != 0 && (flags & kFlagFrameMesh) == 0)
+            {
+                int solid = CutoutAlphaTest(q.CandidateInstanceID(), q.CandidatePrimitiveIndex(), q.CandidateTriangleBarycentrics());
+                if (solid == 0)
+                    continue;
+            }
+            q.CommitNonOpaqueTriangleHit();
+        }
+        bool hit = q.CommittedStatus() == COMMITTED_TRIANGLE_HIT;
+        float s = hit ? max(q.CommittedRayT() - back, 0.0) : 1.0;
+        codes[v] = s > gmax + tolerance ? 1u : (s < gmin - tolerance ? 2u : 0u);
+        uint hid = hit ? min(q.CommittedInstanceIndex() + 1, 0x0FFFFFFFu) : 0;
+        if (v == 0)
+            id0 = hid;
+        else
+            id1 = hid;
+    }
+    uint shown = codes[0] == 1 ? id1 : id0;
+    Repro[(c * kReproGrid + g.y) * kReproGrid + g.x] = codes[0] | (codes[1] << 2) | (shown << 4);
+    CutoutFlushCounters();
 }
 
 float PackRGB565(float3 c)
@@ -212,6 +317,11 @@ void DebugScene(uint2 px, bool from_sun)
 void main(uint3 id : SV_DispatchThreadID)
 {
     uint2 px = id.xy;
+    if (DebugMode == kDebugShadowRepro)
+    {
+        ShadowRepro(px);
+        return;
+    }
     if (any(px >= Size))
         return;
     if (DebugMode == kDebugSceneView || DebugMode == kDebugSceneSun)

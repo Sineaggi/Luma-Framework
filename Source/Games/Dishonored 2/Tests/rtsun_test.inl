@@ -252,8 +252,10 @@ static void TestSunShadows(ID3D11Device* device, ID3D11DeviceContext* context, R
       for (UINT i = 0; i < W * H; i++)
          dark += (is_receiver(i) && camera_only[i] < 0.5f) ? 1 : 0; // Receivers face the light: only a caster can darken them
       // 0b) Shadow map check: the boxes are still camera only. A sun ray hitting one blocks only where the game's shadow map
-      //     (here rendered on the CPU, copied through Luma_RTSunShadowCopy.hlsl) has a surface there. With a map of the
-      //     whole scene they shadow as casters; with a map of the ground alone, not at all; reversed depth the same.
+      //     (here rendered on the CPU, copied through Luma_RTSunShadowCopy.hlsl) has a surface there, in the cascade the
+      //     game would use for the receiver (picked with its slice fars and view matrix, here forced to one cascade). With
+      //     a map of the whole scene they shadow as casters; with a map of the ground alone, not at all; reversed depth the
+      //     same; and only the selected cascade counts, not the finest one.
       {
          settings.casters_only = false;
          tlas.camera_only_non_opaque = true;
@@ -261,7 +263,7 @@ static void TestSunShadows(ID3D11Device* device, ID3D11DeviceContext* context, R
          const V3 center = { 0, 1, 0 };
          const V3 lt = Normalize(std::fabs(L.z) < 0.999f ? Cross(L, { 0, 0, 1 }) : V3{ 1, 0, 0 });
          const V3 lb = Cross(L, lt);
-         const float extents[RTSun::kShadowCascades] = { 6.f, 24.f, 48.f }; // Cascade 0 covers box 1 only: the rest falls through
+         const float extents[RTSun::kShadowCascades] = { 40.f, 44.f, 48.f };
          const float D0 = 30.f, R = 60.f;
          ID3DBlob* copy_code = Compile(L"..\\..\\..\\..\\Shaders\\Dishonored 2\\Luma_RTSunShadowCopy.hlsl", "shadow_copy_ps", "ps_5_0");
          ID3DBlob* pack_code = Compile(L"..\\..\\..\\..\\Shaders\\Dishonored 2\\Luma_RTSunShadowCopy.hlsl", "shadow_pack_ps", "ps_5_0");
@@ -273,10 +275,15 @@ static void TestSunShadows(ID3D11Device* device, ID3D11DeviceContext* context, R
          pack_code->Release();
          CHECK(sun.EnsureShadowTarget(device, N, N, error), "EnsureShadowTarget: %s", error.c_str());
 
-         // Renders the map (boxes from first_box on, box 0 is the ground) and copies it as the game's screen shadows draw would
-         auto upload_map = [&](int first_box, bool reversed) {
+         // Renders the map (cascade c: boxes from first_box[c] on, box 0 is the ground) and copies it as the game's screen
+         // shadows draw would. Every receiver picks cascade "selected" (view depth 5, slice fars around it).
+         auto upload_map = [&](const int first_box[RTSun::kShadowCascades], bool reversed, uint32_t selected) {
             std::vector<float> slices(size_t(N) * N * 4, reversed ? 0.f : 1.f);
             float cb[100] = {}; // PerInstanceCB: c0 slice fars, c1.. cb_shadowprojections
+            for (uint32_t k = 0; k < 4; k++)
+               cb[k] = k < selected ? 0.f : 100.f;
+            float view_cb[40] = {}; // PerViewCB up to c9: cb_viewmatrix at c6..c9, its z column (0, 0, 0, -5): view z -5
+            view_cb[(6 + 3) * 4 + 2] = -5.f;
             for (uint32_t c = 0; c < RTSun::kShadowCascades; c++)
             {
                const float E = extents[c];
@@ -302,7 +309,7 @@ static void TestSunShadows(ID3D11Device* device, ID3D11DeviceContext* context, R
                      float best = 1e30f;
                      for (int b = 0; b < kBoxCount; b++)
                      {
-                        if (b != 0 && b < first_box)
+                        if (b != 0 && b < first_box[c])
                            continue;
                         float th;
                         if (RayBox(o, d, kBoxes[b], th) && th < best)
@@ -320,10 +327,15 @@ static void TestSunShadows(ID3D11Device* device, ID3D11DeviceContext* context, R
             device->CreateTexture2D(&desc, data, &array);
             ID3D11ShaderResourceView* array_srv = nullptr;
             device->CreateShaderResourceView(array, nullptr, &array_srv);
-            D3D11_BUFFER_DESC cb_desc = { sizeof(cb), D3D11_USAGE_DEFAULT, D3D11_BIND_CONSTANT_BUFFER, 0, 0, 0 };
-            D3D11_SUBRESOURCE_DATA cb_data = { cb, 0, 0 };
-            ID3D11Buffer* cb_buffer = nullptr;
-            device->CreateBuffer(&cb_desc, &cb_data, &cb_buffer);
+            ID3D11Buffer* cbs[2] = {};
+            const void* cb_contents[2] = { view_cb, cb };
+            const UINT cb_sizes[2] = { sizeof(view_cb), sizeof(cb) };
+            for (int i = 0; i < 2; i++)
+            {
+               D3D11_BUFFER_DESC cb_desc = { cb_sizes[i], D3D11_USAGE_DEFAULT, D3D11_BIND_CONSTANT_BUFFER, 0, 0, 0 };
+               D3D11_SUBRESOURCE_DATA cb_data = { cb_contents[i], 0, 0 };
+               device->CreateBuffer(&cb_desc, &cb_data, &cbs[i]);
+            }
             bool packed = false;
             ID3D11RenderTargetView* rtv = sun.GetShadowRTV(&packed);
             CHECK(rtv, "shadow map check target");
@@ -334,18 +346,19 @@ static void TestSunShadows(ID3D11Device* device, ID3D11DeviceContext* context, R
             context->VSSetShader(copy_vs, nullptr, 0);
             context->PSSetShader(packed ? shadow_pack_ps : shadow_copy_ps, nullptr, 0);
             context->PSSetShaderResources(0, 1, &array_srv);
-            context->PSSetConstantBuffers(2, 1, &cb_buffer);
+            context->PSSetConstantBuffers(1, 2, cbs); // b1 PerViewCB, b2 PerInstanceCB
             context->Draw(4, 0);
             ID3D11RenderTargetView* null_rtv = nullptr;
             ID3D11ShaderResourceView* null_srv = nullptr;
-            ID3D11Buffer* null_cb = nullptr;
+            ID3D11Buffer* null_cbs[2] = {};
             context->OMSetRenderTargets(1, &null_rtv, nullptr);
             context->PSSetShaderResources(0, 1, &null_srv);
-            context->PSSetConstantBuffers(2, 1, &null_cb);
+            context->PSSetConstantBuffers(1, 2, null_cbs);
             rtv->Release();
             array_srv->Release();
             array->Release();
-            cb_buffer->Release();
+            cbs[0]->Release();
+            cbs[1]->Release();
             settings.shadow_reversed = reversed;
             return packed;
          };
@@ -355,27 +368,60 @@ static void TestSunShadows(ID3D11Device* device, ID3D11DeviceContext* context, R
                n_dark += (is_receiver(i) && vis[i] < 0.5f) ? 1 : 0;
             return n_dark;
          };
+         const int full[3] = { 1, 1, 1 }, ground[3] = { kBoxCount, kBoxCount, kBoxCount };
+         const int c0_ground_c1_full[3] = { kBoxCount, 1, kBoxCount }, c0_full_c1_ground[3] = { 1, kBoxCount, 1 };
 
          settings.shadow_consult = false;
          const int all_block = count_dark(run_frame()); // Camera only boxes, no check: they block like casters
          settings.shadow_consult = true;
-         const bool packed = upload_map(1, false);
+         const bool packed = upload_map(full, false, 0);
          const int full_map = count_dark(run_frame());
-         upload_map(kBoxCount, false); // The ground only
+         // Shadow map reproduction against the same map: with every instance it must match; shadow map instances only (none
+         // here, the boxes are camera only) must report the boxes as missing
+         {
+            settings.shadow_repro = true;
+            for (int i = 0; i < 5; i++)
+               run_frame();
+            settings.shadow_repro = false;
+            std::vector<uint32_t> repro;
+            uint32_t repro_trace = 0;
+            CHECK(sun.GetShadowRepro(repro, repro_trace), "shadow map reproduction read back");
+            size_t all_match = 0, all_total = 0, only_missing = 0, missing_with_id = 0;
+            for (size_t i = 0; i < repro.size(); i++)
+            {
+               all_total++;
+               all_match += ((repro[i] >> 2) & 3) == 0;
+               only_missing += (repro[i] & 3) == 1;
+               missing_with_id += (repro[i] & 3) == 1 && (repro[i] >> 4) != 0;
+            }
+            printf("RT sun shadow map reproduction: all instances match %zu of %zu texels; shadow map instances only: missing %zu (%zu name an instance)\n", all_match, all_total, only_missing, missing_with_id);
+            CHECK(repro.size() == size_t(RTSun::kReproCascades) * RTSun::kReproGrid * RTSun::kReproGrid && all_match > all_total * 99 / 100, "reproduction with every instance must match");
+            CHECK(only_missing > 1000 && missing_with_id == only_missing, "reproduction without camera only instances must name the boxes as missing");
+         }
+         upload_map(ground, false, 0);
          const int ground_map = count_dark(run_frame());
          settings.shadow_tolerance = 0.f;
          const int ground_map_tight = count_dark(run_frame());
          settings.shadow_tolerance = 0.1f;
-         upload_map(1, true);
+         upload_map(full, true, 0);
          const int reversed_map = count_dark(run_frame());
-         printf("RT sun shadow map check (%s copy): dark receiver pixels: no check %d, full map %d, ground only map %d (tolerance 0: %d), full map reversed depth %d\n",
-            packed ? "packed" : "float", all_block, full_map, ground_map, ground_map_tight, reversed_map);
+         upload_map(c0_ground_c1_full, false, 1); // The game uses cascade 1, which has the boxes (cascade 0 doesn't)
+         const int selected_full = count_dark(run_frame());
+         upload_map(c0_full_c1_ground, false, 1); // The game uses cascade 1, without the boxes (cascade 0 has them)
+         const int selected_ground = count_dark(run_frame());
+         upload_map(full, false, 3); // Beyond the copied cascades: no say, the hits count
+         const int beyond = count_dark(run_frame());
+         printf("RT sun shadow map check (%s copy): dark receiver pixels: no check %d, full map %d, ground only map %d (tolerance 0: %d), reversed depth %d;"
+                " cascade 1 selected: with the boxes %d, without %d; beyond the cascades %d\n",
+            packed ? "packed" : "float", all_block, full_map, ground_map, ground_map_tight, reversed_map, selected_full, selected_ground, beyond);
          CHECK(all_block > 1000, "camera only boxes must block without the check (%d)", all_block);
          CHECK(std::abs(full_map - all_block) < all_block / 50, "with the full shadow map, camera only boxes must shadow as casters (%d vs %d)", full_map, all_block);
          // Without the boxes in the map only a contact band stays: a hit within the tolerance (plus two texels) of the
          // receiver passes, as the receiver's own surface is there
-         CHECK(ground_map < all_block / 6 && ground_map_tight < ground_map, "with a shadow map without the boxes, camera only boxes must not block (%d, tolerance 0: %d)", ground_map, ground_map_tight);
+         CHECK(ground_map < all_block / 4 && ground_map_tight < ground_map, "with a shadow map without the boxes, camera only boxes must not block (%d, tolerance 0: %d)", ground_map, ground_map_tight);
          CHECK(std::abs(reversed_map - full_map) < all_block / 100, "reversed depth must match (%d vs %d)", reversed_map, full_map);
+         CHECK(std::abs(selected_full - all_block) < all_block / 50 && selected_ground < all_block / 4, "the game's cascade must decide, not the finest (%d, %d)", selected_full, selected_ground);
+         CHECK(std::abs(beyond - all_block) < all_block / 50, "beyond the copied cascades hits must count (%d vs %d)", beyond, all_block);
          settings.shadow_consult = false;
          settings.shadow_reversed = false;
          tlas.camera_only_non_opaque = false;

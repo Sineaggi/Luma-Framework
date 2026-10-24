@@ -65,6 +65,10 @@ namespace RTSun
 
    // Shadow map check: the game's sun cascades copied for the trace (Shaders/Dishonored 2/Luma_RTSunShadowCopy.hlsl)
    constexpr uint32_t kShadowCascades = 3;
+   // Shadow map reproduction (diagnostics): a kReproGrid x kReproGrid grid of texels per cascade, cascades 0..kReproCascades-1
+   // (rtsun_trace.hlsl ShadowRepro: one uint per texel, codes and blocker id)
+   constexpr uint32_t kReproGrid = 512;
+   constexpr uint32_t kReproCascades = 2;
 
    enum class Output : uint32_t
    {
@@ -77,6 +81,7 @@ namespace RTSun
       SceneSun = 6, // The same, seen from the sun (orthographic, 60 m around the camera): what the shadow rays can hit (debug)
       Blocker = 7, // One hard shadow ray per pixel: the TLAS index + 1 of what it hits first, 0 if lit (16 bit id, debug)
       BlockerAll = 8, // The same ray with every instance (the "casters only" mask off): what a missing caster would be (debug)
+      ShadowRepro = 9, // Internal: the shadow map reproduction dispatch (SunSettings::shadow_repro)
       Count
    };
 
@@ -112,6 +117,8 @@ namespace RTSun
       bool shadow_consult = false;
       bool shadow_reversed = false;
       float shadow_tolerance = 0.1f;
+      // Diagnostics: trace the game's shadow map texels against our scene (needs the shadow target; GetShadowRepro)
+      bool shadow_repro = false;
    };
 
    class SunPass
@@ -137,6 +144,17 @@ namespace RTSun
       // the R8G8B8A8_UNORM fallback (Luma_RTSunShadowCopy.hlsl shadow_pack_ps), else R32_FLOAT (shadow_copy_ps).
       bool EnsureShadowTarget(ID3D11Device* device11, uint32_t slice_width, uint32_t slice_height, std::string& error);
       ID3D11RenderTargetView* GetShadowRTV(bool* packed = nullptr);
+      // The latest shadow map reproduction read back (a few frames late): kReproCascades * kReproGrid^2 values, and the
+      // pass number (TraceCount) it was traced on. False if none.
+      bool GetShadowRepro(std::vector<uint32_t>& out, uint32_t& out_trace)
+      {
+         const std::lock_guard lock(repro_mutex);
+         if (repro_latest.empty())
+            return false;
+         out = repro_latest;
+         out_trace = repro_latest_trace;
+         return true;
+      }
       DXGI_FORMAT GetVisFormat() const { return vis_format; }
 
       // Inside an Interop recorder, after the TLAS of the frame was built: trace + filter into the private texture,
@@ -155,6 +173,7 @@ namespace RTSun
 
    private:
       bool EnsureHeap(const RTAO::RecordInfo& info, RTAO::Retirer& retirer, std::string& error);
+      bool EnsureRepro(); // Under "mutex", recorder thread
       void ReleaseTargetsLocked(); // Moves the D3D12 objects to the graveyard
 
       std::mutex mutex; // Targets (EnsureTargets vs Record)
@@ -204,6 +223,14 @@ namespace RTSun
       bool shadow_packed = false;
       uint32_t shadow_version = 0;
       uint32_t heap_shadow_version = UINT32_MAX;
+      // Shadow map reproduction: UAV buffer, readback ring (per constants slot), latest result
+      ID3D12Resource* repro_buffer = nullptr;
+      ID3D12Resource* repro_readback[kSlots] = {};
+      bool repro_pending[kSlots] = {};
+      uint32_t repro_trace[kSlots] = {};
+      std::mutex repro_mutex;
+      std::vector<uint32_t> repro_latest;
+      uint32_t repro_latest_trace = 0;
 
       // Descriptors (recorder thread). Per history parity p, 5 from p * 5: [depth SRV, raw UAV, vis UAV, hist prev, hist cur],
       // then [10] the cutout atlas SRV, then the debug tables from 11 + 5 * i: [depth SRV, raw UAV, dbg_vis[i], hist, dbg_hist],

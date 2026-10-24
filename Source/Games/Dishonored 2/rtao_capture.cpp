@@ -1318,11 +1318,22 @@ namespace RTAO
       return true;
    }
 
+   namespace
+   {
+      thread_local const char* t_capture_outcome = "unknown";
+      const char* const kSkipNames[kSkipCount] = { "shader", "format", "buffer", "arena_full", "ring_full", "binding", "other" };
+   }
+
+   const char* GeometryCapture::LastOutcome() { return t_capture_outcome; }
+
    bool GeometryCapture::CaptureDraw(ID3D11DeviceContext* context, const DrawInfo& draw)
    {
+      t_capture_outcome = "not_ready";
       if (!ring11)
          return false;
+      t_capture_outcome = "unknown";
       auto skip = [&](CaptureSkip reason) {
+         t_capture_outcome = kSkipNames[reason];
          const std::lock_guard lock(mutex);
          stats.draws_seen++;
          stats.skipped[reason]++;
@@ -1344,6 +1355,7 @@ namespace RTAO
       const bool frame_mesh = draw.vs->skinned || dynamic_vertices;
       if (draw.shadow_view && frame_mesh && !shadow_frame_meshes_enabled.load(std::memory_order_relaxed))
       {
+         t_capture_outcome = "shadow_frame_mesh_off";
          const std::lock_guard lock(mutex);
          stats.shadow_skipped++;
          return false;
@@ -1353,6 +1365,7 @@ namespace RTAO
       // derived matrix on the GPU (NaN vertices, inactive in DXR).
       if (draw.shadow_view && draw.vs->skinned)
       {
+         t_capture_outcome = "shadow_skinned";
          const std::lock_guard lock(mutex);
          stats.shadow_skipped++;
          stats.shadow_skipped_skinned++;
@@ -1400,6 +1413,7 @@ namespace RTAO
          auto seen = frame_identities.find(identity);
          if (seen != frame_identities.end() && (!frame_mesh || seen->second == context))
          {
+            t_capture_outcome = "dedup";
             if (frame_mesh)
                TraceMeshLocked(key, 'D', context, draw.vs->skinned);
             (frame_mesh ? stats.dedup_frame_meshes : stats.dedup_draws)++;
@@ -1464,12 +1478,14 @@ namespace RTAO
             const uint64_t vertex_zero_u = uint64_t(vertex_zero);
             if (vertex_start + FormatSize(draw.position_format) > vb_desc.ByteWidth || index_start + uint64_t(draw.index_count) * index_size > ib_desc.ByteWidth)
             {
+               t_capture_outcome = "buffer_range";
                stats.skipped[kSkipBuffer]++;
                return false;
             }
             if (!EnsureBufferCopy(context, draw.vertex_buffer, true, local) || !EnsureBufferCopy(context, draw.index_buffer, false, local))
             {
                const bool dynamic = vb_desc.Usage == D3D11_USAGE_DYNAMIC || ib_desc.Usage == D3D11_USAGE_DYNAMIC;
+               t_capture_outcome = dynamic ? "buffer_dynamic" : "arena_full";
                stats.skipped[dynamic ? kSkipBuffer : kSkipArenaFull]++;
                // A copy may have been recorded for one of the two: keep its record
                QueueLocked(context, local);
@@ -1542,9 +1558,11 @@ namespace RTAO
          record.mvp = source == MatrixSource::MvpConstantBuffer;
          record.tag = record_tag;
          record.shadow_slice = draw.shadow_slice;
+         record.redraw_pass = draw.redraw_pass;
          local.push_back(record);
          if (identity)
             frame_identities.emplace(identity, context);
+         t_capture_outcome = "captured";
          stats.draws_captured++;
          stats.instances_captured += draw.instance_count;
          if (draw.shadow_view)
@@ -1566,6 +1584,7 @@ namespace RTAO
       }
       else
       {
+         t_capture_outcome = "dispatch_failed";
          stats.skipped[kSkipOther]++;
       }
       QueueLocked(context, local);
@@ -1631,6 +1650,7 @@ namespace RTAO
    {
       const bool skinned = draw.vs->skinned;
       auto skip = [&](CaptureSkip reason) {
+         t_capture_outcome = kSkipNames[reason];
          const std::lock_guard lock(mutex);
          stats.draws_seen++;
          stats.skipped[reason]++;
@@ -1640,6 +1660,7 @@ namespace RTAO
       {
          const std::lock_guard lock(mutex);
          stats.draws_seen++;
+         t_capture_outcome = "frame_instanced";
          (skinned ? stats.skinned_instanced : stats.dynamic_instanced)++;
          return false;
       }
@@ -1714,6 +1735,7 @@ namespace RTAO
          {
             const std::lock_guard lock(mutex);
             stats.draws_seen++;
+            t_capture_outcome = "frame_too_large";
             stats.dynamic_too_large++;
             return false;
          }
@@ -1739,6 +1761,7 @@ namespace RTAO
          {
             if (!EnsureBufferCopy(context, needed[n], true, local))
             {
+               t_capture_outcome = "frame_arena_full";
                stats.skipped[kSkipArenaFull]++;
                QueueLocked(context, local);
                return false;
@@ -1750,6 +1773,7 @@ namespace RTAO
             const BufferEntry& entry = buffers[needed[n]];
             if (!entry.executed && entry.recorded_on != context)
             {
+               t_capture_outcome = "frame_waiting";
                (skinned ? stats.skinned_waiting : stats.dynamic_waiting)++;
                QueueLocked(context, local);
                return false;
@@ -1762,6 +1786,7 @@ namespace RTAO
          const uint64_t view_start = view * arena_view_step;
          if (view >= arena_views.size() || high > view_start + arena_view_span)
          {
+            t_capture_outcome = "frame_view_span";
             stats.skipped[kSkipBuffer]++;
             QueueLocked(context, local);
             return false;
@@ -1770,6 +1795,7 @@ namespace RTAO
          // Budget and ring space
          if (skin_window + vertex_count > kSkinFrameBudget || (dynamic_vertices && dynamic_window + dynamic_copy_bytes > kDynamicFrameBudget))
          {
+            t_capture_outcome = "frame_budget";
             stats.frame_overflow++;
             QueueLocked(context, local);
             return false;
@@ -1852,6 +1878,7 @@ namespace RTAO
          if (identity)
             frame_identities.emplace(identity, context);
          TraceMeshLocked(key, 'c', context, skinned);
+         t_capture_outcome = "frame_captured";
          stats.draws_captured++;
          stats.instances_captured++;
          stats.shadow_frame_meshes += draw.shadow_view;
@@ -1859,6 +1886,7 @@ namespace RTAO
       }
       else
       {
+         t_capture_outcome = "frame_dispatch_failed";
          stats.skipped[kSkipOther]++;
       }
       QueueLocked(context, local);
@@ -1879,7 +1907,7 @@ namespace RTAO
          {
             cutouts.OnStripExecuted(record.mesh_key, record.first_slot); // Copied at the next D3D12 pass, whenever drawn
          }
-         else if (after_ao_pass && !record.shadow_view) // Shadow maps are drawn after the AO, and are opaque casters
+         else if (after_ao_pass && !record.shadow_view && !(record.type == Rec::Instances && record.redraw_pass)) // Shadow maps are drawn after the AO, and are opaque casters
          {
             if (record.type == Rec::FrameMesh)
                TraceMeshEventLocked({ record.mesh_key, 'a', record.context_id, record.skinned });
@@ -1887,6 +1915,8 @@ namespace RTAO
          }
          else
          {
+            if (after_ao_pass && record.redraw_pass && !record.shadow_view)
+               stats.after_ao_redraw_kept++;
             if (record.type == Rec::FrameMesh)
                TraceMeshEventLocked({ record.mesh_key, 'x', record.context_id, record.skinned });
             executed.push_back(record);

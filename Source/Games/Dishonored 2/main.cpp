@@ -361,6 +361,23 @@ namespace
       std::string status = "idle";
    };
    RTDiagCapture g_rtdiag;
+   // Unattended capture (config "RTDiagAutoStartSeconds", 0 off): starts one diagnostic capture this many seconds after the
+   // RT sun first traced with a copy of the game's shadow map (e.g. on the main menu's scene)
+   int g_rtdiag_auto_seconds = 0;
+   bool g_rtdiag_auto_armed = false, g_rtdiag_auto_done = false;
+   std::chrono::steady_clock::time_point g_rtdiag_auto_at;
+
+   // Shadow pass audit: every shadow map draw, by slice, outcome (captured, or why not), shaders and index count, since
+   // the last diagnostic capture wrote it (cNNNN_shadow_audit.csv)
+   struct ShadowAuditKey
+   {
+      uint32_t slice;
+      std::string outcome;
+      uint32_t vs, ps, indices;
+      bool operator<(const ShadowAuditKey& o) const { return std::tie(slice, outcome, vs, ps, indices) < std::tie(o.slice, o.outcome, o.vs, o.ps, o.indices); }
+   };
+   std::mutex g_shadow_audit_mutex;
+   std::map<ShadowAuditKey, uint64_t> g_shadow_audit;
    // ~20 s cycling the 4 test combos in 1 s blocks (the order rotates every 4 blocks, so each combo sees similar camera
    // motion), then 4 s with the ray tracing scene frozen. Captures within kRTDiagSettle of a switch are tagged settle=1.
    constexpr double kRTDiagMatrixSeconds = 20.0, kRTDiagFrozenSeconds = 4.0, kRTDiagBlock = 1.0, kRTDiagSettle = 0.3, kRTDiagInterval = 0.2;
@@ -901,6 +918,21 @@ public:
       native_device->GetImmediateContext(&context);
       const auto now = std::chrono::steady_clock::now();
 
+      if (g_rtdiag_auto_seconds > 0 && !g_rtdiag_auto_done && !g_rtdiag.active && g.rtsun_pass.TraceCount() > 0 && g.rtsun_shadow_copies.load() > 0)
+      {
+         if (!g_rtdiag_auto_armed)
+         {
+            g_rtdiag_auto_armed = true;
+            g_rtdiag_auto_at = now + std::chrono::seconds(g_rtdiag_auto_seconds);
+            reshade::log::message(reshade::log::level::info, ("RT diag: unattended capture in " + std::to_string(g_rtdiag_auto_seconds) + " s").c_str());
+         }
+         else if (now >= g_rtdiag_auto_at)
+         {
+            g_rtdiag_auto_done = true;
+            g_rtdiag.start_requested = true;
+         }
+      }
+
       if (g_rtdiag.start_requested && !g_rtdiag.active)
       {
          g_rtdiag.start_requested = false;
@@ -1149,6 +1181,50 @@ public:
             float fars[4] = {};
             g.rtsun_light.GetSliceFars(fars);
             add("slice_fars=%.4g,%.4g,%.4g,%.4g\n", fars[0], fars[1], fars[2], fars[3]);
+            // Shadow pass audit since the last capture
+            {
+               std::map<ShadowAuditKey, uint64_t> audit;
+               {
+                  const std::lock_guard lock(g_shadow_audit_mutex);
+                  audit.swap(g_shadow_audit);
+               }
+               std::string csv = "slice,outcome,vs_hash,ps_hash,index_count,draws\n";
+               for (const auto& pair : audit)
+               {
+                  char row[160];
+                  snprintf(row, sizeof(row), "%u,%s,%08X,%08X,%u,%llu\n", pair.first.slice, pair.first.outcome.c_str(), pair.first.vs, pair.first.ps, pair.first.indices, (unsigned long long)pair.second);
+                  csv += row;
+               }
+               char name[40];
+               snprintf(name, sizeof(name), "c%04u_shadow_audit.csv", g_rtdiag.index);
+               const std::string path = (std::filesystem::path(g_rtdiag.dir) / name).string();
+               std::thread([csv = std::move(csv), path]() { std::ofstream(path) << csv; }).detach();
+            }
+            // Shadow map reproduction: the latest read back (RTSun::kReproCascades x kReproGrid^2 uints, see rtsun_trace.hlsl)
+            {
+               std::vector<uint32_t> repro;
+               uint32_t repro_trace = 0;
+               if (g.rtsun_pass.GetShadowRepro(repro, repro_trace))
+               {
+                  uint64_t counts[RTSun::kReproCascades][2][3] = {};
+                  const size_t per = size_t(RTSun::kReproGrid) * RTSun::kReproGrid;
+                  for (size_t i = 0; i < repro.size(); i++)
+                  {
+                     const size_t c = i / per;
+                     counts[c][0][repro[i] & 3]++;
+                     counts[c][1][(repro[i] >> 2) & 3]++;
+                  }
+                  add("repro_trace=%u\nrepro_now=%u\n", repro_trace, g.rtsun_pass.TraceCount());
+                  for (uint32_t c = 0; c < RTSun::kReproCascades; c++)
+                     add("repro_c%u=shadow_only match %llu missing %llu extra %llu | all match %llu missing %llu extra %llu\n", c,
+                        (unsigned long long)counts[c][0][0], (unsigned long long)counts[c][0][1], (unsigned long long)counts[c][0][2],
+                        (unsigned long long)counts[c][1][0], (unsigned long long)counts[c][1][1], (unsigned long long)counts[c][1][2]);
+                  char name[40];
+                  snprintf(name, sizeof(name), "c%04u_repro.bin", g_rtdiag.index);
+                  const std::string path = (std::filesystem::path(g_rtdiag.dir) / name).string();
+                  std::thread([repro = std::move(repro), path]() { std::ofstream(path, std::ios::binary).write(reinterpret_cast<const char*>(repro.data()), std::streamsize(repro.size() * 4)); }).detach();
+               }
+            }
             // Every retained TLAS instance of this frame, for the duplicate check (cNNNN_instances.csv)
             {
                std::string csv = "blas_key,sources,min_slice,x,y,z,index_count,vertex_count,first_frame,last_frame,seen_frames,vs_hash,ps_hash\n";
@@ -1165,7 +1241,8 @@ public:
                const std::string path = (std::filesystem::path(g_rtdiag.dir) / name).string();
                std::thread([csv = std::move(csv), path]() { std::ofstream(path) << csv; }).detach();
             }
-            add("casters_only=%d\nskinned_hold=%d\n", int(g_rtsun_casters_only), g_rtao_skinned_hold);
+            add("casters_only=%d\nskinned_hold=%d\nafter_ao_records=%llu\nafter_ao_redraw_kept=%llu\n", int(g_rtsun_casters_only), g_rtao_skinned_hold,
+               (unsigned long long)stats.after_ao_records, (unsigned long long)stats.after_ao_redraw_kept);
             add("shadow_check=%d\nshadow_check_tolerance=%.3f\nshadow_copied_frame=%u\nshadow_reversed=%d\nshadow_copies=%llu\n", int(g_rtsun_shadow_consult), g_rtsun_shadow_tolerance,
                g.rtsun_shadow_copied_frame.load(), int(g.rtsun_shadow_reversed.load()), (unsigned long long)g.rtsun_shadow_copies.load());
             // Per frame meshes of the last complete frame: per mesh, its events in order (see RTAO::FrameMeshEvent)
@@ -1482,6 +1559,10 @@ public:
          SetRTSunStatus("ready, waiting for the light direction (screen shadows pass)", false);
       }
       out.debug_outputs = g_rtdiag.active;
+      {
+         const uint32_t copied = game_device_data.rtsun_shadow_copied_frame.load();
+         out.shadow_repro = g_rtdiag.active && copied != UINT32_MAX && game_device_data.rtao_frame - copied <= 2;
+      }
       if (!game_device_data.rtsun_pass.EnsureTargets(native_device, width, height, error))
       {
          if (!game_device_data.rtsun_logged_error.exchange(true))
@@ -1617,7 +1698,7 @@ public:
          return false;
       const uint32_t frame = game_device_data.rtao_frame;
       game_device_data.rtsun_light.OnScreenShadowsDraw(native_device_context, frame);
-      if (g_rtsun_shadow_consult)
+      if (g_rtsun_shadow_consult || g_rtdiag.active)
          RTSunCopyShadowMap(native_device, native_device_context, device_data, game_device_data);
       // Traced by this frame's SSAO draw (or the previous frame's, if the recording threads raced): otherwise the game's
       if (frame - game_device_data.rtsun_scheduled_frame.load() > 1 || game_device_data.rtsun_pass.TraceCount() == 0)
@@ -2822,6 +2903,29 @@ public:
       reshade::log::message(reshade::log::level::info, buffer);
    }
 
+   static void ShadowAudit(ID3D11DeviceContext* context, uint32_t slice, const char* outcome, uint32_t indices)
+   {
+      com_ptr<ID3D11VertexShader> vs;
+      context->VSGetShader(&vs, nullptr, nullptr);
+      com_ptr<ID3D11PixelShader> ps;
+      context->PSGetShader(&ps, nullptr, nullptr);
+      uint32_t vs_hash = 0, ps_hash = 0;
+      {
+         const std::shared_lock lock(g_rtao_shader_mutex);
+         auto vh = g_rtao_vertex_shader_hashes.find(uint64_t(uintptr_t(vs.get())));
+         vs_hash = vh != g_rtao_vertex_shader_hashes.end() ? vh->second : 0;
+         auto ph = ps ? g_rtao_pixel_shader_hashes.find(uint64_t(uintptr_t(ps.get()))) : g_rtao_pixel_shader_hashes.end();
+         ps_hash = ph != g_rtao_pixel_shader_hashes.end() ? ph->second : 0;
+      }
+      const std::lock_guard lock(g_shadow_audit_mutex);
+      ShadowAuditKey key = { slice, outcome, vs_hash, ps_hash, indices };
+      auto it = g_shadow_audit.find(key);
+      if (it != g_shadow_audit.end())
+         it->second++;
+      else if (g_shadow_audit.size() < 50000)
+         g_shadow_audit.emplace(std::move(key), 1);
+   }
+
    static bool OnRTAODrawIndexed(reshade::api::command_list* cmd_list, uint32_t index_count, uint32_t instance_count, uint32_t first_index, int32_t vertex_offset, uint32_t first_instance)
    {
       if (!g_rtao_capture_active.load(std::memory_order_relaxed))
@@ -2842,6 +2946,7 @@ public:
          shadow_slice = slice;
          if (g_rtao_shadow_near_only && slice >= uint32_t((std::max)(g_rtao_shadow_near_slices, 1)))
          {
+            ShadowAudit(context, slice, "far_slice", index_count);
             g_rtao_shadow_far_skipped++;
             return false;
          }
@@ -2851,7 +2956,10 @@ public:
       D3D11_PRIMITIVE_TOPOLOGY topology;
       context->IAGetPrimitiveTopology(&topology);
       if (shadow_view && topology != D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST)
+      {
+         ShadowAudit(context, shadow_slice, "topology", index_count);
          return false;
+      }
       if (topology != D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST)
       {
          g_rtao_draws_not_triangle_list++;
@@ -2870,6 +2978,19 @@ public:
       RTAO::VertexShaderInfo vs_info;
       RTAO::InputLayoutInfo layout_info;
       RTAO::PixelShaderInfo ps_info;
+      const char* shadow_audit_outcome = nullptr;
+      // Audited once the shader lock is released (ShadowAudit takes it too)
+      struct AuditOnExit
+      {
+         const char*& outcome;
+         ID3D11DeviceContext* context;
+         uint32_t slice, indices;
+         ~AuditOnExit()
+         {
+            if (outcome)
+               ShadowAudit(context, slice, outcome, indices);
+         }
+      } audit_on_exit{ shadow_audit_outcome, context, shadow_slice, index_count };
       bool alpha_tested = false;
       {
          const std::shared_lock lock(g_rtao_shader_mutex);
@@ -2878,6 +2999,8 @@ public:
          {
             if (!shadow_view)
                g_rtao_draws_unknown_shader++;
+            else
+               shadow_audit_outcome = "vs_not_reflected";
             return false;
          }
          vs_info = vs_it->second;
@@ -2898,9 +3021,15 @@ public:
       {
          // Same family toggles as the main view, no diagnostics. Skinned draws are left out (see DrawInfo::shadow_view).
          if ((vs_info.wind && !g_rtao_wind_meshes) || (alpha_tested && !g_rtao_cutouts) || vs_info.source == RTAO::MatrixSource::None || vs_info.skinned)
+         {
+            ShadowAudit(context, shadow_slice, vs_info.source == RTAO::MatrixSource::None ? (vs_info.skip_reason ? vs_info.skip_reason : "no_matrix_source") : (vs_info.skinned ? "skinned" : "family_off"), index_count);
             return false;
+         }
          if (!layout_info.has_position || layout_info.position_per_instance)
+         {
+            ShadowAudit(context, shadow_slice, "layout", index_count);
             return false;
+         }
       }
       else
       {
@@ -2954,6 +3083,7 @@ public:
          draw.debug_vs_hash = vh != g_rtao_vertex_shader_hashes.end() ? vh->second : 0;
          auto ph = ps ? g_rtao_pixel_shader_hashes.find(uint64_t(uintptr_t(ps.get()))) : g_rtao_pixel_shader_hashes.end();
          draw.debug_ps_hash = ph != g_rtao_pixel_shader_hashes.end() ? ph->second : 0;
+         draw.redraw_pass = draw.debug_vs_hash == 0xABCEF358u || draw.debug_ps_hash == 0xBBBE692Eu; // The motion vector pass
       }
       draw.shadow_slice = uint8_t((std::min)(shadow_slice, 0xFEu));
       draw.position_format = layout_info.position_format;
@@ -3075,7 +3205,10 @@ public:
       }
 
       auto& device_data = *device->get_private_data<DeviceData>();
-      if (device_data.game && !GetGameDeviceData(device_data).rtao_capture.CaptureDraw(context, draw) && !shadow_view)
+      const bool captured = device_data.game && GetGameDeviceData(device_data).rtao_capture.CaptureDraw(context, draw);
+      if (shadow_view)
+         ShadowAudit(context, shadow_slice, device_data.game ? RTAO::GeometryCapture::LastOutcome() : "no_game", index_count);
+      if (device_data.game && !captured && !shadow_view)
       {
          D3D11_BUFFER_DESC vb_desc = {}, ib_desc = {};
          if (vertex_buffer)
@@ -3459,6 +3592,7 @@ public:
       reshade::get_config_value(runtime, NAME, "RTAOShadowCasters", g_rtao_shadow_casters);
       reshade::get_config_value(runtime, NAME, "RTSunShadowCastersOnly", g_rtsun_casters_only);
       reshade::get_config_value(runtime, NAME, "RTSunShadowMapCheck", g_rtsun_shadow_consult);
+      reshade::get_config_value(runtime, NAME, "RTDiagAutoStartSeconds", g_rtdiag_auto_seconds);
       reshade::get_config_value(runtime, NAME, "RTSunShadowMapTolerance", g_rtsun_shadow_tolerance);
       reshade::get_config_value(runtime, NAME, "RTAOShadowNearSlices", g_rtao_shadow_near_slices);
       reshade::get_config_value(runtime, NAME, "RTAOShadowNearOnly", g_rtao_shadow_near_only);

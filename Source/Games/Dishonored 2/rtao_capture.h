@@ -238,7 +238,11 @@ namespace RTAO
       // game bound the light's view in PerViewCB.
       bool shadow_view = false;
       uint8_t shadow_slice = 0xFF;
-      uint32_t debug_vs_hash = 0, debug_ps_hash = 0; // Luma shader hashes of the draw (diagnostics) // shadow_view: the shadow map array slice the draw renders into
+      uint32_t debug_vs_hash = 0, debug_ps_hash = 0; // Luma shader hashes of the draw (diagnostics)
+      // The game's motion vector pass (VS 0xABCEF358 / PS 0xBBBE692E): it redraws opaque geometry that is in the depth
+      // buffer, after the AO pass. Its static instances are kept (next pass) instead of dropped as "drawn after the AO":
+      // some meshes (window bars) are only ever captured from it.
+      bool redraw_pass = false;
    };
 
    struct CaptureStats
@@ -260,7 +264,8 @@ namespace RTAO
       // Per frame meshes dispatched / with a rejected matrix (NaN vertices), shadow maps and main view (GPU counters, cumulative)
       uint64_t gpu_shadow_frame = 0, gpu_shadow_frame_rejected = 0, gpu_main_frame = 0, gpu_main_frame_rejected = 0;
       uint64_t frame_retained = 0; // Movable objects kept in their last pose (not drawn in the last frame)
-      uint64_t hold_superseded = 0, hold_owner_freed = 0, hold_capped = 0, hold_timed_out = 0; // Held poses dropped: moved (newer pose), buffer freed, cap
+      uint64_t hold_superseded = 0, hold_owner_freed = 0, hold_capped = 0, hold_timed_out = 0;
+      uint64_t after_ao_redraw_kept = 0; // Motion vector pass instance records kept although executed after the AO pass // Held poses dropped: moved (newer pose), buffer freed, cap
       uint64_t draws_seen = 0, draws_captured = 0, instances_captured = 0;
       uint64_t skipped[8] = {}; // By CaptureSkip
       uint64_t meshes = 0, meshes_ready = 0, buffers_copied = 0, arena_vertex_bytes = 0, arena_index_bytes = 0;
@@ -379,6 +384,8 @@ namespace RTAO
       bool Record(ID3D12GraphicsCommandList4* list, const RecordInfo& info, BlasCache& blases, TlasBuilder& tlas, Retirer& retirer, uint32_t blas_budget, std::string& error);
 
       CaptureStats GetStats();
+      // What the calling thread's last CaptureDraw did ("captured", "dedup", a skip reason...), diagnostics
+      static const char* LastOutcome();
       // Per frame meshes (skinned, dynamic vertex buffers) of the last complete frame: what happened to each draw
       std::vector<FrameMeshEvent> GetLastFrameMeshTrace()
       {
@@ -451,6 +458,7 @@ namespace RTAO
          bool mvp = false; // Instances: MVP derived matrix (identity matched with a tolerance, see FuzzyKey)
          uint64_t identity = 0; // FrameMesh: the draw's per frame identity (the pass keeps one record per identity)
          uint8_t context_id = 0; // FrameMesh: diagnostics (FrameMeshEvent)
+         bool redraw_pass = false; // Instances: from DrawInfo::redraw_pass
       };
 
       bool EnsureBufferCopy(ID3D11DeviceContext* context, ID3D11Buffer* buffer, bool vertex, std::vector<Rec>& records);

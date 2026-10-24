@@ -182,7 +182,7 @@ namespace RTSun
       // Same layout as the AO pass: [0] CBV b0, [1] SRV t0 (TLAS), [2] table { SRV t1 }, [3] table { UAV u0..u3 }
       // Texture exact cutouts (rtao_cutout.hlsli): [4] SRV t2 (records), [5] SRV t3 (geometry arena), [6] table { SRV t4 }
       // (atlas), [7] UAV u4 (counters), static sampler s0 (linear, wrap)
-      // [8] table { SRV t5 } (the shadow map check's copy of the game's cascades)
+      // [8] table { SRV t5 } (the shadow map check's copy of the game's cascades), [9] UAV u5 (shadow map reproduction)
       D3D12_DESCRIPTOR_RANGE ranges[4] = {};
       ranges[0].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
       ranges[0].NumDescriptors = 1;
@@ -196,7 +196,7 @@ namespace RTSun
       ranges[3].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
       ranges[3].NumDescriptors = 1;
       ranges[3].BaseShaderRegister = 5;
-      D3D12_ROOT_PARAMETER parameters[9] = {};
+      D3D12_ROOT_PARAMETER parameters[10] = {};
       parameters[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_CBV;
       parameters[0].Descriptor.ShaderRegister = 0;
       parameters[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_SRV;
@@ -219,6 +219,8 @@ namespace RTSun
       parameters[8].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
       parameters[8].DescriptorTable.NumDescriptorRanges = 1;
       parameters[8].DescriptorTable.pDescriptorRanges = &ranges[3];
+      parameters[9].ParameterType = D3D12_ROOT_PARAMETER_TYPE_UAV;
+      parameters[9].Descriptor.ShaderRegister = 5;
       for (auto& parameter : parameters)
          parameter.ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
       D3D12_STATIC_SAMPLER_DESC sampler = {};
@@ -229,7 +231,7 @@ namespace RTSun
       sampler.ShaderRegister = 0;
       sampler.ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
       D3D12_ROOT_SIGNATURE_DESC root_desc = {};
-      root_desc.NumParameters = 9;
+      root_desc.NumParameters = 10;
       root_desc.pParameters = parameters;
       root_desc.NumStaticSamplers = 1;
       root_desc.pStaticSamplers = &sampler;
@@ -277,7 +279,7 @@ namespace RTSun
 
       D3D12_RESOURCE_DESC desc = {};
       desc.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
-      desc.Width = 6 * kSlots * kConstantsStride; // Sets: the pass, the 5 debug outputs
+      desc.Width = 7 * kSlots * kConstantsStride; // Sets: the pass, the 5 debug outputs, the shadow map reproduction
       desc.Height = 1;
       desc.DepthOrArraySize = 1;
       desc.MipLevels = 1;
@@ -459,7 +461,7 @@ namespace RTSun
       }
       if (shadow_rtv11 && slice_width == shadow_width && slice_height == shadow_height)
          return true;
-      if (slice_width == 0 || slice_height == 0 || slice_width > 16384 || uint64_t(slice_height) * kShadowCascades + 1 > 16384 || slice_width < 16 * kShadowCascades)
+      if (slice_width == 0 || slice_height == 0 || slice_width > 16384 || uint64_t(slice_height) * kShadowCascades + 1 > 16384 || slice_width < 16 * kShadowCascades + 8)
       {
          error = "unsupported shadow map size";
          return false;
@@ -500,6 +502,28 @@ namespace RTSun
       shadow_width = slice_width;
       shadow_height = slice_height;
       return true;
+   }
+
+   bool SunPass::EnsureRepro()
+   {
+      if (repro_buffer)
+         return true;
+      const uint64_t bytes = uint64_t(kReproCascades) * kReproGrid * kReproGrid * 4;
+      HRESULT hr = S_OK;
+      repro_buffer = CreateBuffer(device, bytes, D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS, hr);
+      for (uint32_t i = 0; i < kSlots && repro_buffer; i++)
+      {
+         repro_readback[i] = CreateBuffer(device, bytes, D3D12_HEAP_TYPE_READBACK, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_FLAG_NONE, hr);
+         if (!repro_readback[i])
+         {
+            for (uint32_t k = 0; k < kSlots; k++)
+               if (repro_readback[k]) { repro_readback[k]->Release(); repro_readback[k] = nullptr; }
+            repro_buffer->Release();
+            repro_buffer = nullptr;
+            break;
+         }
+      }
+      return repro_buffer != nullptr;
    }
 
    ID3D11RenderTargetView* SunPass::GetShadowRTV(bool* packed)
@@ -633,6 +657,22 @@ namespace RTSun
          bound_atlas = cutouts->atlas;
          WriteAtlasDescriptor(device, heap, descriptor_size, bound_atlas);
       }
+      if (repro_pending[slot])
+      {
+         repro_pending[slot] = false;
+         const size_t count = size_t(kReproCascades) * kReproGrid * kReproGrid;
+         const D3D12_RANGE range = { 0, count * 4 };
+         uint8_t* data = nullptr;
+         if (SUCCEEDED(repro_readback[slot]->Map(0, &range, reinterpret_cast<void**>(&data))) && data)
+         {
+            const std::lock_guard repro_lock(repro_mutex);
+            repro_latest.resize(count);
+            std::memcpy(repro_latest.data(), data, count * 4);
+            repro_latest_trace = repro_trace[slot];
+            const D3D12_RANGE written = { 0, 0 };
+            repro_readback[slot]->Unmap(0, &written);
+         }
+      }
       if (counters_pending[slot])
       {
          counters_pending[slot] = false;
@@ -716,7 +756,9 @@ namespace RTSun
       D3D12_GPU_DESCRIPTOR_HANDLE shadow_table = heap->GetGPUDescriptorHandleForHeapStart();
       shadow_table.ptr += UINT64(36) * descriptor_size;
       list->SetComputeRootDescriptorTable(8, shadow_table);
-      if (consult)
+      const bool repro = settings.shadow_repro && shadow12 && EnsureRepro();
+      list->SetComputeRootUnorderedAccessView(9, repro ? repro_buffer->GetGPUVirtualAddress() : counters->GetGPUVirtualAddress());
+      if (consult || repro)
          TransitionBarrier(list, shadow12, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
       if (exact)
          TransitionBarrier(list, cutouts->arena, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
@@ -792,7 +834,31 @@ namespace RTSun
          }
       }
 
-      if (consult)
+      // Shadow map reproduction: the game's cascade texels traced against the scene, read back a few frames later
+      if (repro)
+      {
+         SunConstants repro_constants = constants;
+         repro_constants.debug_mode = uint32_t(Output::ShadowRepro);
+         repro_constants.shadow_consult = 1; // The shadow copy is bound and valid
+         const uint64_t offset = (uint64_t(6) * kSlots + slot) * kConstantsStride;
+         std::memcpy(constants_mapped + offset, &repro_constants, sizeof(repro_constants));
+         list->SetComputeRootConstantBufferView(0, constants_upload->GetGPUVirtualAddress() + offset);
+         if (exact)
+            TransitionBarrier(list, cutouts->arena, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+         TransitionBarrier(list, counters, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+         TransitionBarrier(list, repro_buffer, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+         list->SetPipelineState(trace_pso);
+         list->Dispatch(kReproCascades * kReproGrid / 8, kReproGrid / 8, 1);
+         TransitionBarrier(list, repro_buffer, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE);
+         list->CopyBufferRegion(repro_readback[slot], 0, repro_buffer, 0, uint64_t(kReproCascades) * kReproGrid * kReproGrid * 4);
+         TransitionBarrier(list, repro_buffer, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_COMMON);
+         TransitionBarrier(list, counters, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COMMON);
+         if (exact)
+            TransitionBarrier(list, cutouts->arena, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COMMON);
+         repro_pending[slot] = true;
+         repro_trace[slot] = trace_count.load();
+      }
+      if (consult || repro)
          TransitionBarrier(list, shadow12, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COMMON); // D3D11 writes it next
       timer.End(list, info.frame_slot);
 
@@ -837,6 +903,12 @@ namespace RTSun
       Release(dummy_buffer, retirer, fence_value);
       Release(counters, retirer, fence_value);
       Release(counters_readback, retirer, fence_value);
+      Release(repro_buffer, retirer, fence_value);
+      for (uint32_t i = 0; i < kSlots; i++)
+      {
+         Release(repro_readback[i], retirer, fence_value);
+         repro_pending[i] = false;
+      }
       for (bool& pending : counters_pending)
          pending = false;
       counters_have_last = false;

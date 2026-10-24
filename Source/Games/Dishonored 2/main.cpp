@@ -302,11 +302,11 @@ namespace
    int g_rtsun_rays = 1; // Per pixel per frame (config "RTSunRays")
    // Only objects the game draws into its shadow maps block the RT sun (config "RTSunShadowCastersOnly"): the game keeps
    // some objects out of its shadow maps on purpose (window glass, light shaft meshes); camera only ones still occlude the AO
-   bool g_rtsun_casters_only = false;
+   bool g_rtsun_casters_only = true;
    // Shadow map check (config "RTSunShadowMapCheck"): a sun ray hitting an object the game never drew into its shadow map
    // (camera only: glass, light shafts, or a caster drawn only in passes we don't capture as casters) is blocked only
    // where the game's own shadow map has a surface there (or is in shadow), within "RTSunShadowMapTolerance" world units
-   bool g_rtsun_shadow_consult = true;
+   bool g_rtsun_shadow_consult = false;
    float g_rtsun_shadow_tolerance = 0.1f;
    int g_rtsun_output = int(RTSun::Output::Denoised); // Config "RTSunOutput"
    // ---- RT diagnostic capture (RTAO_NOTES.md "Diagnostic capture"): Luma panel button or Ctrl+Shift+Pause (not F9: the game's quickload). About 10 s:
@@ -393,6 +393,10 @@ namespace
    std::mutex g_draw_probe_mutex;
    std::map<std::string, uint64_t> g_draw_probe;
    std::atomic<bool> g_draw_probe_active = false;
+   // The game's shadow map rasterizer bias (last shadow draw): the reproduction allows for it
+   std::atomic<int> g_shadow_depth_bias = 0;
+   std::atomic<float> g_shadow_slope_bias = 0.f;
+   std::atomic<uint32_t> g_shadow_depth_format = 0; // DXGI format of the shadow map's depth view
    std::map<ShadowAuditKey, uint64_t> g_shadow_audit;
    // ~20 s cycling the 4 test combos in 1 s blocks (the order rotates every 4 blocks, so each combo sees similar camera
    // motion), then 4 s with the ray tracing scene frozen. Captures within kRTDiagSettle of a switch are tagged settle=1.
@@ -1301,6 +1305,8 @@ public:
             }
             add("casters_only=%d\nskinned_hold=%d\nafter_ao_records=%llu\nafter_ao_redraw_kept=%llu\n", int(g_rtsun_casters_only), g_rtao_skinned_hold,
                (unsigned long long)stats.after_ao_records, (unsigned long long)stats.after_ao_redraw_kept);
+            add("shadow_bias=%d\nshadow_slope_bias=%.3f\nshadow_depth_format=%u\nshadow_records_held=%llu\nshadow_records_lost=%llu\nrecords_deferred=%llu\n", g_shadow_depth_bias.load(), g_shadow_slope_bias.load(), g_shadow_depth_format.load(),
+               (unsigned long long)stats.shadow_records_held, (unsigned long long)stats.shadow_records_lost, (unsigned long long)stats.records_deferred);
             add("shadow_check=%d\nshadow_check_tolerance=%.3f\nshadow_copied_frame=%u\nshadow_reversed=%d\nshadow_copies=%llu\n", int(g_rtsun_shadow_consult), g_rtsun_shadow_tolerance,
                g.rtsun_shadow_copied_frame.load(), int(g.rtsun_shadow_reversed.load()), (unsigned long long)g.rtsun_shadow_copies.load());
             // Per frame meshes of the last complete frame: per mesh, its events in order (see RTAO::FrameMeshEvent)
@@ -1647,6 +1653,12 @@ public:
          out.shadow_consult = g_rtsun_shadow_consult && copied != UINT32_MAX && game_device_data.rtao_frame - copied <= 2;
          out.shadow_reversed = game_device_data.rtsun_shadow_reversed.load();
          out.shadow_tolerance = g_rtsun_shadow_tolerance;
+         // The game's rasterizer bias in depth units: DepthBias * r (r: the depth format's unit; a 32 bit float map's is
+         // ~2^-24 at the far end, negligible) and SlopeScaledDepthBias
+         const DXGI_FORMAT depth_format = DXGI_FORMAT(g_shadow_depth_format.load());
+         const double r = depth_format == DXGI_FORMAT_D16_UNORM ? 1.0 / 65535.0 : (depth_format == DXGI_FORMAT_D24_UNORM_S8_UINT ? 1.0 / 16777215.0 : 1.0 / 16777216.0);
+         out.shadow_bias_constant = float(double(g_shadow_depth_bias.load()) * r);
+         out.shadow_bias_slope = g_shadow_slope_bias.load();
       }
       const int output = std::clamp(g_rtsun_output, 0, int(RTSun::Output::Count) - 1);
       out.output = RTSun::Output(output);
@@ -1756,7 +1768,8 @@ public:
          return false;
       const uint32_t frame = game_device_data.rtao_frame;
       game_device_data.rtsun_light.OnScreenShadowsDraw(native_device_context, frame);
-      if (g_rtsun_shadow_consult || g_rtdiag.active)
+      // The copy: for the shadow map check, captures, and the periodic reproduction (the frame before it)
+      if (g_rtsun_shadow_consult || g_rtdiag.active || (game_device_data.rtao_frame + 2) % kReproLogFrames <= 1)
          RTSunCopyShadowMap(native_device, native_device_context, device_data, game_device_data);
       // Traced by this frame's SSAO draw (or the previous frame's, if the recording threads raced): otherwise the game's
       if (frame - game_device_data.rtsun_scheduled_frame.load() > 1 || game_device_data.rtsun_pass.TraceCount() == 0)
@@ -2969,6 +2982,18 @@ public:
       }
       if (out_slice)
          *out_slice = slice;
+      {
+         com_ptr<ID3D11RasterizerState> raster;
+         context->RSGetState(&raster);
+         if (raster)
+         {
+            D3D11_RASTERIZER_DESC raster_desc;
+            raster->GetDesc(&raster_desc);
+            g_shadow_depth_bias.store(raster_desc.DepthBias, std::memory_order_relaxed);
+            g_shadow_slope_bias.store(raster_desc.SlopeScaledDepthBias, std::memory_order_relaxed);
+         }
+         g_shadow_depth_format.store(uint32_t(dsv_desc.Format), std::memory_order_relaxed);
+      }
       g_rtao_shadow_view_width.store(desc.Width, std::memory_order_relaxed);
       g_rtao_shadow_view_height.store(desc.Height, std::memory_order_relaxed);
       g_rtao_shadow_view_slices.store(desc.ArraySize, std::memory_order_relaxed);

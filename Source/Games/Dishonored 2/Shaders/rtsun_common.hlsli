@@ -21,6 +21,7 @@ cbuffer SunConstants : register(b0)
     // The game's shadow map decides whether a camera only object blocks (rtsun_trace.hlsl GameShadowConfirms)
     uint ShadowConsult; uint ShadowPacked; uint ShadowReversed; float ShadowTolerance; // Tolerance in world units
     uint2 ShadowSize;   uint ShadowCascades; uint ShadowPad;                          // One cascade's size, how many are stacked
+    float ShadowBiasConstant; float ShadowBiasSlope; uint2 BiasPad;                  // The game's shadow rasterizer bias (depth units, slope factor)
 };
 
 // Must match rtao_accel.h

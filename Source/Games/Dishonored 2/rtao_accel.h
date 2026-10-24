@@ -269,7 +269,7 @@ namespace RTAO
       static constexpr uint32_t kDynamicRetainFrames = 2;
       static constexpr uint32_t kDynamicCoolFrames = 120;
       static constexpr float kMovingDistance = 2.f;
-      static constexpr size_t kMaxShadowStatic = 60000;
+      static constexpr size_t kMaxShadowStatic = 1000000; // A safety bound only (a level holds a few thousand)
 
       ~TlasBuilder() { Clear(nullptr, 0); }
 
@@ -293,6 +293,8 @@ namespace RTAO
       std::vector<InstanceInfo> LastBuildOrder() { const std::lock_guard lock(mutex); return last_build_order; }
       RetentionStats GetRetentionStats();
       void RemoveInstance(uint64_t instance_key);
+      // The mesh's buffers were freed (level change, streaming): its instances go
+      void EvictMesh(uint64_t blas_key);
       size_t RetainedCount();
       // An instance for the current frame only (dropped at the next BeginFrame), with its BLAS given directly (e.g. from
       // a DynamicBlasSet). Not thread safe: call from the recording thread, between BeginFrame and Build.

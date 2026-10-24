@@ -703,6 +703,14 @@ namespace RTAO
       instances.erase(instance_key);
    }
 
+   void TlasBuilder::EvictMesh(uint64_t blas_key)
+   {
+      const std::lock_guard lock(mutex);
+      std::erase_if(instances, [&](const auto& pair) { return pair.second.blas_key == blas_key; });
+      shadow_meshes.erase(blas_key);
+      churn.erase(blas_key);
+   }
+
    void TlasBuilder::AddFrameInstance(D3D12_GPU_VIRTUAL_ADDRESS blas, const float object_to_world[3][4], uint8_t mask, uint8_t source)
    {
       if (!blas)
@@ -745,9 +753,10 @@ namespace RTAO
             const D3D12_GPU_VIRTUAL_ADDRESS blas = blases.Get(pair.second.blas_key);
             if (!blas)
             {
-               // Not built yet, or its mesh is gone (the game freed the buffers, e.g. the menu's scene after a level
-               // load): dropped once it has been missing for kMissingBlasFrames
-               if (++it->second.missing_frames > kMissingBlasFrames)
+               // Not built yet (a level load brings thousands of meshes, built kBlasBudget per frame). A mesh that is
+               // gone is evicted with its instances (EvictMesh); shadow map instances wait for their BLAS however long it
+               // takes (the game drew them once and keeps them in its shadow map), the others go after kMissingBlasFrames
+               if (!(it->second.sources & kInstanceSourceShadow) && ++it->second.missing_frames > kMissingBlasFrames)
                {
                   it = instances.erase(it);
                   last_dropped_missing++;
@@ -766,7 +775,10 @@ namespace RTAO
             // Camera only: neither this instance nor any instance of its mesh was ever drawn into a shadow map (the game
             // keeps the mesh out of its shadows: glass, light shaft meshes). A real caster the shadow map hasn't drawn yet
             // becomes one as soon as it does (the shadow map is redrawn rarely, so this is per mesh, not per instance).
-            const bool camera_only = !(pair.second.sources & kInstanceSourceShadow) && !shadow_meshes.count(pair.second.blas_key);
+            // Camera only: this instance was never drawn into a shadow map. The game draws its sun shadows with its own
+            // shadow meshes (often other geometry than the camera's: merged sector meshes) and leaves objects out of
+            // them by its own choice (window panes), so only what it drew into a shadow map blocks the sun
+            const bool camera_only = !(pair.second.sources & kInstanceSourceShadow);
             if (camera_only)
                desc.InstanceMask = (pair.second.mask & kInstanceMaskCutout) ? kInstanceMaskCameraOnlyCutout : kInstanceMaskCameraOnly;
             desc.Flags = D3D12_RAYTRACING_INSTANCE_FLAG_TRIANGLE_CULL_DISABLE |

@@ -269,7 +269,10 @@ namespace RTAO
       uint64_t gpu_shadow_frame = 0, gpu_shadow_frame_rejected = 0, gpu_main_frame = 0, gpu_main_frame_rejected = 0;
       uint64_t frame_retained = 0; // Movable objects kept in their last pose (not drawn in the last frame)
       uint64_t hold_superseded = 0, hold_owner_freed = 0, hold_capped = 0, hold_timed_out = 0;
-      uint64_t after_ao_redraw_kept = 0; // Motion vector pass instance records kept although executed after the AO pass // Held poses dropped: moved (newer pose), buffer freed, cap
+      uint64_t after_ao_redraw_kept = 0;
+      uint64_t shadow_records_held = 0; // Shadow map records kept across frames without a pass (loading screens)
+      uint64_t shadow_records_lost = 0; // Shadow map records whose ring data was overwritten before a pass
+      uint64_t records_deferred = 0; // Instance records deferred to the next pass (readback full) // Motion vector pass instance records kept although executed after the AO pass // Held poses dropped: moved (newer pose), buffer freed, cap
       uint64_t draws_seen = 0, draws_captured = 0, instances_captured = 0;
       uint64_t skipped[8] = {}; // By CaptureSkip
       uint64_t meshes = 0, meshes_ready = 0, buffers_copied = 0, arena_vertex_bytes = 0, arena_index_bytes = 0;
@@ -462,6 +465,7 @@ namespace RTAO
          bool mvp = false; // Instances: MVP derived matrix (identity matched with a tolerance, see FuzzyKey)
          uint64_t identity = 0; // FrameMesh: the draw's per frame identity (the pass keeps one record per identity)
          uint8_t context_id = 0; // FrameMesh: diagnostics (FrameMeshEvent)
+         uint64_t ring_pos = 0; // Instances: absolute ring position of first_slot (valid while ring_head - ring_pos <= kRingSlots)
          bool redraw_pass = false; // Instances: from DrawInfo::redraw_pass
       };
 

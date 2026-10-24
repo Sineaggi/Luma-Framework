@@ -1557,6 +1557,7 @@ namespace RTAO
          record.mask = draw.cutout ? kInstanceMaskCutout : kInstanceMaskOpaque;
          record.mesh_key = key;
          record.first_slot = dst_slot;
+         record.ring_pos = ring_head - draw.instance_count;
          record.count = draw.instance_count;
          record.material = draw.cutout ? material : 0;
          record.geometry = geometry;
@@ -2073,11 +2074,24 @@ namespace RTAO
             ++it;
          }
       }
-      // Nobody consumed the executed records (RTAO not running): drop them
+      // Nobody consumed the executed records (RTAO not running, e.g. a loading screen): drop them, except shadow map
+      // instances, which the game draws once (level load) and keeps in its shadow maps; they wait for the next pass
+      // while their matrices are still in the ring
       if (frame - last_record_frame > 2 && !executed.empty())
       {
-         stats.late_records += executed.size();
-         executed.clear();
+         size_t kept = 0;
+         for (const Rec& record : executed)
+         {
+            const bool shadow_instances = record.type == Rec::Instances && record.shadow_view;
+            if (shadow_instances && ring_head - record.ring_pos <= kRingSlots)
+               executed[kept++] = record;
+            else if (shadow_instances)
+               stats.shadow_records_lost++;
+            else
+               stats.late_records++;
+         }
+         stats.shadow_records_held += kept;
+         executed.resize(kept);
       }
       cutouts.OnPresent();
    }
@@ -2142,6 +2156,12 @@ namespace RTAO
          work.swap(executed);
          evict.swap(evictions);
          last_record_frame = frame;
+         // Instance records whose ring data was overwritten meanwhile (held through a long load) can't be read back
+         std::erase_if(work, [&](const Rec& record) {
+            const bool stale = record.type == Rec::Instances && ring_head - record.ring_pos > kRingSlots;
+            stats.shadow_records_lost += stale && record.shadow_view;
+            return stale;
+         });
          skin_window = 0; // What was handed out so far is consumed by this pass (or dropped)
          dynamic_window = 0;
          const D3D12_GPU_VIRTUAL_ADDRESS arena = vertex_arena12->GetGPUVirtualAddress();
@@ -2269,6 +2289,7 @@ namespace RTAO
 
       // 2) This frame's matrices: ring -> readback slot (contiguous ring ranges merged into one copy)
       uint64_t overflow = 0;
+      std::vector<GeometryCapture::Rec> deferred;
       if (!work.empty())
       {
          Transition(list, ring12, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_SOURCE);
@@ -2285,7 +2306,8 @@ namespace RTAO
                continue;
             if (dst + record.count > kReadbackSlots)
             {
-               overflow += record.count;
+               // The next pass reads it (its matrices stay in the ring a while)
+               deferred.push_back(record);
                continue;
             }
             // A record may wrap around the end of the ring: split it
@@ -2314,7 +2336,16 @@ namespace RTAO
 
       // 3) Meshes whose buffers were freed (the pointer may come back as another buffer)
       for (uint64_t key : evict)
+      {
          blases.Evict(key, &retirer, info.submit_fence_value);
+         tlas.EvictMesh(key);
+      }
+      if (!deferred.empty())
+      {
+         const std::lock_guard lock(mutex);
+         stats.records_deferred += deferred.size();
+         executed.insert(executed.begin(), deferred.begin(), deferred.end());
+      }
 
       // 4) New BLASes, straight from the arena
       uint32_t built = 0, failed = 0;

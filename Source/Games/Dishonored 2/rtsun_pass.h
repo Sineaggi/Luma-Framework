@@ -60,8 +60,11 @@ namespace RTSun
       uint32_t shadow_size[2];
       uint32_t shadow_cascades;
       uint32_t shadow_pad;
+      float shadow_bias_constant;
+      float shadow_bias_slope;
+      uint32_t bias_pad[2];
    };
-   static_assert(sizeof(SunConstants) == 304);
+   static_assert(sizeof(SunConstants) == 320);
 
    // Shadow map check: the game's sun cascades copied for the trace (Shaders/Dishonored 2/Luma_RTSunShadowCopy.hlsl)
    constexpr uint32_t kShadowCascades = 3;
@@ -110,13 +113,16 @@ namespace RTSun
       // of the same frame into the two debug shared textures (GetDebugSRV), without touching the output or its history
       bool debug_outputs = false;
       // Objects the game never drew into a shadow map (camera only: glass, light shaft meshes) don't block the sun
-      bool casters_only = false;
+      bool casters_only = true;
       // Shadow map check: a camera only object blocks only where the game's shadow map agrees (needs the shadow target,
       // written this or the last frame). "shadow_reversed": the game's shadow compare is GREATER (nearer the light =
       // larger). Tolerance in world units.
       bool shadow_consult = false;
       bool shadow_reversed = false;
       float shadow_tolerance = 0.1f;
+      // The game's shadow map rasterizer bias (depth units, and the slope factor): the reproduction allows for it
+      float shadow_bias_constant = 0.f;
+      float shadow_bias_slope = 0.f;
       // Diagnostics: trace the game's shadow map texels against our scene (needs the shadow target; GetShadowRepro)
       bool shadow_repro = false;
    };

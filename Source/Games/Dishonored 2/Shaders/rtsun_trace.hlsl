@@ -237,7 +237,10 @@ void ShadowRepro(uint2 id)
         }
         bool hit = q.CommittedStatus() == COMMITTED_TRIANGLE_HIT;
         float s = hit ? max(q.CommittedRayT() - back, 0.0) : 1.0;
-        codes[v] = s > gmax + tolerance ? 1u : (s < gmin - tolerance ? 2u : 0u);
+        // The game's map holds depth + its rasterizer bias (constant + slope factor x the depth slope per texel), so a
+        // surface reads nearer the light than the map by up to that much: not "extra"
+        float bias = abs(ShadowBiasConstant) + abs(ShadowBiasSlope) * 0.5 * (gmax - gmin);
+        codes[v] = s > gmax + tolerance ? 1u : (s < gmin - tolerance - bias ? 2u : 0u);
         uint hid = hit ? min(q.CommittedInstanceIndex() + 1, 0x0FFFFFFFu) : 0;
         if (v == 0)
             id0 = hid;

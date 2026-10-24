@@ -31,6 +31,8 @@ struct Capture
    double vp[16] = {}, inv_vp[16] = {};
    double cam[3] = {}, fwd[3] = {};
    int phase = 0;
+   int combo = 0; // Test matrix combo (bit 0: openables from the shadow map off, bit 1: shadow map objects kept longer)
+   bool settle = false; // Right after a combo switch: not compared
    uint32_t w = 0, h = 0;
    std::vector<float> depth;
    std::map<std::string, std::vector<uint8_t>> gray; // game_shadow, rt_raw, rt_denoised
@@ -122,6 +124,10 @@ static bool Load(const fs::path& dir, int index, Capture& c)
    ParseList(c.meta["cam_pos"], c.cam, 3);
    ParseList(c.meta["cam_fwd"], c.fwd, 3);
    c.phase = std::stoi(c.meta["phase"]);
+   if (c.meta.count("combo"))
+      c.combo = std::stoi(c.meta["combo"]);
+   if (c.meta.count("settle"))
+      c.settle = c.meta["settle"] == "1";
    double size[2] = {};
    if (!ParseList(c.meta["size_depth"], size, 2))
       return false;
@@ -217,13 +223,15 @@ int main(int argc, char** argv)
    {
       double flips[5] = {};
       double rt_same_scene = 0;
-      int pairs = 0;
-   } sums[2];
+      double max_rt = 0;
+      int pairs = 0, spikes = 0; // spikes: pairs with more than 5 % of rt_denoised flipping
+   };
+   std::map<int, Sum> sums; // phase * 10 + combo
    for (size_t k = 1; k < captures.size(); k++)
    {
       const Capture& a = captures[k - 1];
       const Capture& b = captures[k];
-      if (a.phase != b.phase || a.w != b.w || a.h != b.h)
+      if (a.phase != b.phase || a.combo != b.combo || a.settle || b.settle || a.w != b.w || a.h != b.h)
          continue;
       const double move = std::sqrt((a.cam[0] - b.cam[0]) * (a.cam[0] - b.cam[0]) + (a.cam[1] - b.cam[1]) * (a.cam[1] - b.cam[1]) + (a.cam[2] - b.cam[2]) * (a.cam[2] - b.cam[2]));
       const double dot = std::clamp(a.fwd[0] * b.fwd[0] + a.fwd[1] * b.fwd[1] + a.fwd[2] * b.fwd[2], -1.0, 1.0);
@@ -294,13 +302,15 @@ int main(int argc, char** argv)
             changed += SceneClass(&a.scene_sun[i * 3]) != SceneClass(&b.scene_sun[i * 3]);
          snprintf(sun_text, sizeof(sun_text), "%.2f%%", 100.0 * changed / (double(b.w) * b.h));
       }
-      Sum& sum = sums[b.phase & 1];
+      Sum& sum = sums[(b.phase & 1) * 10 + b.combo];
       for (int s = 0; s < 5; s++)
          sum.flips[s] += pct[s];
       sum.rt_same_scene += rt_same;
+      sum.max_rt = std::max(sum.max_rt, pct[2]);
+      sum.spikes += pct[2] > 5.0;
       sum.pairs++;
       auto m = [&](const Capture& c, const char* key) { auto it = c.meta.find(key); return it != c.meta.end() ? it->second : std::string("?"); };
-      printf("  c%04d-c%04d   %d    %6.2f   %6.1f  %7llu | %15.2f %7.2f %7.2f %7.2f %7.2f | %29.2f | %10s/%-4s | %5s %4s %5s\n", a.index, b.index, b.phase, move, turn, (unsigned long long)compared, pct[0], pct[1], pct[2], pct[3],
+      printf("  c%04d-c%04d %d/%d  %6.2f   %6.1f  %7llu | %15.2f %7.2f %7.2f %7.2f %7.2f | %29.2f | %10s/%-4s | %5s %4s %5s\n", a.index, b.index, b.phase, b.combo, move, turn, (unsigned long long)compared, pct[0], pct[1], pct[2], pct[3],
          pct[4], rt_same, m(b, "screen_shadows_rt").c_str(), m(b, "screen_shadows_game").c_str(), m(b, "tlas_instances").c_str(), m(b, "new").c_str(), m(b, "evicted").c_str());
       printf("               sun view flipped %s\n", sun_text);
    }
@@ -339,15 +349,16 @@ int main(int argc, char** argv)
          printf("  mesh %08X: in %d captures, largest gap between the shadow map copy and the camera copy %.3f m%s\n", key, p.captures, p.max_gap, p.max_gap > 0.05 ? "  <-- MISPLACED" : "");
    }
    const char* names[5] = { "game_shadow", "rt_raw", "rt_denoised", "scene", "final" };
-   for (int phase = 0; phase < 2; phase++)
+   const char* combo_names[4] = { "default (openables from shadow map, short shadow young)", "openables from shadow map OFF", "shadow map objects kept longer", "openables OFF + kept longer" };
+   printf("\nper combo (pairs within a block, settling captures skipped): mean %% of compared pixels flipping\n");
+   printf("  %-58s %5s | %8s %7s %7s %7s %7s | %6s %6s\n", "combo", "pairs", "game_sh", "rt_raw", "rt_den", "scene", "final", "max rt", "spikes");
+   for (const auto& [id, s] : sums)
    {
-      const Sum& s = sums[phase];
       if (!s.pairs)
          continue;
-      printf("\nphase %d (%s), mean %% of compared pixels flipping between captures, over %d pairs:\n", phase, phase ? "ray tracing scene frozen" : "as is", s.pairs);
-      for (int k = 0; k < 5; k++)
-         printf("  %-12s %6.2f\n", names[k], s.flips[k] / s.pairs);
-      printf("  rt_denoised where the scene class is unchanged: %6.2f\n", s.rt_same_scene / s.pairs);
+      const int phase = id / 10, combo = id % 10;
+      std::string name = phase ? std::string("FROZEN scene, ") + combo_names[combo & 3] : combo_names[combo & 3];
+      printf("  %-58s %5d | %8.2f %7.2f %7.2f %7.2f %7.2f | %6.2f %6d\n", name.c_str(), s.pairs, s.flips[0] / s.pairs, s.flips[1] / s.pairs, s.flips[2] / s.pairs, s.flips[3] / s.pairs, s.flips[4] / s.pairs, s.max_rt, s.spikes);
    }
    printf("\nReading: the game's shadow is the stable reference. scene flips = casters appearing/vanishing in the ray tracing scene;\n"
           "rt flips with the scene unchanged = the trace or the denoiser; final flips with rt stable = the game not using the RT result.\n");

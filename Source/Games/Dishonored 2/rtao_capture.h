@@ -339,6 +339,8 @@ namespace RTAO
       std::vector<FrameMeshProbe> GetProbes() { const std::lock_guard lock(mutex); return probes; }
       // Test toggle: per frame meshes (openables) from shadow map draws are skipped while this is off
       std::atomic<bool> shadow_frame_meshes_enabled = true;
+      // Set to drop the held movables at the next Record (diagnostic test matrix: a switch must not inherit them)
+      std::atomic<bool> drop_retained_request = false;
       void OnDestroyBuffer(ID3D11Buffer* buffer);
       // The game wrote into a buffer (UpdateSubresource, a copy into it). If the capture copied it already, it is counted
       // and, with "forget", dropped like a destroyed buffer (its meshes' BLASes evicted, copied again at the next draw).

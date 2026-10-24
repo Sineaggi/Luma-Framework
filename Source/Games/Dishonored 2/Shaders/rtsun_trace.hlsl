@@ -57,7 +57,7 @@ float3 DepthNormal(uint2 px, float3 p0)
 // ---- Debug scene view (RTSun::Output::SceneView / SceneSun): what the TLAS holds, colored by where it was captured.
 // The color goes out packed as RGB565 in the 16 bit visibility (Luma_RTAO.hlsl ao_view_ps unpacks it).
 static const uint kDebugSceneView = 5; // From the camera, through each pixel
-static const uint kDebugSceneSun = 6;  // From the sun, orthographic, a 60 x 60 m area around the camera (what shadow rays can hit)
+static const uint kDebugSceneSun = 6;  // From the sun, orthographic, a 60 m tall area around the camera, 40 m up the light to 40 m past it
 // Must match rtao_accel.h
 static const uint kSourceMain = 0x01, kSourceShadow = 0x02, kFlagFrameMesh = 0x04, kFlagMvp = 0x08, kFlagSkinned = 0x10;
 
@@ -93,30 +93,23 @@ void DebugScene(uint2 px, bool from_sun)
         float3 t = abs(L.z) < 0.999 ? normalize(cross(L, float3(0, 0, 1))) : float3(1, 0, 0);
         float3 b = cross(L, t);
         float2 xy = (uv * 2.0 - 1.0) * float2(30.0 * float(Size.x) / float(Size.y), -30.0);
-        ray.Origin = CamPos + L * 200.0 + t * xy.x + b * xy.y;
+        ray.Origin = CamPos + L * 40.0 + t * xy.x + b * xy.y;
         ray.Direction = -L;
-        ray.TMax = 400.0;
+        ray.TMax = 80.0;
     }
     else
     {
         float4 h = mul(float4(uv.x * 2.0 - 1.0, 1.0 - uv.y * 2.0, 0.5, 1.0), InvViewProj);
         ray.Origin = CamPos;
         ray.Direction = normalize(h.xyz / h.w - CamPos);
-        ray.TMax = 3000.0;
+        ray.TMax = 200.0;
     }
     ray.TMin = 0.0;
-    // Closest hit; cutouts tested like the shadow rays (their mask, else counted solid)
-    RayQuery<RAY_FLAG_SKIP_PROCEDURAL_PRIMITIVES> q;
-    q.TraceRayInline(Scene, RAY_FLAG_NONE, 0xFF, ray);
-    while (q.Proceed())
-    {
-        if (q.CandidateType() == CANDIDATE_NON_OPAQUE_TRIANGLE)
-        {
-            int solid = (q.CandidateInstanceID() & kInstanceIdCutoutBit) != 0 ? CutoutAlphaTest(q.CandidateInstanceID(), q.CandidatePrimitiveIndex(), q.CandidateTriangleBarycentrics()) : 1;
-            if (solid != 0)
-                q.CommitNonOpaqueTriangleHit();
-        }
-    }
+    // Closest hit, everything forced opaque (cutouts show as solid, darker): no candidate loop, so a debug view stays
+    // cheap and bounded (a long ray through many alpha tested layers once hung the GPU into a device removal)
+    RayQuery<RAY_FLAG_SKIP_PROCEDURAL_PRIMITIVES | RAY_FLAG_FORCE_OPAQUE> q;
+    q.TraceRayInline(Scene, RAY_FLAG_FORCE_OPAQUE, 0xFF, ray);
+    q.Proceed();
     float3 c;
     if (q.CommittedStatus() != COMMITTED_TRIANGLE_HIT)
         c = float3(0.12, 0.12, 0.12); // Nothing in the ray tracing scene
@@ -126,7 +119,7 @@ void DebugScene(uint2 px, bool from_sun)
         bool cutout = (q.CommittedInstanceID() & kInstanceIdCutoutBit) != 0 && (flags & kFlagFrameMesh) == 0;
         // Per triangle shade (shows the mesh), plus a little depth falloff
         float shade = 0.7 + 0.3 * float(Hash(q.CommittedPrimitiveIndex() * 0x9E3779B9u + q.CommittedInstanceIndex()) & 255) / 255.0;
-        shade *= lerp(1.0, 0.6, saturate(q.CommittedRayT() / (from_sun ? 400.0 : 150.0)));
+        shade *= lerp(1.0, 0.6, saturate(q.CommittedRayT() / (from_sun ? 80.0 : 150.0)));
         c = SourceColor(flags, cutout) * shade;
     }
     VisRaw[px] = PackRGB565(c);

@@ -2284,6 +2284,8 @@ namespace RTAO
       {
          const BuildContext ctx = { info.device, list, &retirer, info.submit_fence_value };
          frame_blases.BeginFrame();
+         if (drop_retained_request.exchange(false))
+            frame_blases.DropRetained();
          bool any = false, any_indexed = false;
          for (const auto& record : work)
          {

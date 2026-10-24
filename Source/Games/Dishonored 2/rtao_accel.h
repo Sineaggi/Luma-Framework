@@ -144,6 +144,13 @@ namespace RTAO
                fn(pair.second.result->GetGPUVirtualAddress(), pair.second.source);
       }
       size_t RetainedCount() const { return retained_count; }
+      // Held entries (not drawn this frame) lose "retain": EndFrame evicts them like any other entry
+      void DropRetained()
+      {
+         for (auto& pair : entries)
+            if (pair.second.last_frame != frame)
+               pair.second.retain = false;
+      }
       // UAV barrier for the frame's builds, evicts unused entries
       void EndFrame(const BuildContext& ctx);
       void Clear(Retirer* retirer, uint64_t fence_value);

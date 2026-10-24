@@ -311,7 +311,11 @@ namespace
       uint32_t index = 0; // Captures taken
       uint32_t frame = 0;
       int phase = 0; // 0 as is, 1 scene frozen
-      bool saved_freeze = false;
+      bool saved_freeze = false, saved_openables = true, saved_young_long = false;
+      // Test matrix: combo bit 0 = openables from the shadow map OFF, bit 1 = keep shadow map objects longer ON
+      int combo = 0;
+      std::chrono::steady_clock::time_point switch_time;
+      std::atomic<bool> reset_history = false; // The sun denoiser's history, at a switch (consumed by PrepareRTSun)
       // The pending capture per staging set: its number and metadata, read back at a later present
       int pending_set = -1;
       uint32_t pending_index = 0, pending_frame = 0;
@@ -330,7 +334,9 @@ namespace
       std::string status = "idle";
    };
    RTDiagCapture g_rtdiag;
-   constexpr double kRTDiagPhaseSeconds = 5.0, kRTDiagInterval = 0.2;
+   // ~20 s cycling the 4 test combos in 1 s blocks (the order rotates every 4 blocks, so each combo sees similar camera
+   // motion), then 4 s with the ray tracing scene frozen. Captures within kRTDiagSettle of a switch are tagged settle=1.
+   constexpr double kRTDiagMatrixSeconds = 20.0, kRTDiagFrozenSeconds = 4.0, kRTDiagBlock = 1.0, kRTDiagSettle = 0.3, kRTDiagInterval = 0.2;
 
    std::mutex g_rtsun_status_mutex;
    // The RT sun output is one of the debug scene views (a color image of the ray tracing scene, shown fullscreen)
@@ -885,9 +891,12 @@ public:
          g_rtdiag.frame = 0;
          g_rtdiag.phase = 0;
          g_rtdiag.saved_freeze = g_rtao_freeze_scene;
+         g_rtdiag.saved_openables = g_rtdbg_shadow_openables;
+         g_rtdiag.saved_young_long = g_rtdbg_shadow_young_long;
+         g_rtdiag.combo = -1;
          g_rtdiag.pending_set = -1;
          g_rtdiag.timeline.clear();
-         g_rtdiag.timeline.push_back("frame,t_ms,phase,frozen,screen_shadows_rt,screen_shadows_game,tlas_instances,retained,new,evicted_promoted,evicted_young,frame_meshes,movables_kept,cam_x,cam_y,cam_z,fwd_x,fwd_y,fwd_z");
+         g_rtdiag.timeline.push_back("frame,t_ms,phase,combo,frozen,screen_shadows_rt,screen_shadows_game,tlas_instances,retained,new,evicted_promoted,evicted_young,frame_meshes,movables_kept,cam_x,cam_y,cam_z,fwd_x,fwd_y,fwd_z");
          g_rtdiag.last_bound = g.rtsun_bound_draws;
          g_rtdiag.last_stale = g.rtsun_stale_draws;
          g_rtdiag.active = true;
@@ -906,7 +915,7 @@ public:
       {
          char line[512];
          const RTAO::RetentionStats& r = stats.retention;
-         snprintf(line, sizeof(line), "%u,%.1f,%d,%d,%u,%u,%u,%u,%u,%u,%u,%llu,%llu,%.3f,%.3f,%.3f,%.4f,%.4f,%.4f", g_rtdiag.frame, t * 1000.0, g_rtdiag.phase, int(g_rtao_freeze_scene),
+         snprintf(line, sizeof(line), "%u,%.1f,%d,%d,%d,%u,%u,%u,%u,%u,%u,%u,%llu,%llu,%.3f,%.3f,%.3f,%.4f,%.4f,%.4f", g_rtdiag.frame, t * 1000.0, g_rtdiag.phase, g_rtdiag.combo, int(g_rtao_freeze_scene),
             bound_now, stale_now, g.rtao_tlas_instances.load(), r.promoted + r.young, r.added_new, r.evicted_promoted, r.evicted_young, (unsigned long long)stats.frame_draws,
             (unsigned long long)stats.frame_retained, g.rtdiag_cam_pos[0], g.rtdiag_cam_pos[1], g.rtdiag_cam_pos[2], g.rtdiag_cam_fwd[0], g.rtdiag_cam_fwd[1], g.rtdiag_cam_fwd[2]);
          g_rtdiag.timeline.push_back(line);
@@ -968,10 +977,12 @@ public:
          g_rtdiag.pending_set = -1;
       }
 
-      // Phases
-      if (t >= 2 * kRTDiagPhaseSeconds)
+      // Phases: the test matrix, then the frozen scene
+      if (t >= kRTDiagMatrixSeconds + kRTDiagFrozenSeconds)
       {
          g_rtao_freeze_scene = g_rtdiag.saved_freeze;
+         g_rtdbg_shadow_openables = g_rtdiag.saved_openables;
+         g_rtdbg_shadow_young_long = g_rtdiag.saved_young_long;
          g_rtdiag.active = false;
          std::ofstream(std::filesystem::path(g_rtdiag.dir) / "timeline.csv") << [&]() {
             std::string all;
@@ -984,8 +995,25 @@ public:
          g_rtdiag.frame++;
          return;
       }
-      g_rtdiag.phase = t >= kRTDiagPhaseSeconds ? 1 : 0;
-      g_rtao_freeze_scene = g_rtdiag.phase == 1 ? true : g_rtdiag.saved_freeze;
+      const bool frozen = t >= kRTDiagMatrixSeconds;
+      int combo = 0;
+      if (!frozen)
+      {
+         const int block = int(t / kRTDiagBlock);
+         combo = (block + block / 4) % 4;
+      }
+      if (combo != g_rtdiag.combo || int(frozen) != g_rtdiag.phase)
+      {
+         // A switch: the new combo must not inherit the previous one's state
+         g_rtdiag.switch_time = now;
+         g_rtdiag.reset_history = true;
+         g.rtao_capture.drop_retained_request = true;
+      }
+      g_rtdiag.combo = combo;
+      g_rtdiag.phase = frozen ? 1 : 0;
+      g_rtdbg_shadow_openables = frozen ? g_rtdiag.saved_openables : (combo & 1) == 0;
+      g_rtdbg_shadow_young_long = frozen ? g_rtdiag.saved_young_long : (combo & 2) != 0;
+      g_rtao_freeze_scene = frozen ? true : g_rtdiag.saved_freeze;
 
       // A capture: copy every stage of this frame into the free staging set
       if (now >= g_rtdiag.next && g_rtdiag.pending_set < 0)
@@ -1074,7 +1102,8 @@ public:
             add("tlas_instances=%u\nretained=%u\npromoted=%u\nyoung=%u\nmain_only=%u\nshadow_only=%u\nboth=%u\nnew=%u\nevicted=%u\n", g.rtao_tlas_instances.load(), r.promoted + r.young, r.promoted, r.young,
                r.main_only, r.shadow_only, r.both, r.added_new, r.evicted_promoted + r.evicted_young);
             add("frame_meshes=%llu\nmovables_kept=%llu\n", (unsigned long long)stats.frame_draws, (unsigned long long)stats.frame_retained);
-            add("test_shadow_openables=%d\ntest_shadow_young_long=%d\n", int(g_rtdbg_shadow_openables), int(g_rtdbg_shadow_young_long));
+            add("test_shadow_openables=%d\ntest_shadow_young_long=%d\ncombo=%d\nsettle=%d\n", int(g_rtdbg_shadow_openables), int(g_rtdbg_shadow_young_long), g_rtdiag.combo,
+               int(std::chrono::duration<double>(now - g_rtdiag.switch_time).count() < kRTDiagSettle));
             // Per frame mesh probes: key, flags (1 from a shadow map, 2 skinned), vertex 0 world position
             for (const auto& probe : g.rtao_capture.GetProbes())
                add("probe=%08X,%u,%.4f,%.4f,%.4f\n", probe.key, probe.flags, probe.pos[0], probe.pos[1], probe.pos[2]);
@@ -1386,7 +1415,7 @@ public:
       out.ray_count = uint32_t(std::clamp(g_rtsun_rays, 1, 16));
       const int output = std::clamp(g_rtsun_output, 0, int(RTSun::Output::Count) - 1);
       out.output = RTSun::Output(output);
-      out.reset_history = output != game_device_data.rtsun_last_output;
+      out.reset_history = output != game_device_data.rtsun_last_output || g_rtdiag.reset_history.exchange(false);
       game_device_data.rtsun_last_output = output;
       return true;
    }
@@ -3500,10 +3529,10 @@ public:
       if (ImGui::IsItemHovered())
          ImGui::SetTooltip("What the trace writes. Check it with \"View AO only\" = RT sun visibility.");
       // Debug (shared with RTAO's scene), next to the sun output where they are used
-      if (ImGui::Button(g_rtdiag.active ? "RT diagnostic capture: running..." : "RT diagnostic capture (10 s, Ctrl+Shift+Pause)") && !g_rtdiag.active)
+      if (ImGui::Button(g_rtdiag.active ? "RT diagnostic capture: running..." : "RT diagnostic capture (24 s, Ctrl+Shift+Pause)") && !g_rtdiag.active)
          g_rtdiag.start_requested = true;
       if (ImGui::IsItemHovered())
-         ImGui::SetTooltip("Saves ~50 captures over 10 s into RTDiag\\<time> next to the game exe: 5 s as is, then 5 s with the ray tracing scene frozen.\n"
+         ImGui::SetTooltip("Saves ~120 captures over 24 s into RTDiag\\<time> next to the game exe: 20 s cycling the RT test toggles automatically, then 4 s with the ray tracing scene frozen.\n"
                            "Each has, from the same frame: the game's own shadow, the RT raw and denoised shadow, the scene view, depth and the final image.\n"
                            "Stand where the problem shows and turn slowly (or hold still) while it runs.");
       ImGui::SameLine();

@@ -145,6 +145,10 @@ void main(uint3 id : SV_DispatchThreadID)
                 if (solid > 0)
                     q.CommitNonOpaqueTriangleHit(); // Ends the search (ACCEPT_FIRST_HIT_AND_END_SEARCH)
             }
+            else if (q.CandidateType() == CANDIDATE_NON_OPAQUE_TRIANGLE)
+            {
+                q.CommitNonOpaqueTriangleHit(); // Skinned characters (non opaque for the sun's self shadow test): solid for the AO
+            }
         }
         if (q.CommittedStatus() == COMMITTED_TRIANGLE_HIT)
         {

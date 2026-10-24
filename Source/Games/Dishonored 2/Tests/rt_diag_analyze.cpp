@@ -496,7 +496,7 @@ int main(int argc, char** argv)
             b.row.min_slice == 255 ? "-" : std::to_string(b.row.min_slice).c_str(), b.row.indices, b.row.vertices, b.row.pos[0], b.row.pos[1], b.row.pos[2]);
       }
    }
-   const char* combo_names[4] = { "default (near slices only, static shadow world kept)", "near slices only, OLD retention", "ALL slices, OLD retention", "(unused)" };
+   const char* combo_names[4] = { "current settings", "(combo 1)", "(combo 2)", "(combo 3)" };
    printf("\nper combo (pairs within a block, settling captures skipped): mean %% of compared pixels flipping\n");
    printf("  %-58s %5s | %8s %7s %7s %7s %7s | %6s %6s\n", "combo", "pairs", "game_sh", "rt_raw", "rt_den", "scene", "final", "max rt", "spikes");
    printf("\nper combo, agreement with the game's own shadow (captures with window light in view):\n");

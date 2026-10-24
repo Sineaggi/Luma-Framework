@@ -1026,27 +1026,14 @@ public:
          g_rtdiag.frame++;
          return;
       }
+      // The current settings as they are, then the scene frozen. No switching and no resets: the game keeps its shadow
+      // map content (draws an object into it once), so ray tracing scene objects taken from it can't be dropped and
+      // recovered (the 54b8f2b8 capture: 892 -> 292 instances, never back).
       const bool frozen = t >= kRTDiagMatrixSeconds;
-      int combo = 0;
-      if (!frozen)
-      {
-         const int block = int(t / kRTDiagBlock);
-         combo = (block + block / 3) % 3; // 0 near + static retention, 1 near + old retention, 2 all slices + old retention
-      }
-      if (combo != g_rtdiag.combo || int(frozen) != g_rtdiag.phase)
-      {
-         // A switch: the new combo must not inherit the previous one's state
+      if (int(frozen) != g_rtdiag.phase)
          g_rtdiag.switch_time = now;
-         g_rtdiag.reset_history = true;
-         g.rtao_capture.drop_retained_request = true;
-         g.rtao_tlas.drop_shadow_request = true; // No combo inherits another's shadow map objects
-      }
-      g_rtdiag.combo = combo;
+      g_rtdiag.combo = 0;
       g_rtdiag.phase = frozen ? 1 : 0;
-      g_rtdbg_shadow_openables = g_rtdiag.saved_openables;
-      // Every slice is only ever tested with the old (bounded) retention: far slice copies kept until unloaded would pile up
-      g_rtdbg_shadow_young_long = frozen ? g_rtdiag.saved_young_long : combo != 0;
-      g_rtao_shadow_near_only = frozen ? g_rtdiag.saved_near_only : combo != 2;
       g_rtao_freeze_scene = frozen ? true : g_rtdiag.saved_freeze;
 
       // A capture: copy every stage of this frame into the free staging set
@@ -3642,7 +3629,7 @@ public:
       if (ImGui::Button(g_rtdiag.active ? "RT diagnostic capture: running..." : "RT diagnostic capture (24 s, Ctrl+Shift+Pause)") && !g_rtdiag.active)
          g_rtdiag.start_requested = true;
       if (ImGui::IsItemHovered())
-         ImGui::SetTooltip("Saves ~120 captures over 24 s into RTDiag\\<time> next to the game exe: 20 s cycling the RT test toggles automatically, then 4 s with the ray tracing scene frozen.\n"
+         ImGui::SetTooltip("Saves ~120 captures over 24 s into RTDiag\\<time> next to the game exe: 20 s with the current settings, then 4 s with the ray tracing scene frozen.\n"
                            "Each has, from the same frame: the game's own shadow, the RT raw and denoised shadow, the scene view, depth and the final image.\n"
                            "Stand where the problem shows and turn slowly (or hold still) while it runs.");
       ImGui::SameLine();

@@ -57,6 +57,7 @@ float3 DepthNormal(uint2 px, float3 p0)
 // ---- Debug scene view (RTSun::Output::SceneView / SceneSun): what the TLAS holds, colored by where it was captured.
 // The color goes out packed as RGB565 in the 16 bit visibility (Luma_RTAO.hlsl ao_view_ps unpacks it).
 static const uint kDebugSceneView = 5; // From the camera, through each pixel
+static const float kSkinSelfDistance = 0.08; // A shadow ray ignores a character hit closer than this to its origin (self shadow)
 static const uint kDebugBlocker = 7;    // One hard shadow ray: TLAS index + 1 of the closest blocker, 0 if lit (16 bit id)
 static const uint kDebugSceneSun = 6;  // From the sun, orthographic, a 60 m tall area around the camera, 40 m up the light to 40 m past it
 // Must match rtao_accel.h
@@ -181,6 +182,10 @@ void main(uint3 id : SV_DispatchThreadID)
                 if (solid != 0)
                     q.CommitNonOpaqueTriangleHit();
             }
+            else if (q.CandidateType() == CANDIDATE_NON_OPAQUE_TRIANGLE && q.CandidateTriangleRayT() > kSkinSelfDistance)
+            {
+                q.CommitNonOpaqueTriangleHit(); // A character, beyond its own surface
+            }
         }
         VisRaw[px] = q.CommittedStatus() == COMMITTED_TRIANGLE_HIT ? float(min(q.CommittedInstanceIndex() + 1, 65535u)) / 65535.0 : 0.0;
         CutoutFlushCounters();
@@ -236,6 +241,10 @@ void main(uint3 id : SV_DispatchThreadID)
                 }
                 if (solid > 0)
                     q.CommitNonOpaqueTriangleHit();
+            }
+            else if (q.CandidateType() == CANDIDATE_NON_OPAQUE_TRIANGLE && q.CandidateTriangleRayT() > kSkinSelfDistance)
+            {
+                q.CommitNonOpaqueTriangleHit(); // A character (non opaque), beyond its own surface: blocks
             }
         }
         if (q.CommittedStatus() != COMMITTED_TRIANGLE_HIT)

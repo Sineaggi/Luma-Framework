@@ -635,7 +635,11 @@ namespace RTAO
       D3D12_RAYTRACING_INSTANCE_DESC desc = {};
       std::memcpy(desc.Transform, object_to_world, sizeof(desc.Transform));
       desc.InstanceMask = mask;
-      desc.Flags = D3D12_RAYTRACING_INSTANCE_FLAG_TRIANGLE_CULL_DISABLE | D3D12_RAYTRACING_INSTANCE_FLAG_FORCE_OPAQUE;
+      // Skinned characters go through the traces' candidate loops (non opaque): the sun's shadow rays skip a hit on a
+      // character within kSkinSelfDistance of their origin (a body shadowing itself: its replayed skinning is not
+      // exactly the rendered surface); the AO commits them as solid.
+      desc.Flags = D3D12_RAYTRACING_INSTANCE_FLAG_TRIANGLE_CULL_DISABLE |
+         ((source & kInstanceFlagSkinned) ? D3D12_RAYTRACING_INSTANCE_FLAG_FORCE_NON_OPAQUE : D3D12_RAYTRACING_INSTANCE_FLAG_FORCE_OPAQUE);
       desc.AccelerationStructure = blas;
       desc.InstanceContributionToHitGroupIndex = source | kInstanceFlagFrameMesh; // Debug scene view only (inline ray queries have no hit groups)
       frame_instances.push_back(desc);

@@ -474,6 +474,26 @@ aged out by the retention meant for the main view (2 frames young, then 180). Ch
   by source, new and evicted instances, moving copies, MVP rekeys, and how often the shared camera copy was from
   another frame or differed.
 
+### Diagnostic capture
+
+To settle where a visible change starts (popping, wobble) without guessing: "RT diagnostic capture" in the Luma
+panel (or Ctrl+Shift+F9) records ~10 s into `RTDiag\<time>` next to the game exe. It runs 5 s as is, then 5 s with
+the ray tracing scene frozen, at ~5 captures per second. Each capture holds, from the same frame:
+- `game_shadow`: the game's own screen shadow (its draw run again into a side target, without the RT input);
+- `rt_raw`: the trace before the denoiser (the sun pass's debug output 0);
+- `rt_denoised`: what the lighting reads;
+- `scene`: the camera scene view, traced into a side target (debug output 1);
+- `depth`;
+- `final`: the back buffer.
+Each is written at quarter resolution as `.bin` and `.png`. `cNNNN.txt` holds the camera, light, TLAS counts by
+source, kept movables, and whether the screen shadows draw used the RT result that frame. `timeline.csv` has every
+frame of the run. `Tests/rt_diag_analyze.cpp <folder>` reprojects each capture into the previous one through depth
+and the cameras, and reports per stage the share of same-surface pixels that flipped. Read the stages in order: the
+game's shadow is the reference; scene flips are casters changing; RT flips with the scene unchanged come from the
+trace or the denoiser; final flips with RT stable mean the lighting didn't use the RT result.
+The sun pass's debug outputs were checked offline to equal the Raw and SceneView outputs of the same frame
+(rtsun_test.inl).
+
 ### Local lights (not implemented)
 
 Point/spot/area lights are in `tlf_light_tCB.co_tlf_lights[]` (float3 mWorldPosition, mRadiusFalloff, mColor,

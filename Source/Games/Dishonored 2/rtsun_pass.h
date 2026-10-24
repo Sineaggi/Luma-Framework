@@ -88,6 +88,9 @@ namespace RTSun
       bool cutout_exact = true;
       Output output = Output::Denoised;
       bool reset_history = false;
+      // Diagnostic capture (main.cpp "RT diagnostic capture"): also write the raw visibility and the camera scene view
+      // of the same frame into the two debug shared textures (GetDebugSRV), without touching the output or its history
+      bool debug_outputs = false;
    };
 
    class SunPass
@@ -103,6 +106,11 @@ namespace RTSun
       bool EnsureTargets(ID3D11Device* device11, uint32_t width, uint32_t height, std::string& error);
       // The shared visibility texture (R16_UNORM, or R8_UNORM), AddRef'd. Null until EnsureTargets succeeded.
       ID3D11ShaderResourceView* GetSRV();
+      // Diagnostic capture: EnsureTargets also creates the debug targets while this is set. GetDebugSRV(0): raw visibility,
+      // (1): scene view from the camera (RGB565), AddRef'd, null if not created.
+      void SetDebugOutputs(bool enabled) { debug_requested = enabled; }
+      ID3D11ShaderResourceView* GetDebugSRV(uint32_t index);
+      DXGI_FORMAT GetVisFormat() const { return vis_format; }
 
       // Inside an Interop recorder, after the TLAS of the frame was built: trace + filter into the private texture,
       // then copy it into the shared one. Needs EnsureTargets at info.ao_width x info.ao_height. Always full resolution
@@ -153,14 +161,22 @@ namespace RTSun
       ID3D12Resource* shared12 = nullptr; // vis_format, shared with D3D11 (COMMON outside the recorder)
       ID3D11Texture2D* shared11 = nullptr;
       ID3D11ShaderResourceView* srv11 = nullptr;
+      // Diagnostic capture targets (created by EnsureTargets while debug_requested)
+      std::atomic<bool> debug_requested = false;
+      ID3D12Resource* dbg_vis[2] = {}; // vis_format UAVs: raw, scene view
+      ID3D12Resource* dbg_hist = nullptr; // R32G32_UINT scratch the filter writes in its "off" mode (keeps the real history)
+      ID3D12Resource* dbg_shared12[2] = {};
+      ID3D11Texture2D* dbg_shared11[2] = {};
+      ID3D11ShaderResourceView* dbg_srv11[2] = {};
       std::vector<IUnknown*> graveyard; // D3D12 objects to retire at the next Record
 
       // Descriptors (recorder thread). Per history parity p, 5 from p * 5: [depth SRV, raw UAV, vis UAV, hist prev, hist cur],
-      // then [10] the cutout atlas SRV
+      // then [10] the cutout atlas SRV, then the debug tables from 11 + 5 * i: [depth SRV, raw UAV, dbg_vis[i], hist, dbg_hist]
       ID3D12DescriptorHeap* heap = nullptr;
       uint32_t descriptor_size = 0;
       uint32_t heap_generation = UINT32_MAX; // Interop targets generation the heap was made for
       uint32_t heap_targets_version = UINT32_MAX;
+      bool heap_debug = false; // The heap has the debug tables
 
       uint32_t parity = 0;
       bool has_history = false;

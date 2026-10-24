@@ -24,8 +24,18 @@
 #include "rtao_capture.h"
 #include "rtao_pass.h"
 #include "rtsun_pass.h"
+#include "rt_debug_capture.h"
 
+#include <chrono>
+#include <ctime>
+#include <filesystem>
+#include <fstream>
 #include <shared_mutex>
+#include <thread>
+
+#define STB_IMAGE_WRITE_STATIC
+#define STB_IMAGE_WRITE_IMPLEMENTATION
+#include "../../External/reshade/deps/fpng/src/stb_image_write.h"
 
 struct CBPerViewGlobals
 {
@@ -272,6 +282,52 @@ namespace
    float g_rtsun_angle = 0.75f; // The light's angular diameter, degrees (config "RTSunAngle"); the real sun is 0.53
    int g_rtsun_rays = 1; // Per pixel per frame (config "RTSunRays")
    int g_rtsun_output = int(RTSun::Output::Denoised); // Config "RTSunOutput"
+   // ---- RT diagnostic capture (RTAO_NOTES.md "Diagnostic capture"): Luma panel button or Ctrl+Shift+F9. About 10 s:
+   // 5 s as is, then 5 s with the ray tracing scene frozen, ~5 captures per second. Each capture copies, from the SAME
+   // frame, the game's own screen shadow (its draw run again into a side target, without the RT input), the RT raw and
+   // denoised visibility, the camera scene view (traced into a side target), the depth and the back buffer, and writes
+   // them small (rt_debug_capture.h) with the frame's camera, light and scene counts. Every frame of the run also gets a
+   // timeline line (did the lighting use the RT result, scene counts). Tests/rt_diag_analyze.cpp compares the captures.
+   struct RTDiagStage
+   {
+      const char* name;
+      RTDiag::Kind kind;
+      int channel;
+      com_ptr<ID3D11Texture2D> staging[2];
+      DXGI_FORMAT format = DXGI_FORMAT_UNKNOWN;
+      uint32_t width = 0, height = 0;
+      bool copied[2] = {};
+   };
+   struct RTDiagCapture
+   {
+      std::mutex mutex;
+      std::atomic<bool> active = false;
+      bool start_requested = false;
+      std::string dir;
+      std::chrono::steady_clock::time_point start, next;
+      uint32_t index = 0; // Captures taken
+      uint32_t frame = 0;
+      int phase = 0; // 0 as is, 1 scene frozen
+      bool saved_freeze = false;
+      // The pending capture per staging set: its number and metadata, read back at a later present
+      int pending_set = -1;
+      uint32_t pending_index = 0, pending_frame = 0;
+      std::string pending_meta;
+      std::vector<std::string> timeline;
+      uint32_t last_bound = 0, last_stale = 0;
+      RTDiagStage stages[6] = {
+         { "game_shadow", RTDiag::Kind::Gray, 1 }, // The game's own screen shadow (y of its target)
+         { "rt_raw", RTDiag::Kind::Gray, 0 },
+         { "rt_denoised", RTDiag::Kind::Gray, 0 }, // What the lighting reads
+         { "scene", RTDiag::Kind::Rgb565, 0 },
+         { "depth", RTDiag::Kind::DepthPacked, 0 },
+         { "final", RTDiag::Kind::Color, 0 },
+      };
+      std::string status = "idle";
+   };
+   RTDiagCapture g_rtdiag;
+   constexpr double kRTDiagPhaseSeconds = 5.0, kRTDiagInterval = 0.2;
+
    std::mutex g_rtsun_status_mutex;
    // The RT sun output is one of the debug scene views (a color image of the ray tracing scene, shown fullscreen)
    bool RTSunSceneView()
@@ -432,6 +488,11 @@ struct GameDeviceDataDishonored2 final : public GameDeviceData
    std::atomic<bool> rtsun_logged_error = false;
    float rtsun_logged_dir[3] = {};
    std::atomic<uint64_t> rtao_cutout_tests = 0, rtao_cutout_hits = 0, rtao_cutout_fallback_tests = 0; // Trace candidates last frame (read back late)
+   // RT diagnostic capture (see g_rtdiag): the game's own screen shadow of the frame (side target), the camera of the SSAO draw
+   com_ptr<ID3D11Texture2D> rtdiag_game_shadow;
+   com_ptr<ID3D11RenderTargetView> rtdiag_game_shadow_rtv;
+   std::atomic<uint32_t> rtdiag_game_shadow_frame = UINT32_MAX;
+   float rtdiag_view_proj[16] = {}, rtdiag_cam_pos[3] = {}, rtdiag_cam_fwd[3] = {};
 };
 
 //TODOFT: Building shaders menu (apply gamma?)
@@ -579,6 +640,9 @@ public:
       g_rtao_main_depth_width = depth_desc.Width;
       g_rtao_main_depth_height = depth_desc.Height;
       RTAO::PassSettings settings = MakeRTAOSettings(output);
+      std::memcpy(game_device_data.rtdiag_view_proj, settings.view_proj, sizeof(settings.view_proj)); // RT diagnostic capture
+      std::memcpy(game_device_data.rtdiag_cam_pos, settings.cam_pos, sizeof(settings.cam_pos));
+      std::memcpy(game_device_data.rtdiag_cam_fwd, settings.cam_fwd, sizeof(settings.cam_fwd));
       settings.reset_history = output != game_device_data.rtao_last_output || g_rtao_quality != game_device_data.rtao_last_quality;
       game_device_data.rtao_last_output = output;
       game_device_data.rtao_last_quality = g_rtao_quality;
@@ -700,6 +764,318 @@ public:
 
    // "View AO only" debug: draws the selected AO texture fullscreen as grey over the back buffer, at present (after
    // Luma's display composition, so it covers the scene and the UI)
+
+   // The game's screen shadows draw again, without the RT input (the replaced shader then computes the game's own shadow),
+   // into a side copy of its render target: stage "game_shadow" of the diagnostic capture. Render thread of that draw.
+   static void RTDiagDrawGameShadow(ID3D11Device* native_device, ID3D11DeviceContext* context, GameDeviceDataDishonored2& g, std::function<void()>* original_draw_dispatch_func)
+   {
+      ID3D11RenderTargetView* rtvs[D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT] = {};
+      ID3D11DepthStencilView* dsv = nullptr;
+      context->OMGetRenderTargets(D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT, rtvs, &dsv);
+      if (rtvs[0])
+      {
+         com_ptr<ID3D11Resource> resource;
+         rtvs[0]->GetResource(&resource);
+         com_ptr<ID3D11Texture2D> texture;
+         D3D11_RENDER_TARGET_VIEW_DESC rtv_desc = {};
+         rtvs[0]->GetDesc(&rtv_desc);
+         if (resource && SUCCEEDED(resource->QueryInterface(&texture)))
+         {
+            D3D11_TEXTURE2D_DESC desc;
+            texture->GetDesc(&desc);
+            ID3D11RenderTargetView* side_rtv = nullptr;
+            {
+               const std::lock_guard lock(g_rtdiag.mutex);
+               D3D11_TEXTURE2D_DESC have = {};
+               if (g.rtdiag_game_shadow)
+                  g.rtdiag_game_shadow->GetDesc(&have);
+               if (!g.rtdiag_game_shadow || have.Width != desc.Width || have.Height != desc.Height || have.Format != desc.Format)
+               {
+                  g.rtdiag_game_shadow.reset();
+                  g.rtdiag_game_shadow_rtv.reset();
+                  D3D11_TEXTURE2D_DESC side = desc;
+                  side.MipLevels = 1;
+                  side.ArraySize = 1;
+                  side.SampleDesc = { 1, 0 };
+                  side.Usage = D3D11_USAGE_DEFAULT;
+                  side.BindFlags = D3D11_BIND_RENDER_TARGET;
+                  side.CPUAccessFlags = 0;
+                  side.MiscFlags = 0;
+                  if (SUCCEEDED(native_device->CreateTexture2D(&side, nullptr, &g.rtdiag_game_shadow)))
+                     native_device->CreateRenderTargetView(g.rtdiag_game_shadow.get(), &rtv_desc, &g.rtdiag_game_shadow_rtv);
+               }
+               side_rtv = g.rtdiag_game_shadow_rtv.get();
+               if (side_rtv)
+                  side_rtv->AddRef();
+            }
+            if (side_rtv)
+            {
+               ID3D11RenderTargetView* bound[D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT];
+               std::memcpy(bound, rtvs, sizeof(bound));
+               bound[0] = side_rtv;
+               context->OMSetRenderTargets(D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT, bound, dsv);
+               ID3D11ShaderResourceView* no_rt = nullptr;
+               context->PSSetShaderResources(3, 1, &no_rt);
+               (*original_draw_dispatch_func)();
+               context->OMSetRenderTargets(D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT, rtvs, dsv);
+               side_rtv->Release();
+               g.rtdiag_game_shadow_frame = g.rtao_frame;
+            }
+         }
+      }
+      for (auto* rtv : rtvs)
+         if (rtv)
+            rtv->Release();
+      if (dsv)
+         dsv->Release();
+   }
+
+   static ID3D11Resource* RTDiagResource(ID3D11View* view)
+   {
+      if (!view)
+         return nullptr;
+      ID3D11Resource* resource = nullptr;
+      view->GetResource(&resource);
+      view->Release();
+      return resource; // AddRef'd
+   }
+
+   // Present (immediate context): hotkey, phases, the copies of a capture, the readback of the previous one, the timeline
+   static void RTDiagOnPresent(ID3D11Device* native_device, DeviceData& device_data, GameDeviceDataDishonored2& g)
+   {
+      static bool hotkey_down = false;
+      const bool down = (GetAsyncKeyState(VK_CONTROL) & 0x8000) && (GetAsyncKeyState(VK_SHIFT) & 0x8000) && (GetAsyncKeyState(VK_F9) & 0x8000);
+      if (down && !hotkey_down && !g_rtdiag.active)
+         g_rtdiag.start_requested = true;
+      hotkey_down = down;
+
+      com_ptr<ID3D11DeviceContext> context;
+      native_device->GetImmediateContext(&context);
+      const auto now = std::chrono::steady_clock::now();
+
+      if (g_rtdiag.start_requested && !g_rtdiag.active)
+      {
+         g_rtdiag.start_requested = false;
+         wchar_t exe[MAX_PATH] = {};
+         GetModuleFileNameW(nullptr, exe, MAX_PATH);
+         std::filesystem::path dir = std::filesystem::path(exe).parent_path() / "RTDiag";
+         const std::time_t t = std::time(nullptr);
+         std::tm tm = {};
+         localtime_s(&tm, &t);
+         char stamp[32];
+         std::strftime(stamp, sizeof(stamp), "%Y%m%d_%H%M%S", &tm);
+         dir /= stamp;
+         std::error_code ec;
+         std::filesystem::create_directories(dir, ec);
+         if (ec)
+         {
+            g_rtdiag.status = "could not create " + dir.string();
+            return;
+         }
+         g_rtdiag.dir = dir.string();
+         g_rtdiag.start = now;
+         g_rtdiag.next = now + std::chrono::milliseconds(500); // Lets the debug targets come up
+         g_rtdiag.index = 0;
+         g_rtdiag.frame = 0;
+         g_rtdiag.phase = 0;
+         g_rtdiag.saved_freeze = g_rtao_freeze_scene;
+         g_rtdiag.pending_set = -1;
+         g_rtdiag.timeline.clear();
+         g_rtdiag.timeline.push_back("frame,t_ms,phase,frozen,screen_shadows_rt,screen_shadows_game,tlas_instances,retained,new,evicted_promoted,evicted_young,frame_meshes,movables_kept,cam_x,cam_y,cam_z,fwd_x,fwd_y,fwd_z");
+         g_rtdiag.last_bound = g.rtsun_bound_draws;
+         g_rtdiag.last_stale = g.rtsun_stale_draws;
+         g_rtdiag.active = true;
+         g_rtdiag.status = "capturing into " + g_rtdiag.dir;
+         reshade::log::message(reshade::log::level::info, ("RT diag: capture started, " + g_rtdiag.dir).c_str());
+      }
+      if (!g_rtdiag.active)
+         return;
+
+      const double t = std::chrono::duration<double>(now - g_rtdiag.start).count();
+      const RTAO::CaptureStats stats = g.rtao_capture.GetStats();
+      const uint32_t bound = g.rtsun_bound_draws, stale = g.rtsun_stale_draws;
+      const uint32_t bound_now = bound - g_rtdiag.last_bound, stale_now = stale - g_rtdiag.last_stale;
+      g_rtdiag.last_bound = bound;
+      g_rtdiag.last_stale = stale;
+      {
+         char line[512];
+         const RTAO::RetentionStats& r = stats.retention;
+         snprintf(line, sizeof(line), "%u,%.1f,%d,%d,%u,%u,%u,%u,%u,%u,%u,%llu,%llu,%.3f,%.3f,%.3f,%.4f,%.4f,%.4f", g_rtdiag.frame, t * 1000.0, g_rtdiag.phase, int(g_rtao_freeze_scene),
+            bound_now, stale_now, g.rtao_tlas_instances.load(), r.promoted + r.young, r.added_new, r.evicted_promoted, r.evicted_young, (unsigned long long)stats.frame_draws,
+            (unsigned long long)stats.frame_retained, g.rtdiag_cam_pos[0], g.rtdiag_cam_pos[1], g.rtdiag_cam_pos[2], g.rtdiag_cam_fwd[0], g.rtdiag_cam_fwd[1], g.rtdiag_cam_fwd[2]);
+         g_rtdiag.timeline.push_back(line);
+      }
+
+      // Read back the pending capture (copied at least one present ago) and write it on a worker thread
+      if (g_rtdiag.pending_set >= 0 && g_rtdiag.frame > g_rtdiag.pending_frame)
+      {
+         const int set = g_rtdiag.pending_set;
+         struct Out
+         {
+            std::string name;
+            RTDiag::Image image;
+         };
+         auto outs = std::make_shared<std::vector<Out>>();
+         std::string formats;
+         for (RTDiagStage& stage : g_rtdiag.stages)
+         {
+            if (!stage.copied[set] || !stage.staging[set])
+               continue;
+            stage.copied[set] = false;
+            D3D11_MAPPED_SUBRESOURCE mapped = {};
+            if (FAILED(context->Map(stage.staging[set].get(), 0, D3D11_MAP_READ, 0, &mapped)))
+               continue;
+            const bool scrgb = stage.kind == RTDiag::Kind::Color && stage.format == DXGI_FORMAT_R16G16B16A16_FLOAT;
+            RTDiag::Image image = RTDiag::Convert(mapped, stage.format, stage.width, stage.height, stage.kind, stage.channel, scrgb);
+            context->Unmap(stage.staging[set].get(), 0);
+            formats += std::string("format_") + stage.name + "=" + std::to_string(int(stage.format)) + "\n";
+            formats += std::string("size_") + stage.name + "=" + std::to_string(image.width) + "," + std::to_string(image.height) + "\n";
+            if (image.width)
+               outs->push_back({ stage.name, std::move(image) });
+         }
+         char prefix[32];
+         snprintf(prefix, sizeof(prefix), "c%04u", g_rtdiag.pending_index);
+         const std::string base = (std::filesystem::path(g_rtdiag.dir) / prefix).string();
+         const std::string meta = g_rtdiag.pending_meta + formats;
+         std::thread([outs, base, meta]() {
+            std::ofstream(base + ".txt") << meta;
+            for (const Out& out : *outs)
+            {
+               const std::string file = base + "_" + out.name;
+               const RTDiag::Image& im = out.image;
+               if (im.channels == 0)
+               {
+                  std::ofstream(file + ".bin", std::ios::binary).write(reinterpret_cast<const char*>(im.f32.data()), im.f32.size() * sizeof(float));
+                  // Viewable: reversed Z device depth, sqrt for contrast
+                  std::vector<uint8_t> gray(im.f32.size());
+                  for (size_t i = 0; i < gray.size(); i++)
+                     gray[i] = uint8_t(std::lround(std::sqrt(std::clamp(im.f32[i] * 20.f, 0.f, 1.f)) * 255.f));
+                  stbi_write_png((file + ".png").c_str(), int(im.width), int(im.height), 1, gray.data(), int(im.width));
+               }
+               else
+               {
+                  std::ofstream(file + ".bin", std::ios::binary).write(reinterpret_cast<const char*>(im.u8.data()), im.u8.size());
+                  stbi_write_png((file + ".png").c_str(), int(im.width), int(im.height), int(im.channels), im.u8.data(), int(im.width * im.channels));
+               }
+            }
+         }).detach();
+         g_rtdiag.pending_set = -1;
+      }
+
+      // Phases
+      if (t >= 2 * kRTDiagPhaseSeconds)
+      {
+         g_rtao_freeze_scene = g_rtdiag.saved_freeze;
+         g_rtdiag.active = false;
+         std::ofstream(std::filesystem::path(g_rtdiag.dir) / "timeline.csv") << [&]() {
+            std::string all;
+            for (const std::string& l : g_rtdiag.timeline)
+               all += l + "\n";
+            return all;
+         }();
+         g_rtdiag.status = "done: " + std::to_string(g_rtdiag.index) + " captures in " + g_rtdiag.dir;
+         reshade::log::message(reshade::log::level::info, ("RT diag: " + g_rtdiag.status).c_str());
+         g_rtdiag.frame++;
+         return;
+      }
+      g_rtdiag.phase = t >= kRTDiagPhaseSeconds ? 1 : 0;
+      g_rtao_freeze_scene = g_rtdiag.phase == 1 ? true : g_rtdiag.saved_freeze;
+
+      // A capture: copy every stage of this frame into the free staging set
+      if (now >= g_rtdiag.next && g_rtdiag.pending_set < 0)
+      {
+         g_rtdiag.next = now + std::chrono::milliseconds(int(kRTDiagInterval * 1000.0));
+         const int set = int(g_rtdiag.index & 1);
+         com_ptr<ID3D11Resource> sources[6];
+         {
+            const std::lock_guard lock(g_rtdiag.mutex);
+            if (g.rtdiag_game_shadow && g.rtdiag_game_shadow_frame == g.rtao_frame)
+               sources[0] = g.rtdiag_game_shadow.get();
+         }
+         sources[1] = com_ptr<ID3D11Resource>(RTDiagResource(g.rtsun_pass.GetDebugSRV(0)), true);
+         sources[2] = com_ptr<ID3D11Resource>(RTDiagResource(g.rtsun_pass.GetSRV()), true);
+         sources[3] = com_ptr<ID3D11Resource>(RTDiagResource(g.rtsun_pass.GetDebugSRV(1)), true);
+         if (g.rtao.IsInitialized())
+            sources[4] = com_ptr<ID3D11Resource>(RTDiagResource(g.rtao.GetDepthRTV()), true);
+         {
+            const std::shared_lock lock(device_data.mutex);
+            if (!device_data.swapchains.empty())
+            {
+               IDXGISwapChain* swapchain = (IDXGISwapChain*)((*device_data.swapchains.begin())->get_native());
+               com_ptr<ID3D11Texture2D> back_buffer;
+               if (swapchain && SUCCEEDED(swapchain->GetBuffer(0, IID_PPV_ARGS(&back_buffer))))
+                  sources[5] = back_buffer.get();
+            }
+         }
+         int copied = 0;
+         for (int s = 0; s < 6; s++)
+         {
+            RTDiagStage& stage = g_rtdiag.stages[s];
+            if (!sources[s])
+               continue;
+            com_ptr<ID3D11Texture2D> texture;
+            if (FAILED(sources[s]->QueryInterface(&texture)))
+               continue;
+            D3D11_TEXTURE2D_DESC desc;
+            texture->GetDesc(&desc);
+            D3D11_TEXTURE2D_DESC have = {};
+            if (stage.staging[set])
+               stage.staging[set]->GetDesc(&have);
+            if (!stage.staging[set] || have.Width != desc.Width || have.Height != desc.Height || have.Format != desc.Format)
+            {
+               stage.staging[set].reset();
+               D3D11_TEXTURE2D_DESC staging = desc;
+               staging.MipLevels = 1;
+               staging.ArraySize = 1;
+               staging.SampleDesc = { 1, 0 };
+               staging.Usage = D3D11_USAGE_STAGING;
+               staging.BindFlags = 0;
+               staging.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+               staging.MiscFlags = 0;
+               if (FAILED(native_device->CreateTexture2D(&staging, nullptr, &stage.staging[set])))
+                  continue;
+            }
+            if (desc.MipLevels == 1 && desc.ArraySize == 1 && desc.SampleDesc.Count == 1)
+               context->CopyResource(stage.staging[set].get(), texture.get());
+            else
+               context->CopySubresourceRegion(stage.staging[set].get(), 0, 0, 0, 0, texture.get(), 0, nullptr);
+            stage.format = desc.Format;
+            stage.width = desc.Width;
+            stage.height = desc.Height;
+            stage.copied[set] = true;
+            copied++;
+         }
+         if (copied)
+         {
+            const RTAO::RetentionStats& r = stats.retention;
+            std::string meta;
+            char line[256];
+            auto add = [&](const char* format, auto... args) {
+               snprintf(line, sizeof(line), format, args...);
+               meta += line;
+            };
+            add("index=%u\nframe=%u\nt_ms=%.1f\nphase=%d\nfrozen=%d\n", g_rtdiag.index, g_rtdiag.frame, t * 1000.0, g_rtdiag.phase, int(g_rtao_freeze_scene));
+            add("view_proj=");
+            for (int i = 0; i < 16; i++)
+               add(i ? ",%.9g" : "%.9g", g.rtdiag_view_proj[i]);
+            add("\ncam_pos=%.6g,%.6g,%.6g\ncam_fwd=%.6g,%.6g,%.6g\n", g.rtdiag_cam_pos[0], g.rtdiag_cam_pos[1], g.rtdiag_cam_pos[2], g.rtdiag_cam_fwd[0], g.rtdiag_cam_fwd[1], g.rtdiag_cam_fwd[2]);
+            float light[3] = {};
+            g.rtsun_light.GetDirection(light);
+            add("light=%.6g,%.6g,%.6g\nrt_output=%d\nrt_mode=%d\n", light[0], light[1], light[2], g_rtsun_output, g_rtsun_mode);
+            add("screen_shadows_rt=%u\nscreen_shadows_game=%u\ngame_shadow_captured=%d\n", bound_now, stale_now, int(bool(sources[0])));
+            add("tlas_instances=%u\nretained=%u\npromoted=%u\nyoung=%u\nmain_only=%u\nshadow_only=%u\nboth=%u\nnew=%u\nevicted=%u\n", g.rtao_tlas_instances.load(), r.promoted + r.young, r.promoted, r.young,
+               r.main_only, r.shadow_only, r.both, r.added_new, r.evicted_promoted + r.evicted_young);
+            add("frame_meshes=%llu\nmovables_kept=%llu\n", (unsigned long long)stats.frame_draws, (unsigned long long)stats.frame_retained);
+            g_rtdiag.pending_meta = meta;
+            g_rtdiag.pending_set = set;
+            g_rtdiag.pending_index = g_rtdiag.index;
+            g_rtdiag.pending_frame = g_rtdiag.frame;
+            g_rtdiag.index++;
+         }
+      }
+      g_rtdiag.frame++;
+   }
+
    static void DrawAOView(ID3D11Device* native_device, DeviceData& device_data, GameDeviceDataDishonored2& game_device_data)
    {
       const auto copy_vs = device_data.native_vertex_shaders.find(CompileTimeStringHash("Copy VS"));
@@ -975,6 +1351,8 @@ public:
          }
          SetRTSunStatus("ready, waiting for the light direction (screen shadows pass)", false);
       }
+      game_device_data.rtsun_pass.SetDebugOutputs(g_rtdiag.active);
+      out.debug_outputs = g_rtdiag.active;
       if (!game_device_data.rtsun_pass.EnsureTargets(native_device, width, height, error))
       {
          if (!game_device_data.rtsun_logged_error.exchange(true))
@@ -1063,6 +1441,8 @@ public:
       SetLumaConstantBuffers(native_device_context, cmd_list_data, device_data, reshade::api::shader_stage::pixel, LumaConstantBufferType::LumaSettings);
       updated_cbuffers = true;
       (*original_draw_dispatch_func)();
+      if (g_rtdiag.active)
+         RTDiagDrawGameShadow(native_device, native_device_context, game_device_data, original_draw_dispatch_func);
       ID3D11ShaderResourceView* const restore = previous.get();
       native_device_context->PSSetShaderResources(3, 1, &restore);
       visibility->Release();
@@ -1401,6 +1781,8 @@ public:
          native_device->GetImmediateContext(&immediate);
          game_device_data.rtao_capture.PollCounters(immediate.get());
       }
+      if (game_device_data.rtao.IsInitialized())
+         RTDiagOnPresent(native_device, device_data, game_device_data);
       if (g_ao_view_mode != 0 || RTSunSceneView())
          DrawAOView(native_device, device_data, game_device_data);
 
@@ -3106,6 +3488,14 @@ public:
       if (ImGui::IsItemHovered())
          ImGui::SetTooltip("What the trace writes. Check it with \"View AO only\" = RT sun visibility.");
       // Debug (shared with RTAO's scene), next to the sun output where they are used
+      if (ImGui::Button(g_rtdiag.active ? "RT diagnostic capture: running..." : "RT diagnostic capture (10 s, Ctrl+Shift+F9)") && !g_rtdiag.active)
+         g_rtdiag.start_requested = true;
+      if (ImGui::IsItemHovered())
+         ImGui::SetTooltip("Saves ~50 captures over 10 s into RTDiag\\<time> next to the game exe: 5 s as is, then 5 s with the ray tracing scene frozen.\n"
+                           "Each has, from the same frame: the game's own shadow, the RT raw and denoised shadow, the scene view, depth and the final image.\n"
+                           "Stand where the problem shows and turn slowly (or hold still) while it runs.");
+      ImGui::SameLine();
+      ImGui::TextUnformatted(g_rtdiag.status.c_str());
       if (ImGui::Checkbox("RT debug: re-copy buffers the game rewrites", &g_rtao_recopy_written))
          reshade::set_config_value(runtime, NAME, "RTAORecopyWrittenBuffers", g_rtao_recopy_written);
       if (ImGui::IsItemHovered())

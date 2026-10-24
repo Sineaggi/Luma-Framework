@@ -274,6 +274,33 @@ static void TestSunShadows(ID3D11Device* device, ID3D11DeviceContext* context, R
       CHECK(grey >= sky * 98 / 100, "scene view: rays that hit nothing must be grey (%d of %d)", grey, sky);
       settings.output = RTSun::Output::SceneSun;
       run_frame(); // Must run (no validation errors); content checked in game
+
+      // Diagnostic capture outputs of the same frame: the raw visibility (= the Raw output) and the camera scene view
+      // (= the SceneView output), while the output itself stays denoised
+      sun.SetDebugOutputs(true);
+      CHECK(sun.EnsureTargets(device, W, H, error), "SunPass::EnsureTargets (debug): %s", error.c_str());
+      settings.output = RTSun::Output::Raw;
+      settings.angular_diameter_deg = 0.f;
+      settings.debug_outputs = true;
+      const std::vector<float> out_raw = run_frame();
+      ID3D11ShaderResourceView* debug_raw_srv = sun.GetDebugSRV(0);
+      ID3D11ShaderResourceView* debug_scene_srv = sun.GetDebugSRV(1);
+      CHECK(debug_raw_srv && debug_scene_srv, "debug outputs created");
+      UINT dw = 0, dh = 0;
+      const std::vector<float> debug_raw = ReadAO(device, context, debug_raw_srv, dw, dh);
+      const std::vector<float> debug_scene = ReadAO(device, context, debug_scene_srv, dw, dh);
+      debug_raw_srv->Release();
+      debug_scene_srv->Release();
+      int raw_same = 0, scene_same = 0;
+      for (UINT i = 0; i < W * H; i++)
+      {
+         raw_same += std::fabs(debug_raw[i] - out_raw[i]) < 1e-3f ? 1 : 0;
+         scene_same += std::fabs(debug_scene[i] - scene[i]) < 1e-3f ? 1 : 0;
+      }
+      printf("RT diag outputs: raw matches the Raw output on %d of %u pixels, scene view on %d of %u\n", raw_same, W * H, scene_same, W * H);
+      CHECK(raw_same == int(W * H) && scene_same == int(W * H), "diagnostic outputs must equal the corresponding outputs");
+      settings.debug_outputs = false;
+      sun.SetDebugOutputs(false);
    }
 
    // 2) Soft light: the traced penumbra (raw rays, averaged here over frames) has the analytic width and grows with

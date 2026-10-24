@@ -270,7 +270,7 @@ namespace RTSun
 
       D3D12_RESOURCE_DESC desc = {};
       desc.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
-      desc.Width = kSlots * kConstantsStride;
+      desc.Width = 3 * kSlots * kConstantsStride; // Sets: the pass, the 2 debug outputs
       desc.Height = 1;
       desc.DepthOrArraySize = 1;
       desc.MipLevels = 1;
@@ -312,7 +312,7 @@ namespace RTSun
 
    void SunPass::ReleaseTargetsLocked()
    {
-      ID3D12Resource** resources[] = { &raw, &vis, &history[0], &history[1], &shared12 };
+      ID3D12Resource** resources[] = { &raw, &vis, &history[0], &history[1], &shared12, &dbg_vis[0], &dbg_vis[1], &dbg_hist, &dbg_shared12[0], &dbg_shared12[1] };
       for (ID3D12Resource** resource : resources)
       {
          if (*resource)
@@ -325,6 +325,15 @@ namespace RTSun
       if (shared11)
          shared11->Release();
       shared11 = nullptr;
+      for (uint32_t i = 0; i < 2; i++)
+      {
+         if (dbg_srv11[i])
+            dbg_srv11[i]->Release();
+         dbg_srv11[i] = nullptr;
+         if (dbg_shared11[i])
+            dbg_shared11[i]->Release();
+         dbg_shared11[i] = nullptr;
+      }
       width = height = 0;
    }
 
@@ -336,7 +345,8 @@ namespace RTSun
          error = "RT sun pass not initialized";
          return false;
       }
-      if (srv11 && new_width == width && new_height == height)
+      const bool want_debug = debug_requested.load();
+      if (srv11 && new_width == width && new_height == height && (!want_debug || dbg_srv11[1]))
          return true;
       if (new_width == 0 || new_height == 0)
       {
@@ -373,9 +383,52 @@ namespace RTSun
          ReleaseTargetsLocked();
          return false;
       }
+      if (want_debug)
+      {
+         std::string debug_error;
+         bool ok = true;
+         for (uint32_t i = 0; i < 2 && ok; i++)
+         {
+            dbg_vis[i] = CreateTexture(device, vis_format, new_width, new_height, hr);
+            ok = dbg_vis[i] && CreateSharedTexture(device, device11, vis_format, new_width, new_height, dbg_shared12[i], dbg_shared11[i], debug_error) &&
+                 SUCCEEDED(device11->CreateShaderResourceView(dbg_shared11[i], nullptr, &dbg_srv11[i]));
+         }
+         if (ok)
+            dbg_hist = CreateTexture(device, DXGI_FORMAT_R32G32_UINT, new_width, new_height, hr);
+         if (!ok || !dbg_hist)
+         {
+            // The pass works without them: the capture just has no raw / scene stages
+            for (uint32_t i = 0; i < 2; i++)
+            {
+               if (dbg_vis[i])
+                  graveyard.push_back(dbg_vis[i]);
+               if (dbg_shared12[i])
+                  graveyard.push_back(dbg_shared12[i]);
+               if (dbg_srv11[i])
+                  dbg_srv11[i]->Release();
+               if (dbg_shared11[i])
+                  dbg_shared11[i]->Release();
+               dbg_vis[i] = dbg_shared12[i] = nullptr;
+               dbg_srv11[i] = nullptr;
+               dbg_shared11[i] = nullptr;
+            }
+            if (dbg_hist)
+               graveyard.push_back(dbg_hist);
+            dbg_hist = nullptr;
+         }
+      }
       width = new_width;
       height = new_height;
       return true;
+   }
+
+   ID3D11ShaderResourceView* SunPass::GetDebugSRV(uint32_t index)
+   {
+      const std::lock_guard lock(mutex);
+      ID3D11ShaderResourceView* srv = index < 2 ? dbg_srv11[index] : nullptr;
+      if (srv)
+         srv->AddRef();
+      return srv;
    }
 
    ID3D11ShaderResourceView* SunPass::GetSRV()
@@ -388,14 +441,14 @@ namespace RTSun
 
    bool SunPass::EnsureHeap(const RTAO::RecordInfo& info, RTAO::Retirer& retirer, std::string& error)
    {
-      if (heap && heap_generation == info.targets_generation && heap_targets_version == targets_version)
+      if (heap && heap_generation == info.targets_generation && heap_targets_version == targets_version && heap_debug == (dbg_hist != nullptr))
          return true;
       Release(heap, &retirer, info.submit_fence_value);
       if (heap_targets_version != targets_version)
          has_history = false;
       D3D12_DESCRIPTOR_HEAP_DESC heap_desc = {};
       heap_desc.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
-      heap_desc.NumDescriptors = 11;
+      heap_desc.NumDescriptors = 21;
       heap_desc.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
       HRESULT hr = device->CreateDescriptorHeap(&heap_desc, IID_PPV_ARGS(&heap));
       if (FAILED(hr))
@@ -425,6 +478,30 @@ namespace RTSun
             handle.ptr += descriptor_size;
          }
       }
+      // Debug tables (diagnostic capture): the filter in its "off" mode copies raw into dbg_vis[i]; HistCur goes to a scratch
+      for (uint32_t i = 0; i < 2 && dbg_hist; i++)
+      {
+         D3D12_CPU_DESCRIPTOR_HANDLE handle = heap->GetCPUDescriptorHandleForHeapStart();
+         handle.ptr += SIZE_T(11 + i * 5) * descriptor_size;
+         D3D12_SHADER_RESOURCE_VIEW_DESC srv = {};
+         srv.Format = info.depth_format;
+         srv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+         srv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+         srv.Texture2D.MipLevels = 1;
+         device->CreateShaderResourceView(info.depth, &srv, handle);
+         handle.ptr += descriptor_size;
+         D3D12_UNORDERED_ACCESS_VIEW_DESC uav = {};
+         uav.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2D;
+         ID3D12Resource* uav_resources[4] = { raw, dbg_vis[i], dbg_hist, dbg_hist };
+         DXGI_FORMAT uav_formats[4] = { DXGI_FORMAT_R32_FLOAT, vis_format, DXGI_FORMAT_R32G32_UINT, DXGI_FORMAT_R32G32_UINT };
+         for (uint32_t k = 0; k < 4; k++)
+         {
+            uav.Format = uav_formats[k];
+            device->CreateUnorderedAccessView(uav_resources[k], nullptr, &uav, handle);
+            handle.ptr += descriptor_size;
+         }
+      }
+      heap_debug = dbg_hist != nullptr;
       WriteAtlasDescriptor(device, heap, descriptor_size, bound_atlas);
       heap_generation = info.targets_generation;
       heap_targets_version = targets_version;
@@ -563,6 +640,48 @@ namespace RTSun
       Transition(vis, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, barriers[0]);
       Transition(shared12, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_COMMON, barriers[1]);
       list->ResourceBarrier(2, barriers);
+
+      // Diagnostic capture: the same frame's raw visibility (what "raw" holds now), then a camera scene view trace
+      if (settings.debug_outputs && heap_debug && dbg_hist)
+      {
+         for (uint32_t i = 0; i < 2; i++)
+         {
+            SunConstants debug_constants = constants;
+            debug_constants.filter_mode = uint32_t(RTAO::FilterMode::Off);
+            debug_constants.debug_mode = i == 0 ? uint32_t(Output::Raw) : uint32_t(Output::SceneView);
+            const uint64_t offset = (uint64_t(1 + i) * kSlots + slot) * kConstantsStride;
+            std::memcpy(constants_mapped + offset, &debug_constants, sizeof(debug_constants));
+            D3D12_GPU_DESCRIPTOR_HANDLE debug_table = heap->GetGPUDescriptorHandleForHeapStart();
+            debug_table.ptr += UINT64(11 + i * 5) * descriptor_size;
+            D3D12_GPU_DESCRIPTOR_HANDLE debug_uavs = debug_table;
+            debug_uavs.ptr += descriptor_size;
+            list->SetComputeRootConstantBufferView(0, constants_upload->GetGPUVirtualAddress() + offset);
+            list->SetComputeRootDescriptorTable(2, debug_table);
+            list->SetComputeRootDescriptorTable(3, debug_uavs);
+            if (i == 1)
+            {
+               if (exact)
+                  TransitionBarrier(list, cutouts->arena, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+               TransitionBarrier(list, counters, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+               list->SetPipelineState(trace_pso);
+               list->Dispatch(groups_x, groups_y, 1);
+               UavBarrier(list, &raw, 1);
+               TransitionBarrier(list, counters, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COMMON);
+               if (exact)
+                  TransitionBarrier(list, cutouts->arena, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COMMON);
+            }
+            list->SetPipelineState(filter_pso);
+            list->Dispatch(groups_x, groups_y, 1);
+            UavBarrier(list, &dbg_vis[i], 1);
+            Transition(dbg_vis[i], D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE, barriers[0]);
+            Transition(dbg_shared12[i], D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_DEST, barriers[1]);
+            list->ResourceBarrier(2, barriers);
+            list->CopyResource(dbg_shared12[i], dbg_vis[i]);
+            Transition(dbg_vis[i], D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, barriers[0]);
+            Transition(dbg_shared12[i], D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_COMMON, barriers[1]);
+            list->ResourceBarrier(2, barriers);
+         }
+      }
 
       timer.End(list, info.frame_slot);
 
